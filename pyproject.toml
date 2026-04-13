@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worsaga"
+version = "0.1.0"
+description = "Read-only Moodle toolkit for agents, MCP servers, and local scripts"
+requires-python = ">=3.10"
+readme = "README.md"
+keywords = ["moodle", "lms", "education", "study", "mcp"]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Education",
+]
+dependencies = ["platformdirs>=2.10", "pymupdf>=1.23", "rich>=13.0"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+worsaga = "worsaga.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

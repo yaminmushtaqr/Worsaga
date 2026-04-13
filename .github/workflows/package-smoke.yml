@@ -1,0 +1,50 @@
+name: Package smoke tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  package-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            venv-bin: bin
+          - os: macos-latest
+            venv-bin: bin
+          - os: windows-latest
+            venv-bin: Scripts
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Smoke-test wheel install
+        shell: bash
+        run: |
+          python -m venv test-wheel
+          test-wheel/${{ matrix.venv-bin }}/pip install dist/*.whl
+          test-wheel/${{ matrix.venv-bin }}/worsaga --help
+          test-wheel/${{ matrix.venv-bin }}/python -m worsaga.cli --help
+          test-wheel/${{ matrix.venv-bin }}/worsaga config --json
+
+      - name: Smoke-test sdist install
+        shell: bash
+        run: |
+          python -m venv test-sdist
+          test-sdist/${{ matrix.venv-bin }}/pip install dist/*.tar.gz
+          test-sdist/${{ matrix.venv-bin }}/worsaga --help
+          test-sdist/${{ matrix.venv-bin }}/python -m worsaga.cli --help
+          test-sdist/${{ matrix.venv-bin }}/worsaga config --json

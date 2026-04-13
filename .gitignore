@@ -1,0 +1,44 @@
+# Private notes
+notes-private/
+
+# Private planning / scratch files (root-level only)
+/PLAN*.md
+/*PLAN*.md
+/BUGS*.md
+/*BUGS*.md
+/INTERNAL*.md
+/SCRATCH*.md
+
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Secrets & config
+.env
+.env.*
+config.json
+credentials.json
+*.secrets.json
+
+# Logs
+*.log
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
