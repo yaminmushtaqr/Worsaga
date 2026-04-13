@@ -1,13 +1,11 @@
 # worsaga
 
-Worsaga is a study kit for university LMS systems. Today it ships with read-only Moodle support, and Blackboard plus Canvas support are coming soon.
+Worsaga is a study kit for university LMS systems.
 
 ## Platform support
 
 - Supported now: **Moodle**
 - Coming soon: **Blackboard**, **Canvas**
-
-Worsaga is intentionally positioned as a broader LMS study layer, not a Moodle-only product. Moodle just happens to be the first integration.
 
 ## Quick start
 
@@ -192,9 +190,9 @@ py -m pytest
 
 This package is **read-only by design**. Every Moodle API call is checked against a hardcoded allowlist in `ALLOWED_FUNCTIONS` inside the client module. Write-like operations — submitting assignments, posting forum replies, uploading files, creating events, deleting content — are blocked with a `SafetyError` before any network request is made.
 
-- Your token cannot modify anything on Moodle, even accidentally.
+- Your token cannot modify anything on Moodle/Canvas/Blackboard, even accidentally.
 - Agents (Claude Code, OpenClaw, etc.) can use these tools safely.
-- Treat your Moodle API token like a password: never commit it to git, never share it, use HTTPS only.
+- Treat your API token like a password: never commit it to git, never share it, use HTTPS only.
 
 ### Known limitations
 
