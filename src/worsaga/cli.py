@@ -63,7 +63,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="worsaga",
-        description="Read-only Moodle toolkit for students and agents.",
+        description="Study kit for university LMS systems. Moodle is supported today.",
     )
     parser.add_argument(
         "-V", "--version", action="version",

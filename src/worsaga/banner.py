@@ -97,7 +97,7 @@ _LOGO_LINES = [
     r"  ╚══╝╚══╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝",
 ]
 
-_SUBTITLE = "r e a d - o n l y   m o o d l e   t o o l k i t"
+_SUBTITLE = "u n i v e r s i t y   l m s   s t u d y   k i t"
 
 
 # ── Rich banner ──────────────────────────────────────────────────
@@ -138,8 +138,8 @@ def _rich_banner_large(*, version: str) -> None:
     body.append("\n")
 
     # Tagline
-    body.append("  Read-only Moodle toolkit", style="rgb(150,55,55)")
-    body.append("  —  for students and agents", style="dim rgb(120,45,45)")
+    body.append("  Study kit for university LMSs", style="rgb(150,55,55)")
+    body.append("  —  Moodle first, Blackboard + Canvas soon", style="dim rgb(120,45,45)")
     body.append("\n")
 
     panel = Panel(
@@ -165,8 +165,8 @@ def _rich_banner_compact(*, version: str) -> None:
     title.append("a", style="bold rgb(100,10,10)")
 
     ver = Text(f"  v{version}", style="dim rgb(140,50,50)")
-    tagline = Text("  Read-only Moodle toolkit", style="rgb(160,60,60)")
-    detail = Text("  for students and agents", style="dim rgb(120,50,50)")
+    tagline = Text("  Study kit for university LMSs", style="rgb(160,60,60)")
+    detail = Text("  Moodle first, Blackboard + Canvas soon", style="dim rgb(120,50,50)")
 
     body = Text.assemble(title, ver, "\n", tagline, "\n", detail, "\n")
 
@@ -194,8 +194,8 @@ def _ansi_banner(*, version: str) -> None:
     lines = [
         f"{_DR}  ┌{'─' * 38}┐{_RST}",
         f"{_DR}  │{_RST}  {_B}{_R}worsaga{_RST}  {_DIM}v{version:<22}{_DR}  │{_RST}",
-        f"{_DR}  │{_RST}  {_R}Read-only Moodle toolkit{_RST}            {_DR}│{_RST}",
-        f"{_DR}  │{_RST}  {_DIM}for students and agents{_RST}             {_DR}│{_RST}",
+        f"{_DR}  │{_RST}  {_R}Study kit for university LMSs{_RST}         {_DR}│{_RST}",
+        f"{_DR}  │{_RST}  {_DIM}Moodle first, Blackboard + Canvas soon{_RST}{_DR}│{_RST}",
         f"{_DR}  └{'─' * 38}┘{_RST}",
     ]
     sys.stdout.write("\n".join(lines) + "\n")

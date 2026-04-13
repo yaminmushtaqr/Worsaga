@@ -1,5 +1,8 @@
 """MCP server for worsaga.
 
+Worsaga is a study kit for university LMS systems.
+Moodle is supported today. Blackboard and Canvas are planned next.
+
 Exposes tools:
     - list_courses
     - get_deadlines

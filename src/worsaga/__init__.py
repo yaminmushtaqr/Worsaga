@@ -1,4 +1,4 @@
-"""worsaga — Read-only Moodle toolkit."""
+"""worsaga — Study kit for university LMS systems."""
 
 __version__ = "0.1.0"
 

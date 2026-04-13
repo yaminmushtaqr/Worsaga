@@ -84,7 +84,7 @@ class TestRichBannerLarge:
     def test_large_banner_contains_subtitle(self, capsys):
         _rich_banner_large(version="0.2.2")
         out = capsys.readouterr().out
-        assert "m o o d l e" in out
+        assert "l m s" in out
 
     def test_large_banner_contains_version(self, capsys):
         _rich_banner_large(version="1.2.3")
@@ -94,7 +94,7 @@ class TestRichBannerLarge:
     def test_large_banner_contains_tagline(self, capsys):
         _rich_banner_large(version="0.2.2")
         out = capsys.readouterr().out
-        assert "Read-only Moodle toolkit" in out
+        assert "Study kit for university LMSs" in out
 
 
 class TestRichBannerCompact:
@@ -113,7 +113,7 @@ class TestRichBannerCompact:
     def test_compact_banner_contains_tagline(self, capsys):
         _rich_banner_compact(version="0.2.2")
         out = capsys.readouterr().out
-        assert "Read-only Moodle toolkit" in out
+        assert "Study kit for university LMSs" in out
 
 
 class TestPrintBanner:
@@ -130,7 +130,7 @@ class TestPrintBanner:
     def test_ansi_banner_contains_tagline(self, capsys):
         _ansi_banner(version="0.2.0")
         out = capsys.readouterr().out
-        assert "Read-only Moodle toolkit" in out
+        assert "Study kit for university LMSs" in out
 
     def test_print_banner_force_ansi(self, capsys):
         """force_ansi=True should use ANSI path even when Rich is available."""
@@ -150,7 +150,7 @@ class TestPrintBanner:
         print_banner(width=120)
         out = capsys.readouterr().out
         assert "███" in out
-        assert "m o o d l e" in out
+        assert "l m s" in out
 
     def test_print_banner_narrow_uses_compact(self, capsys):
         """Narrow terminal should produce the compact banner."""

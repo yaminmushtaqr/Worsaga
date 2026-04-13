@@ -1,6 +1,13 @@
 # worsaga
 
-Read-only Moodle toolkit for students and agents. Provides a Python library, CLI, and MCP server for accessing Moodle course data without any write operations.
+Worsaga is a study kit for university LMS systems. Today it ships with read-only Moodle support, and Blackboard plus Canvas support are coming soon.
+
+## Platform support
+
+- Supported now: **Moodle**
+- Coming soon: **Blackboard**, **Canvas**
+
+Worsaga is intentionally positioned as a broader LMS study layer, not a Moodle-only product. Moodle just happens to be the first integration.
 
 ## Quick start
 

@@ -2,6 +2,8 @@
 
 This repo is designed for agent use.
 
+Worsaga is a study kit for university LMS systems. Moodle is the first supported LMS right now, and Blackboard plus Canvas are planned next.
+
 ## Core rule: discovery first, download second
 
 For Moodle materials, there are **two distinct steps**:
