@@ -1,4 +1,4 @@
-# worsaga
+# Worsaga
 
 Worsaga is a study kit for university LMS systems.
 
