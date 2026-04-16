@@ -2,10 +2,24 @@
 
 Worsaga is a study kit for university LMS systems.
 
+This repository is the **open-source core** of Worsaga — the CLI and the MCP server — released under the Apache License 2.0 (see [LICENSE](LICENSE)). The wider Worsaga platform, app, and architecture are developed separately and are not part of this repo.
+
 ## Platform support
 
 - Supported now: **Moodle**
 - Coming soon: **Blackboard**, **Canvas**
+
+Worsaga is intentionally positioned as a broader LMS study layer, not a Moodle-only product. Moodle just happens to be the first integration.
+
+## What's in this repo
+
+This repo contains only the open-core pieces:
+
+- The `worsaga` command-line interface.
+- The `worsaga.mcp_server` MCP server for agents.
+- The read-only Moodle client and supporting Python modules they share.
+
+The broader Worsaga product — hosted platform, end-user app, and overall system architecture — lives outside this repository and is not open source. Issues, PRs, and discussions here should stay scoped to the CLI and MCP core.
 
 ## Quick start
 
@@ -253,3 +267,7 @@ get_course_contents(). To see what files are available, use get_week_materials()
 fetch a file, use download_material() — it handles authentication internally. Never
 fetch file_url values directly; always use download_material().
 ```
+
+## License
+
+This repo — the worsaga CLI and MCP server — is released under the [Apache License 2.0](LICENSE). The rest of the Worsaga platform (hosted service, end-user app, and overall system architecture) is developed separately and is not covered by this license.
