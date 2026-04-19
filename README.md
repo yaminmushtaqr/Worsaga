@@ -25,12 +25,18 @@ The broader Worsaga product — hosted platform, end-user app, and overall syste
 
 ### Install
 
-Pick whichever tool you already have:
+Install from PyPI with whichever tool you already have:
 
 ```bash
 uv tool install worsaga      # recommended — adds worsaga to PATH automatically
 pipx install worsaga         # alternative
 pip install worsaga          # if you just want the library, or don't have uv/pipx
+```
+
+For local development from a checked-out repo:
+
+```bash
+pip install -e .
 ```
 
 **Windows note:** If `worsaga` is not recognised after `pip install`, the Python
