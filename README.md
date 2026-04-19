@@ -1,8 +1,8 @@
 # Worsaga
 
-Worsaga is a study kit for university LMS systems.
+Worsaga is an open-source study kit for university LMS systems.
 
-This repository is the **open-source core** of Worsaga — the CLI and the MCP server — released under the Apache License 2.0 (see [LICENSE](LICENSE)). The wider Worsaga platform, app, and architecture are developed separately and are not part of this repo.
+This repository contains Worsaga's Apache 2.0 licensed CLI, MCP server, and supporting read-only LMS code.
 
 ## Platform support
 
@@ -13,25 +13,34 @@ Worsaga is intentionally positioned as a broader LMS study layer, not a Moodle-o
 
 ## What's in this repo
 
-This repo contains only the open-core pieces:
+This repo currently contains:
 
 - The `worsaga` command-line interface.
 - The `worsaga.mcp_server` MCP server for agents.
 - The read-only Moodle client and supporting Python modules they share.
+- The reusable open interface layer for LMS study workflows, starting with Moodle.
 
-The broader Worsaga product — hosted platform, end-user app, and overall system architecture — lives outside this repository and is not open source. Issues, PRs, and discussions here should stay scoped to the CLI and MCP core.
+Worsaga is intentionally open at the interface layer. The CLI, MCP surface, and shared read-only LMS library live here under Apache 2.0.
 
 ## Quick start
 
 ### Install
 
-Pick whichever tool you already have:
+Current install options:
 
 ```bash
-uv tool install worsaga      # recommended — adds worsaga to PATH automatically
-pipx install worsaga         # alternative
-pip install worsaga          # if you just want the library, or don't have uv/pipx
+uv tool install "git+https://github.com/yaminmushtaqr/Worsaga.git"   # recommended
+pipx install "git+https://github.com/yaminmushtaqr/Worsaga.git"      # alternative
+pip install "git+https://github.com/yaminmushtaqr/Worsaga.git"       # library-style install
 ```
+
+For local development from a checked-out repo:
+
+```bash
+pip install -e .
+```
+
+A one-line `curl` installer can be added later, but the public Git install flow is the primary path for now.
 
 **Windows note:** If `worsaga` is not recognised after `pip install`, the Python
 Scripts folder may not be on your PATH. Either:
@@ -270,4 +279,4 @@ fetch file_url values directly; always use download_material().
 
 ## License
 
-This repo — the worsaga CLI and MCP server — is released under the [Apache License 2.0](LICENSE). The rest of the Worsaga platform (hosted service, end-user app, and overall system architecture) is developed separately and is not covered by this license.
+Worsaga is licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).

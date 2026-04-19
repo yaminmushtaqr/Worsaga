@@ -7,9 +7,9 @@ name = "worsaga"
 version = "0.1.0"
 description = "Study kit for university LMS systems, starting with Moodle"
 requires-python = ">=3.10"
+readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-readme = "README.md"
 keywords = ["moodle", "lms", "education", "study", "mcp"]
 classifiers = [
     "Operating System :: OS Independent",

@@ -4,14 +4,14 @@ This repo is designed for agent use.
 
 Worsaga is a study kit for university LMS systems. Moodle is the first supported LMS right now, and Blackboard plus Canvas are planned next.
 
-## Scope of this repository (open core)
+## Scope of this repository
 
-This repo is the **open-source core** of Worsaga, licensed under Apache 2.0. It contains only the CLI (`worsaga`) and the MCP server (`worsaga.mcp_server`), plus the read-only Moodle client they share.
+This repo is Worsaga, licensed under Apache 2.0. It contains the CLI (`worsaga`), the MCP server (`worsaga.mcp_server`), and the shared read-only Moodle client they use.
 
-The wider Worsaga platform, app, and architecture are proprietary and live outside this repo. When working in here:
+When working in here:
 
-- Treat this repo as a standalone open-source package — do not reference or assume private platform internals.
-- Keep changes scoped to the CLI, the MCP server, and their supporting library code.
+- Keep the CLI and MCP surfaces clean, installable, and contributor-friendly.
+- Keep substantial proprietary product logic out of this repo.
 - Do not reintroduce earlier brand names or add migration shims for them.
 - Preserve the read-only Moodle safety posture (see the Safety section below).
 
