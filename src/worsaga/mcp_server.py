@@ -17,28 +17,22 @@ Requires the ``mcp`` extra: pip install worsaga[mcp]
 
 from __future__ import annotations
 
-import json
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from worsaga.client import MoodleClient
 from worsaga.config import MoodleConfig
 from worsaga.deadlines import get_upcoming_deadlines
-from worsaga.extraction import extract_file_text
 from worsaga.materials import (
     MaterialSelectionError,
-    _candidate_summary,
+    candidate_summary,
     download_material as _download_material,
     get_section_materials,
     search_course_content as _search_content,
     select_material as _select_material,
 )
-from worsaga.summaries import (
-    build_summary,
-    find_best_section,
-    format_bullets,
-    get_downloadable_files,
-)
+from worsaga.summaries import build_weekly_summary, format_bullets
 
 mcp = FastMCP("worsaga")
 
@@ -55,14 +49,13 @@ def _get_client() -> MoodleClient:
 
 
 @mcp.tool()
-def list_courses() -> str:
+def list_courses() -> list[dict[str, Any]]:
     """List all Moodle courses the authenticated user is enrolled in."""
-    courses = _get_client().get_courses()
-    return json.dumps(courses, indent=2)
+    return _get_client().get_courses()
 
 
 @mcp.tool()
-def get_deadlines(lookahead_days: int = 14) -> str:
+def get_deadlines(lookahead_days: int = 14) -> list[dict[str, Any]]:
     """Return upcoming assignment and quiz deadlines sorted by due date.
 
     Parameters
@@ -70,12 +63,11 @@ def get_deadlines(lookahead_days: int = 14) -> str:
     lookahead_days : int
         How many days ahead to look (default 14).
     """
-    deadlines = get_upcoming_deadlines(_get_client(), lookahead_days=lookahead_days)
-    return json.dumps(deadlines, indent=2)
+    return get_upcoming_deadlines(_get_client(), lookahead_days=lookahead_days)
 
 
 @mcp.tool()
-def get_course_contents(course_id: int) -> str:
+def get_course_contents(course_id: int) -> list[dict[str, Any]]:
     """Return all sections and modules for a specific course.
 
     Parameters
@@ -83,12 +75,11 @@ def get_course_contents(course_id: int) -> str:
     course_id : int
         The Moodle course ID.
     """
-    contents = _get_client().get_course_contents(course_id)
-    return json.dumps(contents, indent=2)
+    return _get_client().get_course_contents(course_id)
 
 
 @mcp.tool()
-def get_week_materials(course_id: int, week: str) -> str:
+def get_week_materials(course_id: int, week: str) -> list[dict[str, Any]]:
     """List downloadable materials for a specific teaching week (discovery only).
 
     Returns metadata about available files — file names, sizes, types, and
@@ -110,12 +101,11 @@ def get_week_materials(course_id: int, week: str) -> str:
     """
     client = _get_client()
     sections = client.get_course_contents(course_id)
-    materials = get_section_materials(sections, course_id, week, base_url=client.base_url)
-    return json.dumps(materials, indent=2)
+    return get_section_materials(sections, course_id, week, base_url=client.base_url)
 
 
 @mcp.tool()
-def search_course_content(course_id: int, query: str) -> str:
+def search_course_content(course_id: int, query: str) -> list[dict[str, Any]]:
     """Search section and module names within a course.
 
     Useful for finding where a topic lives without knowing the week number.
@@ -128,12 +118,11 @@ def search_course_content(course_id: int, query: str) -> str:
         Case-insensitive search term to match against section and module names.
     """
     sections = _get_client().get_course_contents(course_id)
-    results = _search_content(sections, query)
-    return json.dumps(results, indent=2)
+    return _search_content(sections, query)
 
 
 @mcp.tool()
-def get_weekly_summary(course_id: int, week: int) -> str:
+def get_weekly_summary(course_id: int, week: int) -> dict[str, Any]:
     """Generate a study summary for a specific teaching week of a course.
 
     Finds the best matching section, extracts text from downloadable
@@ -148,29 +137,9 @@ def get_weekly_summary(course_id: int, week: int) -> str:
     week : int
         The teaching week number.
     """
-    client = _get_client()
-    sections = client.get_course_contents(course_id)
-    section, section_type, section_name = find_best_section(sections, week)
-
-    file_texts: list[tuple[str, str]] = []
-    if section and section.get("modules"):
-        files = get_downloadable_files(section["modules"])
-        for finfo in files:
-            url = finfo["fileurl"]
-            if not url:
-                continue
-            data = client.download_file(url)
-            if data:
-                text = extract_file_text(data, finfo["filename"], clean=True)
-                if text:
-                    file_texts.append((finfo["filename"], text))
-
-    result = build_summary(file_texts, section_type=section_type)
-    result["section_name"] = section_name
-    result["week"] = week
-    result["course_id"] = course_id
+    result = build_weekly_summary(_get_client(), course_id, week)
     result["formatted"] = format_bullets(result["bullets"])
-    return json.dumps(result, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -180,7 +149,7 @@ def download_material(
     match: str = "",
     index: int = -1,
     output_dir: str = "",
-) -> str:
+) -> dict[str, Any]:
     """Download a material file from a teaching week (authenticated).
 
     This is the primary way to fetch files from Moodle. It discovers
@@ -215,10 +184,10 @@ def download_material(
     )
 
     if not materials:
-        return json.dumps({
+        return {
             "error": f"No materials found for week '{week}'.",
             "candidates": [],
-        }, indent=2)
+        }
 
     sel_match = match or None
     sel_index = index if index >= 0 else None
@@ -227,13 +196,13 @@ def download_material(
         chosen = _select_material(materials, match=sel_match, index=sel_index)
     except MaterialSelectionError as exc:
         candidates = [
-            _candidate_summary({**c, "_index": i})
+            candidate_summary(c, i)
             for i, c in enumerate(exc.candidates)
         ]
-        return json.dumps({
+        return {
             "error": str(exc),
             "candidates": candidates,
-        }, indent=2)
+        }
 
     try:
         result = _download_material(
@@ -241,9 +210,9 @@ def download_material(
             output_dir=output_dir or None,
         )
     except RuntimeError as exc:
-        return json.dumps({"error": str(exc)}, indent=2)
+        return {"error": str(exc)}
 
-    return json.dumps(result, indent=2)
+    return result
 
 
 def main() -> None:

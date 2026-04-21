@@ -45,13 +45,8 @@ from worsaga.materials import (
     search_course_content,
     select_material,
 )
-from worsaga.summaries import (
-    build_summary,
-    find_best_section,
-    format_bullets,
-    get_downloadable_files,
-    summarize_modules,
-)
+from worsaga.sections import find_best_section, summarize_modules
+from worsaga.summaries import build_weekly_summary, format_bullets
 
 
 class CourseResolutionError(ValueError):
@@ -354,7 +349,7 @@ def _print_setup_success(dest) -> None:
     print(f"  {cmd} contents <course> --week 1 # explore week content")
     print(f"  {cmd} materials <course> --week 1          # list available files")
     print(f"  {cmd} download <course> --week 1 --index 0 # download a file")
-    print(f"  {cmd} summary <course> --week 1  # AI study notes for a week")
+    print(f"  {cmd} summary <course> --week 1  # Study notes for a week")
 
 
 # ── Normalizers ──────────────────────────────────────────────────
@@ -504,7 +499,7 @@ def cmd_materials(args: argparse.Namespace) -> None:
 
 
 def cmd_download(args: argparse.Namespace) -> None:
-    from worsaga.materials import _candidate_summary
+    from worsaga.materials import candidate_summary
 
     client = _client(args)
     course_id = _resolve_course_id(client, args.course)
@@ -528,7 +523,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         )
     except MaterialSelectionError as exc:
         candidates = [
-            _candidate_summary({**c, "_index": i})
+            candidate_summary(c, i)
             for i, c in enumerate(exc.candidates)
         ]
         if args.json:
@@ -569,72 +564,33 @@ def cmd_download(args: argparse.Namespace) -> None:
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
-    from worsaga.extraction import extract_file_text
-
     client = _client(args)
     course_id = _resolve_course_id(client, args.course)
     sections = client.get_course_contents(course_id)
-
     week_query = args.week
-    section, section_type, section_name = find_best_section(sections, week_query)
 
-    # Display label: use raw query for non-numeric, resolved for numeric
-    week_label = week_query
+    if not args.json:
+        section, _, section_name = find_best_section(sections, week_query)
+        print(f"Week {week_query} — {section_name or '(no section found)'}")
+        if section and section.get("modules"):
+            overview = summarize_modules(section["modules"])
+            if overview:
+                print(f"Materials: {overview}")
+            print()
+
+    def _on_extract(filename: str) -> None:
+        if not args.json and not args.quiet:
+            print(f"  Extracting {filename}...", file=sys.stderr)
+
+    result = build_weekly_summary(
+        client, course_id, week_query,
+        sections=sections,
+        on_extract=_on_extract,
+    )
 
     if args.json:
-        # For JSON mode: build full structured output
-        file_texts: list[tuple[str, str]] = []
-        if section and section.get("modules"):
-            files = get_downloadable_files(section["modules"])
-            for finfo in files:
-                url = finfo["fileurl"]
-                if not url:
-                    continue
-                data = client.download_file(url)
-                if data:
-                    text = extract_file_text(data, finfo["filename"], clean=True)
-                    if text:
-                        file_texts.append((finfo["filename"], text))
-
-        result = build_summary(
-            file_texts, section_type=section_type,
-        )
-        result["section_name"] = section_name
-        result["week"] = week_query
-        result["course_id"] = course_id
         print(json.dumps(result, indent=2))
         return
-
-    # Human-friendly output
-    print(f"Week {week_label} — {section_name or '(no section found)'}")
-    if section and section.get("modules"):
-        overview = summarize_modules(section["modules"])
-        if overview:
-            print(f"Materials: {overview}")
-        print()
-
-        files = get_downloadable_files(section["modules"])
-        if files:
-            file_texts = []
-            for finfo in files:
-                url = finfo["fileurl"]
-                if not url:
-                    continue
-                if not args.quiet:
-                    print(f"  Extracting {finfo['filename']}...", file=sys.stderr)
-                data = client.download_file(url)
-                if data:
-                    text = extract_file_text(data, finfo["filename"], clean=True)
-                    if text:
-                        file_texts.append((finfo["filename"], text))
-
-            result = build_summary(
-                file_texts, section_type=section_type,
-            )
-        else:
-            result = build_summary([], section_type=section_type)
-    else:
-        result = build_summary([], section_type=section_type)
 
     print(f"Study notes ({result['method']}):")
     print(format_bullets(result["bullets"]))

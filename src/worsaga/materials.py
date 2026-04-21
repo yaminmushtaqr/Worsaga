@@ -350,10 +350,16 @@ def select_material(
     )
 
 
-def _candidate_summary(material: dict) -> dict:
-    """Return a token-free summary of a material for candidate lists."""
+def candidate_summary(material: dict, index: int) -> dict:
+    """Return a token-free summary of a material for candidate lists.
+
+    *index* is the caller's position for the material in its candidate
+    list (used so UI/JSON output can reference a specific entry by
+    number). No token-bearing fields (``file_url`` in particular) are
+    included in the returned dict.
+    """
     return {
-        "index": material.get("_index", 0),
+        "index": index,
         "file_name": material.get("file_name", ""),
         "module_name": material.get("module_name", ""),
         "section_name": material.get("section_name", ""),

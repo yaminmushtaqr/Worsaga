@@ -1,6 +1,6 @@
 """worsaga — Study kit for university LMS systems."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from worsaga.client import (
     ALLOWED_FUNCTIONS,
@@ -27,16 +27,18 @@ from worsaga.materials import (
     search_course_content,
     select_material,
 )
-from worsaga.summaries import (
-    build_deterministic_summary,
-    build_summary,
+from worsaga.sections import (
     classify_section,
-    fallback_bullets,
     find_best_section,
-    format_bullets,
     get_downloadable_files,
     score_section_match,
     summarize_modules,
+)
+from worsaga.summaries import (
+    build_deterministic_summary,
+    build_summary,
+    fallback_bullets,
+    format_bullets,
 )
 
 __all__ = [

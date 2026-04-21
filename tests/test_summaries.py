@@ -3,7 +3,21 @@ deterministic bullet building, and the high-level summary builder."""
 
 import pytest
 
+from worsaga.sections import (
+    classify_section,
+    find_best_section,
+    get_downloadable_files,
+    score_section_match,
+    summarize_modules,
+)
 from worsaga.summaries import (
+    build_deterministic_summary,
+    build_summary,
+    build_weekly_summary,
+    fallback_bullets,
+    format_bullets,
+)
+from worsaga.summary_text import (
     _condense_line,
     _content_words,
     _deduplicate_lines,
@@ -13,16 +27,6 @@ from worsaga.summaries import (
     _reject_final_bullet,
     _score_line,
     _select_diverse,
-    build_deterministic_summary,
-    build_llm_summary,
-    build_summary,
-    classify_section,
-    fallback_bullets,
-    find_best_section,
-    format_bullets,
-    get_downloadable_files,
-    score_section_match,
-    summarize_modules,
 )
 
 
@@ -1140,56 +1144,6 @@ class TestBuildDeterministicSummary:
         assert "economies of scale" in combined or "what leads to what and why" in combined
 
 
-# ── build_llm_summary ──────────────────────────────────────────
-
-
-class TestBuildLlmSummary:
-    def test_returns_none_without_callable(self):
-        file_texts = [("a.txt", "Some content that is long enough.")]
-        assert build_llm_summary(file_texts) is None
-
-    def test_uses_callable(self):
-        def fake_llm(prompt):
-            return "First important point.\nSecond insight.\nThird takeaway."
-
-        file_texts = [("a.txt", "Material about economics that covers important topics.")]
-        result = build_llm_summary(file_texts, llm_callable=fake_llm)
-        assert result is not None
-        assert len(result) == 3
-
-    def test_strips_bullet_markers_from_llm(self):
-        def fake_llm(prompt):
-            return "- Point one.\n• Point two.\n1. Point three."
-
-        file_texts = [("a.txt", "Some material about finance and markets.")]
-        result = build_llm_summary(file_texts, llm_callable=fake_llm)
-        assert result is not None
-        for bullet in result:
-            assert not bullet.startswith("-")
-            assert not bullet.startswith("•")
-            assert not bullet.startswith("1.")
-
-    def test_returns_none_on_llm_failure(self):
-        def failing_llm(prompt):
-            raise RuntimeError("LLM unavailable")
-
-        file_texts = [("a.txt", "Some educational content for testing.")]
-        assert build_llm_summary(file_texts, llm_callable=failing_llm) is None
-
-    def test_returns_none_on_too_few_lines(self):
-        def single_line_llm(prompt):
-            return "Just one line."
-
-        file_texts = [("a.txt", "Content about important economic theories.")]
-        assert build_llm_summary(file_texts, llm_callable=single_line_llm) is None
-
-    def test_empty_file_texts(self):
-        def fake_llm(prompt):
-            return "Should not be called."
-
-        assert build_llm_summary([], llm_callable=fake_llm) is None
-
-
 # ── build_summary (high-level) ──────────────────────────────────
 
 
@@ -1212,27 +1166,6 @@ class TestBuildSummary:
         assert len(result["bullets"]) == 4
         assert result["section_type"] == "reading"
 
-    def test_llm_preferred_when_available(self):
-        def fake_llm(prompt):
-            return "First.\nSecond.\nThird."
-
-        text = "Material covering supply and demand theory in detail."
-        file_texts = [("slides.pdf", text)]
-        result = build_summary(file_texts, llm_callable=fake_llm)
-        assert result["method"] == "llm"
-
-    def test_falls_back_to_extractive_when_llm_fails(self):
-        def failing_llm(prompt):
-            raise RuntimeError("fail")
-
-        text = (
-            "Markets are characterised by the interaction of supply and demand forces.\n\n"
-            "Trade policy affects welfare through tariffs and quotas on imports."
-        )
-        file_texts = [("slides.pdf", text)]
-        result = build_summary(file_texts, llm_callable=failing_llm)
-        assert result["method"] == "extractive"
-
     def test_generic_fallback_for_empty_normal_week(self):
         result = build_summary([], section_type="normal")
         assert result["method"] == "fallback"
@@ -1252,6 +1185,105 @@ class TestBuildSummary:
         assert result["file_count"] == 1
         assert any("introductory" in b.lower() or "administrative" in b.lower()
                     for b in result["bullets"])
+
+
+# ── build_weekly_summary (shared orchestration) ─────────────────
+
+
+class _StubClient:
+    """Minimal stand-in for MoodleClient used by build_weekly_summary tests."""
+
+    def __init__(self, *, sections=None, file_bytes=None):
+        self._sections = sections or []
+        self._file_bytes = file_bytes
+        self.downloaded: list[str] = []
+
+    def get_course_contents(self, course_id):
+        return self._sections
+
+    def download_file(self, fileurl, *, max_bytes=None):
+        self.downloaded.append(fileurl)
+        return self._file_bytes
+
+
+def _text_pdf_bytes(text: str) -> bytes:
+    """Plain .txt bytes — extraction works on TXT without extra deps."""
+    return text.encode("utf-8")
+
+
+class TestBuildWeeklySummary:
+    def test_no_section_falls_back(self):
+        client = _StubClient(sections=[])
+        result = build_weekly_summary(client, 42, 1)
+        assert result["method"] == "fallback"
+        assert result["course_id"] == 42
+        assert result["week"] == 1
+        assert result["section_name"] == ""
+
+    def test_section_without_modules_falls_back(self):
+        sections = [
+            _make_section("Reading Week", 3, []),
+        ]
+        client = _StubClient(sections=sections)
+        result = build_weekly_summary(client, 42, 3)
+        assert result["method"] == "fallback"
+        assert result["section_type"] == "reading"
+        assert result["section_name"] == "Reading Week"
+        assert result["course_id"] == 42
+
+    def test_pre_supplied_sections_skip_fetch(self):
+        called = {"n": 0}
+
+        class _Client(_StubClient):
+            def get_course_contents(self, course_id):
+                called["n"] += 1
+                return super().get_course_contents(course_id)
+
+        client = _Client(sections=[])
+        build_weekly_summary(client, 42, 1, sections=[])
+        assert called["n"] == 0
+
+    def test_on_extract_invoked_per_file(self):
+        sections = [
+            _make_section("Week 1: Intro", 1, [
+                _make_module(10, "Slides", contents=[
+                    _make_file_content("w1.txt"),
+                ]),
+            ]),
+        ]
+        # Plain text bytes so extract_file_text returns substantive content.
+        client = _StubClient(
+            sections=sections,
+            file_bytes=_text_pdf_bytes(
+                "Markets tend toward equilibrium because of price adjustment. "
+                "Supply and demand forces determine prevailing prices."
+            ),
+        )
+        seen: list[str] = []
+        result = build_weekly_summary(
+            client, 7, 1,
+            on_extract=lambda f: seen.append(f),
+        )
+        assert seen == ["w1.txt"]
+        assert result["course_id"] == 7
+        assert result["week"] == 1
+        assert result["section_name"] == "Week 1: Intro"
+
+    def test_failed_download_does_not_raise(self):
+        sections = [
+            _make_section("Week 1: Intro", 1, [
+                _make_module(10, "Slides", contents=[
+                    _make_file_content("w1.pdf"),
+                ]),
+            ]),
+        ]
+        # download_file returns None → fall through to fallback.
+        client = _StubClient(sections=sections, file_bytes=None)
+        result = build_weekly_summary(client, 42, 1)
+        assert result["section_name"] == "Week 1: Intro"
+        assert result["course_id"] == 42
+        # No content extracted, so fallback bullets kick in.
+        assert result["method"] == "fallback"
 
 
 # ── format_bullets ──────────────────────────────────────────────

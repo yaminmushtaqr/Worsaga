@@ -131,6 +131,17 @@ class MoodleClient:
         """Return assignments for a single course."""
         return self.call("mod_assign_get_assignments", **{"courseids[0]": course_id})
 
+    def get_assignments_by_courses(self, course_ids: list[int]) -> dict:
+        """Return assignments for the given courses in one batched call.
+
+        Uses the array form of ``mod_assign_get_assignments`` to avoid the
+        N round-trips of calling :meth:`get_assignments` per course.
+        """
+        if not course_ids:
+            return {"courses": []}
+        params = {f"courseids[{i}]": cid for i, cid in enumerate(course_ids)}
+        return self.call("mod_assign_get_assignments", **params)
+
     def get_quizzes(self, course_ids: list[int] | None = None) -> dict:
         """Return quizzes for the given courses (or all enrolled courses)."""
         if course_ids is None:
@@ -143,19 +154,22 @@ class MoodleClient:
         return self.call("core_course_get_contents", courseid=course_id)
 
     def download_file(
-        self, fileurl: str, *, max_bytes: int = 10 * 1024 * 1024,
+        self, fileurl: str, *, max_bytes: int | None = None,
     ) -> bytes | None:
         """Download a file from a Moodle file URL (read-only GET).
 
         Appends the session token and returns raw bytes, or None on failure.
         This is a plain HTTP GET — not a web-service call — so the allowlist
         is not checked (there is no wsfunction involved).
+
+        By default the full response body is read. Callers may pass
+        ``max_bytes`` explicitly when they intentionally want a capped read.
         """
         sep = "&" if "?" in fileurl else "?"
         url = f"{fileurl}{sep}token={self._config.token}"
         req = urllib.request.Request(url)
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                return r.read(max_bytes)
+                return r.read() if max_bytes is None else r.read(max_bytes)
         except Exception:
             return None

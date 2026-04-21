@@ -1,6 +1,7 @@
 """Tests for the read-only Moodle client safeguards."""
 
 import pytest
+from unittest.mock import patch
 
 from worsaga.client import (
     ALLOWED_FUNCTIONS,
@@ -86,3 +87,37 @@ class TestClientConstruction:
         c = MoodleClient(config=cfg)
         assert c.base_url == "https://example.com/moodle"  # trailing slash stripped
         assert c.userid == 42
+
+
+class _FakeResponse:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self, size=None):
+        if size is None:
+            return self.payload
+        return self.payload[:size]
+
+
+class TestDownloadFile:
+    def test_download_file_reads_full_response_by_default(self, client):
+        payload = b"x" * (11 * 1024 * 1024)
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(payload)):
+            data = client.download_file("https://moodle.example.com/pluginfile.php/123/file.pptx")
+        assert data == payload
+        assert len(data) == len(payload)
+
+    def test_download_file_honors_explicit_max_bytes(self, client):
+        payload = b"abcdef"
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(payload)):
+            data = client.download_file(
+                "https://moodle.example.com/pluginfile.php/123/file.txt",
+                max_bytes=3,
+            )
+        assert data == b"abc"

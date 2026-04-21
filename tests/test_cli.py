@@ -616,10 +616,16 @@ class TestNonInteractiveSetup:
 
 
 class TestErrorHandling:
-    def test_valueerror_clean_exit(self, capsys):
+    def test_valueerror_clean_exit(self, capsys, monkeypatch):
         """ValueError (e.g. missing config) should produce clean stderr, exit 1."""
+        for var in ("WORSAGA_URL", "WORSAGA_TOKEN", "WORSAGA_USERID", "WORSAGA_CREDS_PATH"):
+            monkeypatch.delenv(var, raising=False)
         with pytest.raises(SystemExit) as exc:
-            main(["--url", "", "--token", "", "courses"])
+            main([
+                "--url", "", "--token", "",
+                "--creds-path", "/nonexistent/path.json",
+                "courses",
+            ])
         assert exc.value.code == 1
         err = capsys.readouterr().err
         assert "Error" in err
@@ -842,17 +848,29 @@ class TestDoctorCommand:
         assert output["username"] == "ymushtaq"
         assert output["sitename"] == "My Moodle"
 
-    def test_doctor_no_config(self, capsys):
+    def test_doctor_no_config(self, capsys, monkeypatch):
         """doctor should report missing credentials cleanly."""
+        for var in ("WORSAGA_URL", "WORSAGA_TOKEN", "WORSAGA_USERID", "WORSAGA_CREDS_PATH"):
+            monkeypatch.delenv(var, raising=False)
         with pytest.raises(SystemExit) as exc:
-            main(["--url", "", "--token", "", "doctor"])
+            main([
+                "--url", "", "--token", "",
+                "--creds-path", "/nonexistent/path.json",
+                "doctor",
+            ])
         assert exc.value.code == 1
         out = capsys.readouterr().out
         assert "FAIL" in out
 
-    def test_doctor_no_config_json(self, capsys):
+    def test_doctor_no_config_json(self, capsys, monkeypatch):
+        for var in ("WORSAGA_URL", "WORSAGA_TOKEN", "WORSAGA_USERID", "WORSAGA_CREDS_PATH"):
+            monkeypatch.delenv(var, raising=False)
         with pytest.raises(SystemExit) as exc:
-            main(["--json", "--url", "", "--token", "", "doctor"])
+            main([
+                "--json", "--url", "", "--token", "",
+                "--creds-path", "/nonexistent/path.json",
+                "doctor",
+            ])
         assert exc.value.code == 1
         output = json.loads(capsys.readouterr().out)
         assert output["ok"] is False
@@ -1033,12 +1051,10 @@ class TestQuietFlag:
         assert args.quiet is False
 
     @patch("worsaga.cli._client")
-    @patch("worsaga.extraction.extract_file_text", return_value="hello")
     @patch("worsaga.cli.find_best_section")
-    @patch("worsaga.cli.get_downloadable_files")
-    @patch("worsaga.cli.build_summary")
+    @patch("worsaga.cli.build_weekly_summary")
     def test_quiet_suppresses_extraction_progress(
-        self, mock_summary, mock_files, mock_best, mock_extract, mock_client_fn, capsys
+        self, mock_summary, mock_best, mock_client_fn, capsys
     ):
         mock = mock_client_fn.return_value
         mock.get_courses.return_value = [{"id": 1, "shortname": "EC100"}]
@@ -1048,23 +1064,26 @@ class TestQuietFlag:
             "teaching",
             "Week 1",
         )
-        mock_files.return_value = [
-            {"filename": "slides.pdf", "fileurl": "https://example.com/f.pdf"},
-        ]
-        mock.download_file.return_value = b"data"
-        mock_summary.return_value = {"method": "extraction", "bullets": ["point"]}
+
+        def _fake_summary(client, course_id, week, *, sections=None, on_extract=None):
+            if on_extract is not None:
+                on_extract("slides.pdf")
+            return {
+                "bullets": ["point"], "method": "extraction",
+                "section_name": "Week 1", "section_type": "teaching",
+                "file_count": 1, "week": week, "course_id": course_id,
+            }
+        mock_summary.side_effect = _fake_summary
 
         main(["-q", "summary", "1", "--week", "1"])
         err = capsys.readouterr().err
         assert "Extracting" not in err
 
     @patch("worsaga.cli._client")
-    @patch("worsaga.extraction.extract_file_text", return_value="hello")
     @patch("worsaga.cli.find_best_section")
-    @patch("worsaga.cli.get_downloadable_files")
-    @patch("worsaga.cli.build_summary")
+    @patch("worsaga.cli.build_weekly_summary")
     def test_no_quiet_shows_extraction_progress(
-        self, mock_summary, mock_files, mock_best, mock_extract, mock_client_fn, capsys
+        self, mock_summary, mock_best, mock_client_fn, capsys
     ):
         mock = mock_client_fn.return_value
         mock.get_courses.return_value = [{"id": 1, "shortname": "EC100"}]
@@ -1074,11 +1093,16 @@ class TestQuietFlag:
             "teaching",
             "Week 1",
         )
-        mock_files.return_value = [
-            {"filename": "slides.pdf", "fileurl": "https://example.com/f.pdf"},
-        ]
-        mock.download_file.return_value = b"data"
-        mock_summary.return_value = {"method": "extraction", "bullets": ["point"]}
+
+        def _fake_summary(client, course_id, week, *, sections=None, on_extract=None):
+            if on_extract is not None:
+                on_extract("slides.pdf")
+            return {
+                "bullets": ["point"], "method": "extraction",
+                "section_name": "Week 1", "section_type": "teaching",
+                "file_count": 1, "week": week, "course_id": course_id,
+            }
+        mock_summary.side_effect = _fake_summary
 
         main(["summary", "1", "--week", "1"])
         err = capsys.readouterr().err

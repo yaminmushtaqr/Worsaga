@@ -134,7 +134,7 @@ worsaga materials EC100      # List all downloadable materials (discovery)
 worsaga materials EC100 --week 3   # Materials for week 3 only
 worsaga download EC100 --week 3 --match slides   # Download a file (authenticated)
 worsaga download EC100 --week 3 --index 0        # Download by index
-worsaga summary EC100 --week 3     # AI-generated study notes for a week
+worsaga summary EC100 --week 3     # Study notes for a week (extractive)
 worsaga setup                # Guided first-time setup
 worsaga update               # Show the safe upgrade command
 ```

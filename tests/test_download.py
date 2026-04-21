@@ -9,8 +9,8 @@ import pytest
 
 from worsaga.materials import (
     MaterialSelectionError,
-    _candidate_summary,
     _sanitize_filename,
+    candidate_summary,
     download_material,
     extract_materials,
     get_section_materials,
@@ -261,8 +261,7 @@ class TestNoTokenLeak:
 
     def test_candidate_summary_has_no_file_url(self):
         material = _materials()[0]
-        material["_index"] = 0
-        summary = _candidate_summary(material)
+        summary = candidate_summary(material, 0)
         assert "file_url" not in summary
         json_str = json.dumps(summary)
         assert "pluginfile" not in json_str
@@ -272,7 +271,7 @@ class TestNoTokenLeak:
         with pytest.raises(MaterialSelectionError) as exc_info:
             select_material(mats)
         for i, c in enumerate(exc_info.value.candidates):
-            summary = _candidate_summary({**c, "_index": i})
+            summary = candidate_summary(c, i)
             assert "file_url" not in summary
 
     def test_materials_json_output_does_not_get_tokenized(self):
@@ -304,13 +303,12 @@ class TestSanitizeFilename:
         assert _sanitize_filename("my-file_v2.pdf") == "my-file_v2.pdf"
 
 
-# ── _candidate_summary ──────────────────────────────────────────
+# ── candidate_summary ───────────────────────────────────────────
 
 
 class TestCandidateSummary:
     def test_includes_expected_fields(self):
         material = {
-            "_index": 2,
             "file_name": "slides.pdf",
             "module_name": "Lecture",
             "section_name": "Week 1",
@@ -318,7 +316,7 @@ class TestCandidateSummary:
             "file_size": 1024,
             "view_url": "https://example.com/view",
         }
-        summary = _candidate_summary(material)
+        summary = candidate_summary(material, 2)
         assert summary["index"] == 2
         assert summary["file_name"] == "slides.pdf"
         assert summary["module_name"] == "Lecture"
@@ -329,11 +327,10 @@ class TestCandidateSummary:
 
     def test_excludes_file_url(self):
         material = {
-            "_index": 0,
             "file_name": "slides.pdf",
             "file_url": "https://moodle.example.com/pluginfile.php/123/slides.pdf",
         }
-        summary = _candidate_summary(material)
+        summary = candidate_summary(material, 0)
         assert "file_url" not in summary
 
 
