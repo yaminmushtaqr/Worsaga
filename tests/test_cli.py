@@ -249,11 +249,12 @@ class TestUpdateCommand:
         assert "python3 -m pip install --upgrade worsaga" in out
 
     @patch("worsaga.cli._upgrade_command", return_value="py -m pip install --upgrade worsaga")
-    @patch("worsaga.cli._get_latest_pypi_version", return_value="0.1.0")
-    def test_update_human_output_when_current(self, mock_latest, mock_upgrade, capsys):
-        main(["update"])
+    def test_update_human_output_when_current(self, mock_upgrade, capsys):
+        from worsaga import __version__
+        with patch("worsaga.cli._get_latest_pypi_version", return_value=__version__):
+            main(["update"])
         out = capsys.readouterr().out
-        assert "Latest PyPI version: 0.1.0" in out
+        assert f"Latest PyPI version: {__version__}" in out
         assert "To upgrade or reinstall, run:" in out
         assert "py -m pip install --upgrade worsaga" in out
 
