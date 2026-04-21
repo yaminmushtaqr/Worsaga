@@ -693,8 +693,8 @@ class TestSetupMessaging:
 
     @patch("worsaga.cli.test_connection")
     @patch("worsaga.cli.MoodleConfig.write_config")
-    def test_600_on_unix(self, mock_write, mock_test_conn, capsys, tmp_path):
-        # sys.platform is 'linux' in our test environment
+    def test_600_on_unix(self, mock_write, mock_test_conn, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr(os, "name", "posix")
         mock_test_conn.return_value = {"userid": 42}
         mock_write.return_value = tmp_path / "config.json"
         main(["setup", "--url", "https://m.example.com", "--token", "tok123"])
@@ -725,6 +725,7 @@ class TestSetupMessaging:
     @patch("worsaga.cli.MoodleConfig.write_config")
     def test_module_invocation_hint(self, mock_write, mock_test_conn, monkeypatch, capsys, tmp_path):
         """When invoked via python -m, next-step hints should use module form."""
+        monkeypatch.setattr(os, "name", "posix")
         monkeypatch.setattr(sys, "argv", ["/path/to/worsaga.cli", "setup"])
         mock_test_conn.return_value = {"userid": 42}
         mock_write.return_value = tmp_path / "config.json"
