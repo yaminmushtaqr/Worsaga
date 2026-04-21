@@ -1,6 +1,6 @@
 """worsaga — Study kit for university LMS systems."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from worsaga.client import (
     ALLOWED_FUNCTIONS,
