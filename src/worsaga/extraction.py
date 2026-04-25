@@ -290,8 +290,11 @@ def extract_pptx_text(data: bytes) -> str:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             slide_names = sorted(
-                n for n in zf.namelist()
-                if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+                (
+                    n for n in zf.namelist()
+                    if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+                ),
+                key=_pptx_slide_sort_key,
             )
             all_slides: list[str] = []
             for sn in slide_names:
@@ -310,6 +313,14 @@ def extract_pptx_text(data: bytes) -> str:
             return "\n\n".join(all_slides)
     except Exception:
         return ""
+
+
+def _pptx_slide_sort_key(name: str) -> tuple[int, str]:
+    """Sort PowerPoint slide XML paths by slide number."""
+    match = re.search(r"/slide(\d+)\.xml$", name)
+    if match:
+        return (int(match.group(1)), name)
+    return (0, name)
 
 
 def extract_docx_text(data: bytes) -> str:

@@ -71,20 +71,38 @@ class MoodleConfig:
         env_token = os.environ.get("WORSAGA_TOKEN", "")
         env_userid = os.environ.get("WORSAGA_USERID", "")
 
-        file_url = ""
-        file_token = ""
-        file_userid = 0
+        resolved_url = url or env_url
+        resolved_token = token or env_token
+        resolved_userid = userid
+        if resolved_userid is None and env_userid:
+            resolved_userid = int(env_userid)
 
-        path = _find_config_file(creds_path)
-        if path is not None:
-            creds = _load_config_file(path)
-            file_url = creds.get("url", "")
-            file_token = creds.get("token", "")
-            file_userid = int(creds.get("userid", 0))
+        need_file_url = not resolved_url
+        need_file_token = not resolved_token
+        need_file_userid = resolved_userid is None
+        if need_file_url or need_file_token or need_file_userid:
+            path = _find_config_file(creds_path)
+            if path is not None:
+                try:
+                    creds = _load_config_file(path)
+                    if not isinstance(creds, dict):
+                        raise ValueError("credentials file must contain a JSON object")
+                except (OSError, json.JSONDecodeError, ValueError):
+                    if need_file_url or need_file_token:
+                        raise
+                    creds = {}
 
-        resolved_url = url or env_url or file_url
-        resolved_token = token or env_token or file_token
-        resolved_userid = userid if userid is not None else (int(env_userid) if env_userid else file_userid)
+                if need_file_url:
+                    resolved_url = creds.get("url", "")
+                if need_file_token:
+                    resolved_token = creds.get("token", "")
+                if need_file_userid:
+                    try:
+                        resolved_userid = int(creds.get("userid", 0) or 0)
+                    except (TypeError, ValueError):
+                        if need_file_url or need_file_token:
+                            raise
+                        resolved_userid = 0
 
         if not resolved_url:
             raise ValueError(
@@ -102,7 +120,7 @@ class MoodleConfig:
         return cls(
             url=resolved_url.rstrip("/"),
             token=resolved_token,
-            userid=resolved_userid,
+            userid=resolved_userid or 0,
         )
 
     @staticmethod

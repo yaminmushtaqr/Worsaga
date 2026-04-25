@@ -165,11 +165,55 @@ class MoodleClient:
         By default the full response body is read. Callers may pass
         ``max_bytes`` explicitly when they intentionally want a capped read.
         """
-        sep = "&" if "?" in fileurl else "?"
-        url = f"{fileurl}{sep}token={self._config.token}"
-        req = urllib.request.Request(url)
         try:
+            url = self._authenticated_file_url(fileurl)
+            req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.read() if max_bytes is None else r.read(max_bytes)
         except Exception:
             return None
+
+    def _authenticated_file_url(self, fileurl: str) -> str:
+        """Return a Moodle-local pluginfile URL with this client's token.
+
+        Moodle may expose arbitrary URL/page resources in course contents.
+        Only pluginfile-style URLs from the configured Moodle origin should
+        receive the token used for authenticated file downloads.
+        """
+        raw = str(fileurl or "").strip()
+        if not raw:
+            raise ValueError("file URL is empty")
+
+        base = urllib.parse.urlparse(self.base_url)
+        target = urllib.parse.urlparse(raw)
+        if not target.scheme and not target.netloc:
+            target = urllib.parse.urlparse(urllib.parse.urljoin(f"{self.base_url}/", raw))
+
+        if target.scheme.lower() not in {"http", "https"}:
+            raise ValueError("file URL must be HTTP(S)")
+        if target.scheme.lower() != base.scheme.lower():
+            raise ValueError("file URL scheme does not match Moodle base URL")
+        if target.netloc.lower() != base.netloc.lower():
+            raise ValueError("file URL host does not match Moodle base URL")
+
+        base_path = base.path.rstrip("/")
+        if base_path and not (
+            target.path == base_path or target.path.startswith(f"{base_path}/")
+        ):
+            raise ValueError("file URL path is outside Moodle base path")
+
+        path_parts = {part.lower() for part in target.path.split("/") if part}
+        if not ({"pluginfile.php", "draftfile.php"} & path_parts):
+            raise ValueError("file URL is not a Moodle file endpoint")
+
+        query = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(
+                target.query, keep_blank_values=True,
+            )
+            if key.lower() not in {"token", "wstoken"}
+        ]
+        query.append(("token", self._config.token))
+        return urllib.parse.urlunparse(
+            target._replace(query=urllib.parse.urlencode(query))
+        )

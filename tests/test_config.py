@@ -77,6 +77,40 @@ class TestConfigLoad:
         cfg = MoodleConfig.load()
         assert cfg.userid == 42
 
+    def test_explicit_credentials_ignore_corrupt_file(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text("{not valid json")
+        monkeypatch.delenv("WORSAGA_URL", raising=False)
+        monkeypatch.delenv("WORSAGA_TOKEN", raising=False)
+        monkeypatch.delenv("WORSAGA_USERID", raising=False)
+
+        cfg = MoodleConfig.load(
+            url="https://explicit.example.com",
+            token="explicit_tok",
+            creds_path=cfg_file,
+        )
+
+        assert cfg.url == "https://explicit.example.com"
+        assert cfg.token == "explicit_tok"
+        assert cfg.userid == 0
+
+    def test_explicit_credentials_ignore_invalid_file_userid(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"userid": "not-an-int"}))
+        monkeypatch.delenv("WORSAGA_URL", raising=False)
+        monkeypatch.delenv("WORSAGA_TOKEN", raising=False)
+        monkeypatch.delenv("WORSAGA_USERID", raising=False)
+
+        cfg = MoodleConfig.load(
+            url="https://explicit.example.com",
+            token="explicit_tok",
+            creds_path=cfg_file,
+        )
+
+        assert cfg.url == "https://explicit.example.com"
+        assert cfg.token == "explicit_tok"
+        assert cfg.userid == 0
+
 
 class TestFindConfigFile:
     def test_explicit_path_found(self, tmp_path):

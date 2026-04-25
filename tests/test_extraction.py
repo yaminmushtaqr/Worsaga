@@ -308,6 +308,11 @@ class TestExtractPptx:
         assert "World" in result
         assert "Slide two" in result
 
+    def test_extracts_slides_in_numeric_order(self):
+        data = _make_pptx([[f"S{i:02d} content"] for i in range(1, 11)])
+        result = extract_pptx_text(data)
+        assert result.index("S02 content") < result.index("S10 content")
+
     def test_empty_pptx(self):
         data = _make_pptx([])
         assert extract_pptx_text(data) == ""

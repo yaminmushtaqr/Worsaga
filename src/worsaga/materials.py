@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -116,14 +117,14 @@ def _build_material(
         file_size = file_info.get("filesize", 0)
         mime_type = file_info.get("mimetype", "")
         time_modified = file_info.get("timemodified", 0)
-        dedupe_key = f"{module_id}:{file_name}"
+        dedupe_key = f"{module_id}:{file_name}:{_dedupe_location_key(file_info)}"
     else:
         file_name = ""
         file_url = module.get("url", "")
         file_size = 0
         mime_type = ""
         time_modified = module.get("added", 0)
-        dedupe_key = f"{module_id}:"
+        dedupe_key = f"{module_id}::{_token_free_url_key(file_url)}"
 
     record = {
         "course_id": course_id,
@@ -148,6 +149,31 @@ def _build_material(
         )
 
     return record
+
+
+def _token_free_url_key(url: str) -> str:
+    """Return a stable URL-derived key without Moodle token parameters."""
+    parsed = urllib.parse.urlparse(str(url or ""))
+    query = urllib.parse.urlencode([
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(
+            parsed.query, keep_blank_values=True,
+        )
+        if key.lower() not in {"token", "wstoken"}
+    ])
+    return urllib.parse.urlunparse(
+        ("", "", parsed.path, "", query, "")
+    ) or str(url or "")
+
+
+def _dedupe_location_key(file_info: dict) -> str:
+    """Return the file location component used for material dedupe."""
+    file_url = file_info.get("fileurl", "")
+    filepath = file_info.get("filepath", "")
+    return "|".join(
+        part for part in (str(filepath or ""), _token_free_url_key(file_url))
+        if part
+    )
 
 
 # ── Extraction helpers ───────────────────────────────────────────
@@ -279,6 +305,22 @@ def _sanitize_filename(name: str) -> str:
     """Remove or replace characters unsafe for filenames."""
     # Keep alphanumerics, dots, hyphens, underscores
     return re.sub(r"[^\w.\-]", "_", name)
+
+
+def _available_path(path: Path) -> Path:
+    """Return a non-existing path by adding a numeric suffix if needed."""
+    if not path.exists():
+        return path
+
+    stem = path.stem or "download"
+    suffix = path.suffix
+    parent = path.parent
+    counter = 1
+    while True:
+        candidate = parent / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
 def select_material(
@@ -419,7 +461,7 @@ def download_material(
 
     dest_dir = Path(output_dir) if output_dir else Path.cwd()
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / _sanitize_filename(file_name)
+    dest_path = _available_path(dest_dir / _sanitize_filename(file_name))
 
     dest_path.write_bytes(data)
 

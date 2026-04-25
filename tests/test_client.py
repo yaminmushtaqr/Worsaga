@@ -121,3 +121,37 @@ class TestDownloadFile:
                 max_bytes=3,
             )
         assert data == b"abc"
+
+    def test_download_file_adds_token_only_to_moodle_file_url(self, client):
+        seen = {}
+
+        def _fake_urlopen(req, timeout=30):
+            seen["url"] = req.full_url
+            return _FakeResponse(b"ok")
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            data = client.download_file(
+                "https://moodle.example.com/pluginfile.php/123/file.txt?forcedownload=1",
+            )
+
+        assert data == b"ok"
+        assert "forcedownload=1" in seen["url"]
+        assert "token=fake" in seen["url"]
+
+    def test_download_file_rejects_external_host_before_tokenizing(self, client):
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            data = client.download_file(
+                "https://evil.example.com/pluginfile.php/123/file.txt",
+            )
+
+        assert data is None
+        mock_urlopen.assert_not_called()
+
+    def test_download_file_rejects_non_file_moodle_url(self, client):
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            data = client.download_file(
+                "https://moodle.example.com/mod/url/view.php?id=123",
+            )
+
+        assert data is None
+        mock_urlopen.assert_not_called()

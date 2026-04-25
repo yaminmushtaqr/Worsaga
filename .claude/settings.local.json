@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest -x --tb=short)",
+      "Bash(python -m pytest tests/test_summaries.py tests/test_mcp_server.py -q)"
+    ]
+  }
+}

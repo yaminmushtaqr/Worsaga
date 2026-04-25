@@ -239,6 +239,19 @@ class TestDownloadMaterial:
         result = download_material(mock_client, material)
         assert str(tmp_path) in result["local_path"]
 
+    def test_does_not_overwrite_existing_file(self, tmp_path):
+        material = _materials()[0]
+        existing = tmp_path / "week3_slides.pdf"
+        existing.write_bytes(b"old-data")
+        mock_client = MagicMock()
+        mock_client.download_file.return_value = b"new-data"
+
+        result = download_material(mock_client, material, output_dir=tmp_path)
+
+        assert existing.read_bytes() == b"old-data"
+        assert Path(result["local_path"]).name == "week3_slides_1.pdf"
+        assert Path(result["local_path"]).read_bytes() == b"new-data"
+
 
 # ── No-token-leak guarantees ────────────────────────────────────
 

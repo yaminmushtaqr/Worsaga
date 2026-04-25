@@ -249,7 +249,8 @@ class TestExtractMaterials:
         assert rec["module_type"] == "resource"
         assert rec["file_size"] == 2048000
         assert rec["mime_type"] == "application/pdf"
-        assert rec["dedupe_key"] == "1010:week1_slides.pdf"
+        assert rec["dedupe_key"].startswith("1010:week1_slides.pdf:")
+        assert "/pluginfile.php/0/week1_slides.pdf" in rec["dedupe_key"]
 
     def test_no_view_url_without_base_url(self):
         materials = extract_materials(SAMPLE_SECTIONS, COURSE_ID)
@@ -292,6 +293,38 @@ class TestExtractMaterials:
         without_dedupe = extract_materials(sections, COURSE_ID, dedupe=False)
         assert len(with_dedupe) == 1
         assert len(without_dedupe) == 2
+
+    def test_dedupe_keeps_same_filename_at_different_urls(self):
+        """Same module+filename can still represent distinct folder files."""
+        sections = [
+            {
+                "id": 300,
+                "name": "Section A",
+                "section": 0,
+                "modules": [
+                    {
+                        "id": 3001,
+                        "name": "Folder",
+                        "modname": "folder",
+                        "contents": [
+                            {
+                                **_make_file("slides.pdf"),
+                                "fileurl": "https://moodle.example.com/pluginfile.php/0/a/slides.pdf",
+                            },
+                            {
+                                **_make_file("slides.pdf"),
+                                "fileurl": "https://moodle.example.com/pluginfile.php/0/b/slides.pdf",
+                            },
+                        ],
+                    },
+                ],
+            },
+        ]
+
+        materials = extract_materials(sections, COURSE_ID, dedupe=True)
+
+        assert len(materials) == 2
+        assert len({m["dedupe_key"] for m in materials}) == 2
 
     def test_empty_sections(self):
         assert extract_materials([], COURSE_ID) == []
