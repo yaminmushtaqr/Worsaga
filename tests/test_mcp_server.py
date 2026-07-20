@@ -491,6 +491,95 @@ class TestDownloadMaterialErrorShapes:
         assert not (tmp_path / "escape").exists()
 
 
+# ── extract_material tool ─────────────────────────────────────────
+
+
+def _section_with_txt_material(name="notes", text_name=None):
+    """Build a section holding one plain-text file material."""
+    filename = text_name or f"{name}.txt"
+    return [
+        {
+            "id": 1,
+            "name": "Week 1",
+            "section": 1,
+            "modules": [
+                {
+                    "id": 10,
+                    "name": "Module notes",
+                    "modname": "resource",
+                    "contents": [
+                        {
+                            "type": "file",
+                            "filename": filename,
+                            "fileurl": f"https://moodle.example.com/{filename}",
+                            "filesize": 1024,
+                            "mimetype": "text/plain",
+                            "timemodified": 0,
+                        },
+                    ],
+                },
+            ],
+        },
+    ]
+
+
+class TestExtractMaterialTool:
+    def test_no_materials_returns_error_dict(self):
+        client = _FakeClient(contents=[])
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(42, "99")
+
+        assert isinstance(result, dict)
+        assert "No materials found for week '99'." in result["error"]
+        assert result["candidates"] == []
+
+    def test_ambiguous_match_returns_candidate_list(self):
+        sections = _section_with_materials("notes_a", "notes_b")
+        client = _FakeClient(contents=sections)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(42, "1")
+
+        assert "error" in result
+        assert len(result["candidates"]) == 2
+        for c in result["candidates"]:
+            assert "token" not in str(c).lower()
+            assert "index" in c
+
+    def test_fetch_failure_returns_error_code(self):
+        sections = _section_with_txt_material()
+        client = _FakeClient(contents=sections, file_bytes=None)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(42, "1", index=0)
+
+        assert "Download failed" in result["error"]
+        assert result["error_code"] == "empty"
+        assert "candidates" not in result
+
+    def test_successful_extract_returns_pages(self):
+        sections = _section_with_txt_material()
+        text = b"Study content about market equilibrium and price adjustment."
+        client = _FakeClient(contents=sections, file_bytes=text)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(42, "1", index=0)
+
+        assert result["filename"] == "notes.txt"
+        assert result["file_type"] == "txt"
+        assert result["page_count"] == 1
+        assert "market equilibrium" in result["pages"][0]["text"]
+        # Token/authentication details must stay out of the return shape.
+        assert "file_url" not in result
+        assert "token" not in str(result).lower()
+
+    def test_nothing_written_to_disk(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        sections = _section_with_txt_material()
+        client = _FakeClient(contents=sections, file_bytes=b"study text here")
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            mcp_server.extract_material(42, "1", index=0)
+
+        assert list(tmp_path.iterdir()) == []
+
+
 # ── FastMCP registration invariants ───────────────────────────────
 
 
@@ -517,6 +606,7 @@ class TestFastMCPRegistration:
         "search_course_content",
         "get_weekly_summary",
         "download_material",
+        "extract_material",
     )
 
     @pytest.mark.parametrize("name", TOOL_NAMES)

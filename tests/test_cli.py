@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1615,3 +1615,63 @@ class TestNormalizers:
         assert m["id"] is None
         assert m["type"] == ""
         assert m["url"] == ""
+
+
+# ── Legacy-encoding console safety ───────────────────────────────
+
+
+class TestCp1252ConsoleSafety:
+    """Human output must never crash on legacy-encoded stdout (cp1252).
+
+    Windows consoles and pipes frequently use cp1252, which cannot
+    encode box-drawing or many content characters. main() reconfigures
+    the streams with errors="replace", and table separators are ASCII.
+    """
+
+    def _cp1252_stdout(self, monkeypatch):
+        import io
+
+        buf = io.BytesIO()
+        wrapper = io.TextIOWrapper(buf, encoding="cp1252", errors="strict")
+        monkeypatch.setattr(sys, "stdout", wrapper)
+        return buf, wrapper
+
+    def test_demo_materials_table_survives_cp1252(self, monkeypatch, capsys):
+        buf, wrapper = self._cp1252_stdout(monkeypatch)
+
+        main(["--demo", "materials", "ECON101", "--week", "3"])
+
+        wrapper.flush()
+        out = buf.getvalue().decode("cp1252")
+        # Full table rendered: header, ASCII separator row, data rows.
+        assert "Section" in out
+        assert "-" * 10 in out
+        assert ".pdf" in out
+        assert "?" not in out  # nothing needed replacement
+        assert "codec" not in capsys.readouterr().err
+
+    def test_demo_courses_table_survives_cp1252(self, monkeypatch):
+        buf, wrapper = self._cp1252_stdout(monkeypatch)
+
+        main(["--demo", "courses"])
+
+        wrapper.flush()
+        out = buf.getvalue().decode("cp1252")
+        assert "ECON101" in out
+        assert "-" * 8 in out
+
+    def test_unencodable_content_is_replaced_not_fatal(self, monkeypatch):
+        """Characters outside cp1252 degrade to '?' instead of crashing."""
+        buf, wrapper = self._cp1252_stdout(monkeypatch)
+        client = MagicMock()
+        client.get_courses.return_value = [
+            {"id": 1, "shortname": "MATH101", "fullname": "Analysis – ε–δ proofs"},
+        ]
+        with patch("worsaga.cli._client", return_value=client):
+            main(["courses"])
+
+        wrapper.flush()
+        out = buf.getvalue().decode("cp1252")
+        assert "MATH101" in out
+        assert "Analysis" in out  # row still printed
+        assert "?" in out  # Greek letters replaced, not fatal

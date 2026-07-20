@@ -11,6 +11,7 @@ Exposes tools:
     - search_course_content
     - get_weekly_summary
     - download_material
+    - extract_material
     - get_grades
     - get_grade_summary
     - get_assignments
@@ -50,10 +51,12 @@ from worsaga.forums import get_forum_discussions as _get_forum_discussions
 from worsaga.forums import get_latest_updates as _get_latest_updates
 from worsaga.grades import get_grade_summary as _get_grade_summary
 from worsaga.grades import get_grades as _get_grades
+from worsaga.extraction import MAX_TEXT_PER_FILE
 from worsaga.materials import (
     MaterialSelectionError,
     candidate_summary,
     download_material as _download_material,
+    extract_material_content as _extract_material_content,
     get_section_materials,
     search_course_content as _search_content,
     select_material as _select_material,
@@ -325,6 +328,33 @@ def download_material(
         dest_dir = downloads_root
 
     client = _get_client()
+    chosen = _select_week_material(client, course_id, week, match, index)
+    if "error" in chosen:
+        return chosen
+
+    try:
+        result = _download_material(client, chosen, output_dir=dest_dir)
+    except DownloadError as exc:
+        return {"error": str(exc), "error_code": exc.code}
+    except RuntimeError as exc:
+        return {"error": str(exc)}
+
+    return result
+
+
+def _select_week_material(
+    client: MoodleClient,
+    course_id: int,
+    week: str,
+    match: str,
+    index: int,
+) -> dict[str, Any]:
+    """Discover materials for *week* and select exactly one.
+
+    Returns the chosen material record, or a structured error dict
+    (with a ``candidates`` list where applicable) that the calling tool
+    passes straight back to the agent.
+    """
     sections = client.get_course_contents(course_id)
     materials = get_section_materials(
         sections, course_id, week, base_url=client.base_url,
@@ -336,11 +366,12 @@ def download_material(
             "candidates": [],
         }
 
-    sel_match = match or None
-    sel_index = index if index >= 0 else None
-
     try:
-        chosen = _select_material(materials, match=sel_match, index=sel_index)
+        return _select_material(
+            materials,
+            match=match or None,
+            index=index if index >= 0 else None,
+        )
     except MaterialSelectionError as exc:
         candidates = [
             candidate_summary(c, i)
@@ -351,14 +382,62 @@ def download_material(
             "candidates": candidates,
         }
 
+
+@mcp.tool()
+def extract_material(
+    course_id: int,
+    week: str,
+    match: str = "",
+    index: int = -1,
+    max_chars: int = 0,
+    clean: bool = True,
+) -> dict[str, Any]:
+    """Extract per-page structured text from a material (in memory).
+
+    Fetches the file with authenticated credentials and returns its
+    text page by page (slide by slide for PPTX) — each page carries
+    ``text``, ``markdown``, ``image_count``, ``has_low_text_density``,
+    and ``warnings``. Nothing is written to disk; use
+    ``download_material()`` when you need the file itself.
+
+    Light cleaning is applied by default and preserves educational
+    content — figure captions, learning objectives, references. Pages
+    dominated by images are flagged rather than silently empty.
+
+    If multiple materials match, returns a structured error with a
+    candidate list so the caller can refine with *match* or *index*.
+
+    Parameters
+    ----------
+    course_id : int
+        The Moodle course ID.
+    week : str
+        Week number (e.g. "3") or section name substring.
+    match : str
+        Optional substring to filter candidates by file or module name.
+    index : int
+        Zero-based index to pick from matching materials (-1 = auto).
+    max_chars : int
+        Cap on total extracted text across pages (0 = default cap).
+    clean : bool
+        Strip boilerplate lines (page numbers, copyright footers,
+        repeated headers). Set False for the raw extractor output.
+    """
+    client = _get_client()
+    chosen = _select_week_material(client, course_id, week, match, index)
+    if "error" in chosen:
+        return chosen
+
     try:
-        result = _download_material(client, chosen, output_dir=dest_dir)
+        return _extract_material_content(
+            client, chosen,
+            max_chars=max_chars if max_chars > 0 else MAX_TEXT_PER_FILE,
+            clean=clean,
+        )
     except DownloadError as exc:
         return {"error": str(exc), "error_code": exc.code}
     except RuntimeError as exc:
         return {"error": str(exc)}
-
-    return result
 
 
 def main() -> None:

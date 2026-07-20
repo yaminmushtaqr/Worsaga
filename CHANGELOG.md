@@ -2,7 +2,26 @@
 
 All notable changes to Worsaga are documented in this file.
 
-## 0.4.0 (unreleased)
+## 0.5.0 (unreleased)
+
+### Added
+
+- Per-page structured extraction is now user-facing. The new
+  `worsaga extract` CLI command and `extract_material` MCP tool fetch a
+  material into memory (nothing is written to disk) and return its text
+  page by page — slide by slide for PPTX — with per-page Markdown
+  rendering, image counts, low-text-density flags, and structured
+  warnings. Selection works exactly like `download` (`--match`,
+  `--index`, candidate lists on ambiguity), and demo mode is fully
+  supported.
+- Light cleaning is applied by default and preserves educational
+  content — figure/table captions, learning objectives, source lines,
+  and references. Pass `--raw` (CLI) or `clean=false` (MCP) for the
+  unmodified extractor output; `--max-chars` / `max_chars` caps the
+  total text.
+- New public API: `worsaga.extract_material_content`.
+
+## 0.4.0
 
 First clean public release.
 

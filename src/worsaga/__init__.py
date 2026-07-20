@@ -1,6 +1,6 @@
 """worsaga — Open-source, local-first, read-only study toolkit for Moodle."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from worsaga.assignments import get_assignment_status, get_assignments, normalize_assignment
 from worsaga.calendar import get_calendar_events, normalize_calendar_events
@@ -41,6 +41,7 @@ from worsaga.grades import get_grade_summary, get_grades, normalize_grade_items
 from worsaga.materials import (
     MaterialSelectionError,
     download_material,
+    extract_material_content,
     extract_materials,
     get_section_materials,
     match_section,
@@ -90,6 +91,7 @@ __all__ = [
     "default_downloads_dir",
     "extract_file_structured",
     "extract_file_text",
+    "extract_material_content",
     "extract_materials",
     "fallback_bullets",
     "find_best_section",
