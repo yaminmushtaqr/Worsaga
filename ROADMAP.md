@@ -5,7 +5,7 @@ local scratch files must stay out of the repository.
 
 ## Current baseline
 
-Version `0.5.0` includes:
+Version `0.6.0` includes:
 
 - CLI and MCP server entrypoints.
 - Read-only Moodle client with a hardcoded allowlist.
@@ -24,7 +24,7 @@ Version `0.5.0` includes:
   default.
 - Unit tests with mocked Moodle payloads.
 
-## In development: 0.6.0 — cache, sync, and changes (unreleased)
+## New in 0.6.0: cache, sync, and changes
 
 - Local SQLite cache in the platform-native user data directory.
 - `worsaga sync` with metadata-only defaults.
