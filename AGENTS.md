@@ -29,16 +29,25 @@ When working in here:
   dependency and licence decision is explicit and reviewed.
 - Do not reintroduce earlier brand names or add migration shims for them.
 
-## Core rule: discovery first, download second
+## Core rule: discovery first, download or extraction second
 
-For Moodle materials, there are **two distinct steps**:
+For Moodle materials, there are **three distinct steps**:
 
 1. **Discovery**
    - CLI: `worsaga materials <course> --week <n>`
    - MCP: `get_week_materials(course_id=..., week=...)`
-2. **Authenticated download**
+2. **Authenticated download** (saves the file)
    - CLI: `worsaga download <course> --week <n> --match ...` or `--index ...`
    - MCP: `download_material(course_id=..., week=..., match=..., index=...)`
+3. **Authenticated extraction** (per-page text, in memory, nothing saved)
+   - CLI: `worsaga extract <course> --week <n> --match ...` or `--index ...`
+   - MCP: `extract_material(course_id=..., week=..., match=..., index=...)`
+
+When you only need to *read* a material, prefer `extract` / `extract_material`
+over downloading: it returns page-by-page text (slide-by-slide for PPTX) with
+Markdown rendering, image counts, and low-text-density flags, and writes
+nothing to disk. Light cleaning preserves captions, learning objectives, and
+references by default.
 
 Do **not** fetch raw `file_url` values directly.
 - Raw `file_url` values are omitted from default discovery output (MCP
@@ -59,13 +68,17 @@ worsaga --json download PSY110 --week 3 --match "Lec 3"
 
 # or select by candidate index if multiple match
 worsaga --json download PSY110 --week 3 --index 0
+
+# or read it page by page without saving anything
+worsaga --json extract PSY110 --week 3 --match "Lec 3"
 ```
 
 ## Recommended MCP flow
 
 ```python
 get_week_materials(course_id=42, week="3")
-download_material(course_id=42, week="3", match="Lec 3")
+extract_material(course_id=42, week="3", match="Lec 3")   # read in memory
+download_material(course_id=42, week="3", match="Lec 3")  # save the file
 ```
 
 ## Output expectations
@@ -80,7 +93,38 @@ download_material(course_id=42, week="3", match="Lec 3")
 - `bytes_written`
 - optional `view_url`
 
-They should **not** expose tokens or authenticated URLs.
+`extract` / `extract_material` return `filename`, `file_type`, `page_count`,
+`pages` (each with `page`, `text`, `markdown`, `image_count`,
+`has_low_text_density`, `warnings`), top-level `warnings`, and the same
+section/module context fields.
+
+None of these should expose tokens or authenticated URLs.
+
+## Post-implementation verification (required for coding agents)
+
+Worsaga is agents-first software: the CLI, the MCP server, and demo mode
+exist so an agent can exercise its own changes end-to-end. After **every**
+implementation, the coding agent must test and verify its own work through
+the real surfaces before reporting it done — do not hand unverified
+behaviour to the maintainer for manual review.
+
+Minimum verification for any change:
+
+1. Run the test suite and lint: `pytest` and `ruff check src tests`.
+2. Exercise the changed surface for real, using demo mode (no credentials
+   or network needed):
+   - CLI: `PYTHONPATH=src python -m worsaga.cli --demo <command> ...`
+     (plain `python -m worsaga.cli` may resolve to an older installed
+     package — always set `PYTHONPATH=src` when verifying source changes).
+   - MCP: call the tools in-process against the source tree, e.g.
+     `WORSAGA_DEMO=1 PYTHONPATH=src python -c "from worsaga import mcp_server; print(mcp_server.extract_material(101, '3', index=0))"`
+     (course IDs come from `list_courses()` / `worsaga --demo courses`).
+3. Review the actual output — human and `--json` for CLI changes, the
+   returned dict/list shape for MCP changes — and check the safety
+   invariants hold: no tokens, no raw `file_url` values, structured error
+   shapes with candidate lists where applicable.
+4. Report what was run and what it produced. The maintainer reviews
+   evidence and design decisions, not untested code.
 
 ## Smoke test recipe for agents
 

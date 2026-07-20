@@ -5,7 +5,7 @@ local scratch files must stay out of the repository.
 
 ## Current baseline
 
-Version `0.4.0` includes:
+Version `0.5.0` (unreleased) includes:
 
 - CLI and MCP server entrypoints.
 - Read-only Moodle client with a hardcoded allowlist.
@@ -14,27 +14,17 @@ Version `0.4.0` includes:
   notifications, inbox, digest, doctor, config, setup, and update commands.
 - Structured JSON output.
 - Optional YAML output.
-- Token-safe authenticated downloads.
+- Token-safe authenticated downloads with conservative size, file-count, and
+  page limits, structured download errors, and local-timezone display.
+- Demo mode: the full CLI and MCP server without Moodle credentials, using
+  clearly fake course data and generated fake PDFs, never contacting a real
+  Moodle site.
+- Per-page structured extraction (`worsaga extract`, `extract_material`)
+  that preserves educational content (captions, objectives, references) by
+  default.
 - Unit tests with mocked Moodle payloads.
 
-## Next: demo mode
-
-- Try the CLI and MCP server without Moodle credentials, using clearly fake
-  course data and generated fake PDFs.
-- Demo mode never contacts a real Moodle site.
-
-## Then: safer downloads and extraction limits
-
-- Conservative size, file-count, and page limits with clear skip warnings.
-- Structured download errors instead of silent failures.
-- Local-timezone display for deadlines and events.
-
-## Then: better PDF extraction
-
-- Per-page structured extraction output.
-- Preserve educational content (captions, objectives, references) by default.
-
-## Later: cache, sync, and changes
+## Next: cache, sync, and changes
 
 - Local SQLite cache in the platform-native user data directory.
 - `worsaga sync` with metadata-only defaults.

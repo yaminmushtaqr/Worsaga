@@ -6,6 +6,7 @@ Usage:
     worsaga contents <id|code>   Show course sections & modules
     worsaga materials <id|code>  Discover downloadable materials
     worsaga download <id|code>   Download a material file
+    worsaga extract <id|code>    Extract per-page text from a material
     worsaga grades [id|code]     Show grade items
     worsaga assignments [id|code] Show assignment statuses
     worsaga forums <id|code>     Show course forums
@@ -56,9 +57,11 @@ from worsaga.forums import get_latest_updates as get_latest_updates_data
 from worsaga.grades import collect_grades as collect_grades_data
 from worsaga.grades import get_grade_summary as build_grade_summary
 from worsaga.client import DownloadError
+from worsaga.extraction import MAX_TEXT_PER_FILE
 from worsaga.materials import (
     MaterialSelectionError,
     download_material,
+    extract_material_content,
     extract_materials,
     get_section_materials,
     match_section,
@@ -244,6 +247,52 @@ def _build_parser() -> argparse.ArgumentParser:
     dn.add_argument(
         "--output", default=None, metavar="DIR",
         help="Directory to save the file (default: current directory)",
+    )
+
+    ex = sub.add_parser(
+        "extract", parents=[_shared],
+        help="Extract per-page text from a material (nothing saved to disk)",
+        description=(
+            "Fetch a material into memory and extract structured per-page "
+            "text — no file is written to disk (use 'worsaga download' to "
+            "save the file itself). Light cleaning preserves educational "
+            "content such as captions, learning objectives, and references "
+            "by default."
+        ),
+        epilog=(
+            "Example workflow:\n"
+            "  worsaga materials ECON101 --week 3            # discover files\n"
+            "  worsaga extract ECON101 --week 3 --match slides\n"
+            "  worsaga --json extract ECON101 --week 3 --index 0\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ex.add_argument(
+        "course",
+        help="Moodle course ID (integer) or course short-code (e.g. ECON101)",
+    )
+    ex.add_argument(
+        "--week", required=True,
+        help="Teaching week number or name substring",
+    )
+    ex.add_argument(
+        "--match", default=None,
+        help="Substring filter on file/module name to narrow selection",
+    )
+    ex.add_argument(
+        "--index", type=int, default=None,
+        help="Zero-based index to pick from matching materials",
+    )
+    ex.add_argument(
+        "--raw", action="store_true",
+        help="Skip boilerplate cleaning; return extractor output unchanged",
+    )
+    ex.add_argument(
+        "--max-chars", type=int, default=None, metavar="N",
+        help=(
+            "Cap total extracted text at N characters "
+            f"(default: {MAX_TEXT_PER_FILE}; 0 = no cap)"
+        ),
     )
 
     gr = sub.add_parser("grades", parents=[_shared], help="Show grade items")
@@ -596,7 +645,7 @@ def cmd_courses(args: argparse.Namespace) -> None:
         print("No enrolled courses found.")
         return
     print(f"{'ID':>8}  {'Short code':<20}  {'Full name'}")
-    print(f"{'─' * 8}  {'─' * 20}  {'─' * 40}")
+    print(f"{'-' * 8}  {'-' * 20}  {'-' * 40}")
     for c in courses:
         print(f"{c['id']:>8}  {c.get('shortname', ''):.<20}  {c.get('fullname', '')}")
 
@@ -610,7 +659,7 @@ def cmd_deadlines(args: argparse.Namespace) -> None:
         print(f"No deadlines in the next {args.days} days.")
         return
     print(f"{'Due':<22}  {'Days':>4}  {'Type':<12}  {'Course':<15}  {'Name'}")
-    print(f"{'─' * 22}  {'─' * 4}  {'─' * 12}  {'─' * 15}  {'─' * 30}")
+    print(f"{'-' * 22}  {'-' * 4}  {'-' * 12}  {'-' * 15}  {'-' * 30}")
     for d in deadlines:
         print(
             f"{d['due_str']:<22}  {d['days_left']:>4}  {d['type']:<12}  "
@@ -949,8 +998,8 @@ def cmd_materials(args: argparse.Namespace) -> None:
         f"{'File':<30}  {'Size':>10}"
     )
     print(
-        f"{'─' * 30}  {'─' * 25}  {'─' * 10}  "
-        f"{'─' * 30}  {'─' * 10}"
+        f"{'-' * 30}  {'-' * 25}  {'-' * 10}  "
+        f"{'-' * 30}  {'-' * 10}"
     )
     for m in materials:
         size = m["file_size"]
@@ -967,11 +1016,19 @@ def cmd_materials(args: argparse.Namespace) -> None:
         )
 
 
-def cmd_download(args: argparse.Namespace) -> None:
+def _select_week_material(
+    args: argparse.Namespace,
+    client: MoodleClient,
+    course_id: int,
+) -> dict:
+    """Discover materials for ``args.week`` and select exactly one.
+
+    Shared by the ``download`` and ``extract`` commands. On no materials
+    or an ambiguous/failed selection, emits the structured (or human)
+    candidate error exactly like ``download`` always has and exits 1.
+    """
     from worsaga.materials import candidate_summary
 
-    client = _client(args)
-    course_id = _resolve_course_id(client, args.course)
     sections = client.get_course_contents(course_id)
     materials = get_section_materials(
         sections, course_id, args.week, base_url=client.base_url,
@@ -986,7 +1043,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        chosen = select_material(
+        return select_material(
             materials, match=getattr(args, "match", None),
             index=getattr(args, "index", None),
         )
@@ -1011,6 +1068,12 @@ def cmd_download(args: argparse.Namespace) -> None:
                         file=sys.stderr,
                     )
         sys.exit(1)
+
+
+def cmd_download(args: argparse.Namespace) -> None:
+    client = _client(args)
+    course_id = _resolve_course_id(client, args.course)
+    chosen = _select_week_material(args, client, course_id)
 
     if not args.quiet:
         print(
@@ -1037,6 +1100,49 @@ def cmd_download(args: argparse.Namespace) -> None:
             else "0 B"
         )
         print(f"Saved: {result['local_path']} ({size_str})")
+
+
+def cmd_extract(args: argparse.Namespace) -> None:
+    client = _client(args)
+    course_id = _resolve_course_id(client, args.course)
+    chosen = _select_week_material(args, client, course_id)
+
+    if not args.quiet:
+        print(
+            f"Extracting {chosen.get('file_name') or chosen.get('module_name')}...",
+            file=sys.stderr,
+        )
+
+    max_chars = args.max_chars if args.max_chars is not None else MAX_TEXT_PER_FILE
+    try:
+        result = extract_material_content(
+            client, chosen, max_chars=max_chars, clean=not args.raw,
+        )
+    except DownloadError as exc:
+        if wants_structured(args):
+            _emit_data(args, {"error": str(exc), "error_code": exc.code})
+        else:
+            print(f"Error ({exc.code}): {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if _emit_data(args, result):
+        return
+
+    unit = "Slide" if result["file_type"] == "pptx" else "Page"
+    # ASCII separators only: Windows consoles often use cp1252, where
+    # box-drawing characters raise UnicodeEncodeError.
+    print(f"# {result['filename']} - {result['section_name']}")
+    for page in result["pages"]:
+        print(f"\n--- {unit} {page['page']} ---")
+        if page["markdown"]:
+            print(page["markdown"])
+        for page_warning in page["warnings"]:
+            print(f"Warning ({unit.lower()} {page['page']}): {page_warning}",
+                  file=sys.stderr)
+    if not result["pages"]:
+        print("(no extractable text)")
+    for warning in result["warnings"]:
+        print(f"Warning: {warning}", file=sys.stderr)
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
@@ -1087,7 +1193,7 @@ def cmd_search(args: argparse.Namespace) -> None:
         return
 
     print(f"{'Section':<30}  {'Module':<30}  {'Type':<12}")
-    print(f"{'─' * 30}  {'─' * 30}  {'─' * 12}")
+    print(f"{'-' * 30}  {'-' * 30}  {'-' * 12}")
     for r in results:
         print(
             f"{r['section_name'][:30]:<30}  "
@@ -1302,7 +1408,25 @@ def cmd_setup(args: argparse.Namespace) -> None:
 # ── Main ──────────────────────────────────────────────────────────
 
 
+def _reconfigure_streams() -> None:
+    """Make stdout/stderr tolerate characters their encoding can't represent.
+
+    Windows consoles and pipes often use legacy code pages (cp1252),
+    where printing extracted course text — or any non-ASCII character —
+    raises UnicodeEncodeError and kills the command. Substituting a
+    replacement character is always preferable to crashing mid-output.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # Non-TextIOWrapper streams (test harnesses, exotic hosts)
+            # simply keep their existing behaviour.
+            pass
+
+
 def main(argv: list[str] | None = None) -> None:
+    _reconfigure_streams()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -1330,6 +1454,7 @@ def main(argv: list[str] | None = None) -> None:
         "contents": cmd_contents,
         "materials": cmd_materials,
         "download": cmd_download,
+        "extract": cmd_extract,
         "summary": cmd_summary,
         "setup": cmd_setup,
         "search": cmd_search,

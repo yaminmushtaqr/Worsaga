@@ -141,6 +141,7 @@ worsaga materials ECON101    # List downloadable materials (discovery)
 worsaga materials ECON101 --week 3 # Materials for week 3 only
 worsaga download ECON101 --week 3 --match slides  # Download a file (authenticated)
 worsaga download ECON101 --week 3 --index 0       # Download by index
+worsaga extract ECON101 --week 3 --match slides   # Per-page text, nothing saved
 worsaga summary ECON101 --week 3   # Study notes for a week (extractive)
 worsaga search ECON101 regression  # Search course content by keyword
 worsaga doctor               # Check auth and connectivity
@@ -180,7 +181,7 @@ The server runs over stdio. Tools: `list_courses`, `get_deadlines`,
 `get_notifications`, `get_messages`, `get_digest`, `get_calendar_events`,
 `get_course_contents`, `get_week_materials` (discovery),
 `search_course_content`, `get_weekly_summary`, `download_material`
-(authenticated fetch).
+(authenticated fetch), `extract_material` (per-page text, in memory).
 
 Minimal MCP configuration:
 
@@ -226,15 +227,16 @@ Here is that prompt running against the demo dataset in Claude Code
 ![Worsaga MCP demo transcript: an agent lists upcoming deadlines and week 3
 study notes from the fake dataset](docs/demo-mcp-transcript.png)
 
-## Discovery vs. download
+## Discovery, download, and extraction
 
-There are two distinct steps — **discovery** and **download** — with separate
-commands for each:
+There are three distinct steps — **discovery**, **download**, and
+**extraction** — with separate commands for each:
 
 | Purpose | CLI | MCP tool |
 |---------|-----|----------|
 | **List** available files (metadata only) | `worsaga materials` | `get_week_materials()` |
 | **Download** a file (authenticated) | `worsaga download` | `download_material()` |
+| **Extract** per-page text (in memory, nothing saved) | `worsaga extract` | `extract_material()` |
 
 `materials` / `get_week_materials` return file metadata only. Raw Moodle
 `file_url` values are omitted by default because they require token
@@ -246,7 +248,14 @@ partially written file behind.
 ```bash
 worsaga materials ECON101 --week 3               # discover
 worsaga download ECON101 --week 3 --match slides # fetch
+worsaga extract ECON101 --week 3 --match slides  # read, page by page
 ```
+
+`extract` fetches the file into memory and returns structured per-page text
+(per-slide for PPTX) with light Markdown rendering — captions, learning
+objectives, and references are preserved by default (`--raw` skips cleaning).
+Pages dominated by images are flagged rather than silently empty. Nothing is
+written to disk.
 
 If multiple materials match, you get a structured candidate list with indices
 to pick from (`--index 0`).

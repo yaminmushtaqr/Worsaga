@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from worsaga.client import DownloadError
+from worsaga.extraction import MAX_TEXT_PER_FILE, extract_file_structured
 
 if TYPE_CHECKING:
     from worsaga.client import MoodleClient
@@ -502,6 +503,81 @@ def download_material(
         "file_size": material.get("file_size", 0),
         "bytes_written": len(data),
     }
+    if material.get("view_url"):
+        result["view_url"] = material["view_url"]
+    return result
+
+
+def extract_material_content(
+    client: "MoodleClient",
+    material: dict,
+    *,
+    max_chars: int = MAX_TEXT_PER_FILE,
+    clean: bool = True,
+    aggressive: bool = False,
+) -> dict:
+    """Fetch a material into memory and extract per-page structured text.
+
+    Downloads the file through the authenticated client (token never
+    exposed) and runs :func:`worsaga.extraction.extract_file_structured`
+    on the bytes. Nothing is written to disk — use
+    :func:`download_material` to save the file itself.
+
+    Parameters
+    ----------
+    client : MoodleClient
+        Authenticated client instance.
+    material : dict
+        A material record (from :func:`extract_materials` etc.).
+    max_chars : int
+        Cap on total extracted text across pages (0 = no cap).
+    clean : bool
+        Strip boilerplate lines. The default light tier preserves
+        educational content — captions, objectives, references.
+    aggressive : bool
+        With ``clean=True``, also strip captions, source lines, and
+        structural headings (the summary-bullet tier).
+
+    Returns
+    -------
+    dict
+        The :func:`extract_file_structured` result — ``filename``,
+        ``file_type``, ``pages``, ``warnings`` — plus ``course_id``,
+        ``section_name``, ``module_name``, ``mime_type``, ``file_size``,
+        ``page_count``, and ``view_url`` (if available). **No tokens or
+        authenticated URLs are included.**
+
+    Raises
+    ------
+    DownloadError
+        Categorized fetch failure (auth, not_found, network, oversize,
+        invalid_url, empty) with a token-free message.
+    """
+    file_url = material.get("file_url", "")
+    if not file_url:
+        raise DownloadError(
+            "invalid_url", "Material has no file_url — cannot extract.",
+        )
+
+    file_name = material.get("file_name", "")
+    if not file_name:
+        file_name = _sanitize_filename(material.get("module_name", "material"))
+
+    data = client.download_file(file_url)
+    if data is None:
+        # Defensive: the real client raises, but stand-ins may return None.
+        raise DownloadError("empty", f"Download failed for '{file_name}'.")
+
+    result = extract_file_structured(
+        data, file_name,
+        max_chars=max_chars, clean=clean, aggressive=aggressive,
+    )
+    result["course_id"] = material.get("course_id", 0)
+    result["section_name"] = material.get("section_name", "")
+    result["module_name"] = material.get("module_name", "")
+    result["mime_type"] = material.get("mime_type", "")
+    result["file_size"] = material.get("file_size", 0)
+    result["page_count"] = len(result["pages"])
     if material.get("view_url"):
         result["view_url"] = material["view_url"]
     return result

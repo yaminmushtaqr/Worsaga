@@ -1,5 +1,15 @@
 # CLAUDE.md — Worsaga
 
+## Verify your own work through the real surfaces
+
+Worsaga is agents-first software. After every implementation, test and
+verify the change yourself before reporting it done: run `pytest` and
+`ruff`, then exercise the changed behaviour end-to-end through the actual
+CLI (demo mode) and the MCP server tools (in-process with `WORSAGA_DEMO=1`),
+and review the real output. Do not ask the maintainer to review unverified
+behaviour — present evidence of what ran and what it produced. See
+"Post-implementation verification" in `AGENTS.md` for the exact recipe.
+
 ## Never commit private or planning documents
 
 Never commit, stage, or push, in this repository or any repository derived
