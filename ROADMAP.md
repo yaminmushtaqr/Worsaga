@@ -42,11 +42,13 @@ Version `0.6.0` includes:
 - Markdown study-pack exports for a course week — `worsaga study-pack`.
 - Tokens and authenticated URLs stay out of the index and the exports.
 
-## Later: notifications and auto-sync
+## New in 0.8.0 (unreleased): notifications and auto-sync
 
-- Watch mode for local sync loops.
-- Local notification backends where practical.
-- `worsaga auto-sync install`, `status`, and `remove`.
+- Watch mode for local sync loops — `worsaga watch`.
+- Local notification backends where practical (Windows toast, macOS
+  `osascript`, Linux `notify-send`), best effort and dependency-free.
+- `worsaga auto-sync install`, `status`, and `remove`, with `--dry-run`
+  previews of every scheduler change.
 
 ## Later: optional AI workflows
 

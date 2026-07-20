@@ -22,6 +22,8 @@ Usage:
     worsaga study-pack <id|code> Export a Markdown study pack for a week
     worsaga sync                 Sync metadata to the local cache
     worsaga changes              Show changes detected by syncs
+    worsaga watch                Foreground sync loop with notifications
+    worsaga auto-sync <action>   Manage the scheduled background sync
     worsaga doctor               Check auth and connectivity
     worsaga config [path]        Show active config file location
     worsaga setup                Guided first-time configuration
@@ -74,8 +76,15 @@ from worsaga.materials import (
     select_material,
     strip_file_urls,
 )
+from worsaga.autosync import (
+    DEFAULT_INTERVAL_MINUTES,
+    autosync_status,
+    install_autosync,
+    remove_autosync,
+)
 from worsaga.output import render_structured, wants_structured
 from worsaga.sections import find_best_section, summarize_modules
+from worsaga.watch import DEFAULT_WATCH_INTERVAL, run_watch
 from worsaga.studypack import build_study_pack, write_study_pack
 from worsaga.summaries import build_weekly_summary, format_bullets
 from worsaga.textindex import (
@@ -91,7 +100,7 @@ from worsaga.sync import (
 )
 from worsaga.messages import get_messages as get_messages_data
 from worsaga.messages import get_notifications as get_notifications_data
-from worsaga.time_utils import parse_since, timestamp_to_display
+from worsaga.time_utils import parse_interval, parse_since, timestamp_to_display
 
 
 PUBLIC_INSTALL_SPEC = "worsaga[mcp]"
@@ -572,6 +581,61 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=list(SYNC_CATEGORIES),
         help="Only show changes from one category",
+    )
+
+    wt = sub.add_parser(
+        "watch", parents=[_shared],
+        help="Run a foreground sync loop with change notifications",
+        description=(
+            "Repeatedly run the metadata sync on a fixed interval, print "
+            "detected changes, and raise a local desktop notification "
+            "when something changed. Runs in the foreground; stop with "
+            "Ctrl+C. For unattended background syncs use "
+            "'worsaga auto-sync install' instead."
+        ),
+    )
+    wt.add_argument(
+        "--interval", default=None, metavar="SPAN",
+        help="Time between syncs like 15m, 900, or 1h (default: 15m)",
+    )
+    wt.add_argument(
+        "--cycles", type=_non_negative_int, default=None,
+        help="Stop after this many sync cycles (default: run until Ctrl+C)",
+    )
+    wt.add_argument(
+        "--no-notify", action="store_true",
+        help="Do not send desktop notifications",
+    )
+    wt.add_argument(
+        "--days", type=int, default=SYNC_LOOKAHEAD_DAYS,
+        help=f"Deadline look-ahead window in days (default: {SYNC_LOOKAHEAD_DAYS})",
+    )
+
+    au = sub.add_parser(
+        "auto-sync", parents=[_shared],
+        help="Manage the scheduled background sync (install/status/remove)",
+        description=(
+            "Register a periodic 'worsaga sync --quiet' with the "
+            "platform scheduler (Task Scheduler on Windows, launchd on "
+            "macOS, a systemd user timer on Linux), inspect it, or "
+            "remove it. 'install --dry-run' shows exactly what would "
+            "be executed or written without changing anything."
+        ),
+    )
+    au.add_argument(
+        "action", choices=["install", "status", "remove"],
+        help="What to do with the scheduled sync",
+    )
+    au.add_argument(
+        "--interval", default=None, metavar="SPAN",
+        help=(
+            "Time between background syncs like 30m or 2h "
+            f"(install only; default: {DEFAULT_INTERVAL_MINUTES}m)"
+        ),
+    )
+    au.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what install/remove would do without doing it",
     )
 
     sub.add_parser("doctor", parents=[_shared], help="Check auth and connectivity")
@@ -1546,6 +1610,129 @@ def cmd_changes(args: argparse.Namespace) -> None:
     _print_change_table(changes)
 
 
+def cmd_watch(args: argparse.Namespace) -> None:
+    client = _client(args)
+    interval = parse_interval(args.interval, default=DEFAULT_WATCH_INTERVAL)
+    structured = wants_structured(args)
+
+    if not structured and not args.quiet:
+        print(
+            f"Watching {client.base_url} every {interval}s "
+            "(Ctrl+C to stop)...",
+            file=sys.stderr,
+        )
+
+    def _on_cycle(result: dict) -> None:
+        if structured:
+            # One structured payload per cycle (JSON/YAML lines).
+            print(
+                render_structured(
+                    result,
+                    json_mode=getattr(args, "json", False),
+                    yaml_mode=getattr(args, "yaml", False),
+                ),
+                flush=True,
+            )
+            return
+        stamp = _display_timestamp(result.get("synced_at"))
+        if not result.get("ok"):
+            print(
+                f"[{stamp}] sync failed: {result.get('error')}",
+                file=sys.stderr,
+            )
+            return
+        changes = result.get("changes", [])
+        print(f"[{stamp}] cycle {result['cycle']}: {len(changes)} change(s)")
+        if changes:
+            _print_change_table(changes)
+        notification = result.get("notification")
+        if notification and not notification.get("sent") and not args.quiet:
+            print(
+                f"  (notification not sent: {notification.get('error', '')})",
+                file=sys.stderr,
+            )
+        for warning in result.get("warnings", []):
+            print(f"Warning: {warning}", file=sys.stderr)
+
+    try:
+        summary = run_watch(
+            client,
+            interval_seconds=interval,
+            max_cycles=args.cycles,
+            notify=not args.no_notify,
+            lookahead_days=args.days,
+            on_cycle=_on_cycle,
+        )
+    except KeyboardInterrupt:
+        if not structured and not args.quiet:
+            print("\nWatch stopped.", file=sys.stderr)
+        return
+
+    if not structured and not args.quiet:
+        print(
+            f"Watch finished: {summary['cycles']} cycle(s), "
+            f"{summary['changes_total']} change(s), "
+            f"{summary['failures']} failed cycle(s).",
+            file=sys.stderr,
+        )
+
+
+def cmd_autosync(args: argparse.Namespace) -> None:
+    if args.action == "status":
+        result = autosync_status()
+        if _emit_data(args, result):
+            return
+        state = "installed" if result["installed"] else "not installed"
+        print(f"Auto-sync: {state} ({result.get('method', '?')})")
+        record = result.get("record")
+        if record:
+            print(f"  interval: {record.get('interval_minutes', '?')} min")
+            print(f"  command:  {' '.join(record.get('command', []))}")
+        if result.get("error"):
+            print(f"Warning: {result['error']}", file=sys.stderr)
+        return
+
+    if args.action == "install":
+        seconds = parse_interval(
+            args.interval, default=DEFAULT_INTERVAL_MINUTES * 60,
+        )
+        result = install_autosync(
+            max(1, seconds // 60), dry_run=args.dry_run,
+        )
+    else:
+        result = remove_autosync(dry_run=args.dry_run)
+
+    if _emit_data(args, result):
+        if result.get("error"):
+            sys.exit(1)
+        return
+
+    label = "install" if args.action == "install" else "remove"
+    if result.get("error"):
+        print(f"Error: auto-sync {label} failed: {result['error']}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    suffix = " (dry run - nothing was changed)" if result["dry_run"] else ""
+    if args.action == "install":
+        print(
+            f"Auto-sync {label}: {result['method']}, "
+            f"every {result['interval_minutes']} min{suffix}"
+        )
+    else:
+        print(f"Auto-sync {label}: {result['method']}{suffix}")
+    for action in result.get("actions", []):
+        if "run" in action:
+            print(f"  run:    {' '.join(action['run'])}")
+        elif "write" in action:
+            print(f"  write:  {action['write']}")
+        elif "delete" in action:
+            print(f"  delete: {action['delete']}")
+    if not result["dry_run"]:
+        done = "installed" if args.action == "install" else "removed"
+        print(f"Auto-sync {done}.")
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     if _demo_mode(args):
         info = DemoMoodleClient().site_info()
@@ -1807,6 +1994,8 @@ def main(argv: list[str] | None = None) -> None:
         "study-pack": cmd_study_pack,
         "sync": cmd_sync,
         "changes": cmd_changes,
+        "watch": cmd_watch,
+        "auto-sync": cmd_autosync,
         "doctor": cmd_doctor,
         "update": cmd_update,
         "config": cmd_config,

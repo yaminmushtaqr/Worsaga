@@ -55,6 +55,24 @@ def calculate_days_left(ts: int | float | None, *, now: int | float | None = Non
     return int((int(ts) - base) / 86400)
 
 
+def parse_interval(value: str | None, *, default: int = 900) -> int:
+    """Parse an interval like ``900``, ``15m``, ``2h``, or ``1d`` into seconds.
+
+    Bare numbers are seconds. Raises ``ValueError`` for anything else.
+    """
+    if value is None:
+        return default
+    raw = value.strip().lower()
+    if not raw:
+        return default
+    match = re.fullmatch(r"(\d+)\s*([smhd]?)", raw)
+    if not match:
+        raise ValueError("interval must be like 900, 30s, 15m, 2h, or 1d")
+    amount = int(match.group(1))
+    unit = match.group(2) or "s"
+    return amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+
 def parse_since(value: str | None, *, now: int | float | None = None) -> int | None:
     """Parse ``7d``, ``24h``, or ``YYYY-MM-DD`` into a Unix timestamp."""
     if value is None:

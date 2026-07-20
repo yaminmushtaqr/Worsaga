@@ -2,6 +2,37 @@
 
 All notable changes to Worsaga are documented in this file.
 
+## 0.8.0 (unreleased)
+
+### Added
+
+- Watch mode. `worsaga watch [--interval 15m] [--cycles N]` runs the
+  metadata sync in a foreground loop, prints detected changes each
+  cycle, and raises a local desktop notification when something
+  changed. Structured mode (`--json`/`--yaml`) emits one payload per
+  cycle. A failed cycle (network down) is reported and the loop
+  continues; intervals are clamped to at least 60 seconds.
+- Local notification backends, best effort and dependency-free: a
+  Windows toast via PowerShell/WinRT, macOS `osascript`, and Linux
+  `notify-send`, with a structured no-backend result everywhere else.
+  Notification content is course metadata only — never tokens or URLs
+  — and content is escaped/argv-passed so it can never inject into the
+  notification scripts.
+- `worsaga auto-sync install|status|remove`: register a periodic
+  `worsaga sync --quiet` with the platform scheduler (Task Scheduler
+  on Windows, a launchd LaunchAgent on macOS, a systemd user timer on
+  Linux; systems without user systemd get a clear cron suggestion).
+  `install`/`remove` support `--dry-run`, which shows the exact
+  commands and files involved without changing anything; `status` is
+  always read-only. The scheduled command line contains no
+  credentials. A local `autosync.json` record keeps `status` honest
+  without parsing locale-dependent scheduler output.
+- MCP: read-only `get_autosync_status` tool. Installing or removing
+  the scheduled sync stays CLI-only by design.
+- New public API: `worsaga.run_watch`, `worsaga.send_notification`,
+  `worsaga.notification_backend`, `worsaga.install_autosync`,
+  `worsaga.autosync_status`, `worsaga.remove_autosync`.
+
 ## 0.7.0 (unreleased)
 
 ### Added

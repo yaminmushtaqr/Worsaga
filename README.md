@@ -153,6 +153,10 @@ worsaga search-text "price elasticity"  # Full-text search, no network
 worsaga study-pack ECON101 --week 3     # Export a Markdown study pack
 worsaga sync                 # Sync metadata to the local cache, report changes
 worsaga changes --since 7d   # Show changes detected by previous syncs
+worsaga watch --interval 15m # Foreground sync loop with notifications
+worsaga auto-sync install    # Register a scheduled background sync
+worsaga auto-sync status     # Is the background sync registered?
+worsaga auto-sync remove     # Unregister it again
 worsaga doctor               # Check auth and connectivity
 worsaga setup                # Guided first-time setup
 worsaga update               # Show the safe upgrade command
@@ -194,7 +198,8 @@ The server runs over stdio. Tools: `list_courses`, `get_deadlines`,
 `sync_now` (metadata sync + change detection), `get_changes` (recorded
 changes, no network), `build_search_index` (local full-text index),
 `search_text` (offline full-text search), `export_study_pack` (Markdown
-study pack for a week).
+study pack for a week), `get_autosync_status` (read-only scheduled-sync
+check).
 
 Minimal MCP configuration:
 
@@ -297,6 +302,35 @@ The cache lives in the platform-native user data directory
 are never written to it, and cache rows are keyed by Moodle site, so demo-mode
 data never mixes with real course data. The MCP equivalents are `sync_now()`
 and `get_changes()`.
+
+## Watch mode and auto-sync
+
+`worsaga watch` runs the sync loop in your terminal: it re-syncs on a fixed
+interval, prints any detected changes, and raises a desktop notification
+when something changed (Windows toast, macOS notification, or
+`notify-send` on Linux — best effort, no extra dependencies). Stop it with
+Ctrl+C.
+
+```bash
+worsaga watch                    # sync every 15 minutes until Ctrl+C
+worsaga watch --interval 1h --no-notify
+```
+
+For unattended syncs, `worsaga auto-sync` registers a periodic
+`worsaga sync --quiet` with your platform's scheduler — Task Scheduler on
+Windows, launchd on macOS, a systemd user timer on Linux:
+
+```bash
+worsaga auto-sync install --interval 30m --dry-run  # preview, changes nothing
+worsaga auto-sync install --interval 30m            # register it
+worsaga auto-sync status                            # read-only check
+worsaga auto-sync remove                            # unregister cleanly
+```
+
+`--dry-run` prints the exact commands and files an install or remove would
+touch. The scheduled command line never contains credentials — the
+background sync loads configuration the same way a manual run does. Check
+what it found later with `worsaga changes`.
 
 ## Full-text search and study packs
 

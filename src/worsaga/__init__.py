@@ -1,6 +1,6 @@
 """worsaga — Open-source, local-first, read-only study toolkit for Moodle."""
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 from worsaga.assignments import get_assignment_status, get_assignments, normalize_assignment
 from worsaga.calendar import get_calendar_events, normalize_calendar_events
@@ -62,8 +62,15 @@ from worsaga.sections import (
     score_section_match,
     summarize_modules,
 )
+from worsaga.autosync import (
+    autosync_status,
+    install_autosync,
+    remove_autosync,
+)
 from worsaga.cache import CacheStore, default_cache_path
+from worsaga.notify import notification_backend, send_notification
 from worsaga.studypack import build_study_pack, write_study_pack
+from worsaga.watch import run_watch
 from worsaga.textindex import (
     TextIndexError,
     TextIndexStore,
@@ -103,6 +110,12 @@ __all__ = [
     "CacheStore",
     "TextIndexError",
     "TextIndexStore",
+    "autosync_status",
+    "install_autosync",
+    "notification_backend",
+    "remove_autosync",
+    "run_watch",
+    "send_notification",
     "build_study_pack",
     "build_text_index",
     "default_cache_path",

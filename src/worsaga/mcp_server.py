@@ -28,6 +28,7 @@ Exposes tools:
     - build_search_index
     - search_text
     - export_study_pack
+    - get_autosync_status
 
 Requires the ``mcp`` extra: pip install worsaga[mcp]
 
@@ -67,6 +68,7 @@ from worsaga.materials import (
     select_material as _select_material,
     strip_file_urls,
 )
+from worsaga.autosync import autosync_status as _autosync_status
 from worsaga.studypack import build_study_pack as _build_study_pack
 from worsaga.studypack import write_study_pack as _write_study_pack
 from worsaga.summaries import build_weekly_summary, format_bullets
@@ -646,6 +648,20 @@ def export_study_pack(
         }
     result["path"] = str(path)
     return result
+
+
+@mcp.tool()
+def get_autosync_status() -> dict[str, Any]:
+    """Report whether a scheduled background sync is registered.
+
+    Read-only: inspects the platform scheduler (Task Scheduler on
+    Windows, launchd on macOS, a systemd user timer on Linux) and the
+    local install record, and changes nothing. Installing or removing
+    the scheduled sync modifies system state and is deliberately CLI
+    only — direct the user to ``worsaga auto-sync install`` /
+    ``worsaga auto-sync remove`` (both support ``--dry-run``).
+    """
+    return _autosync_status()
 
 
 def main() -> None:
