@@ -188,7 +188,9 @@ class TestGetVersion:
 
     def test_matches_pyproject_version(self):
         """__version__ must stay in sync with pyproject.toml."""
-        import tomllib
+        # tomllib is stdlib only on Python 3.11+; on 3.10 the CI
+        # version-consistency job still covers this check.
+        tomllib = pytest.importorskip("tomllib")
         from pathlib import Path
         from worsaga import __version__
         pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
