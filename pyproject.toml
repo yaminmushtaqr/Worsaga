@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worsaga"
+version = "0.4.0"
+description = "Open-source, local-first study toolkit for Moodle"
+requires-python = ">=3.10"
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+keywords = ["moodle", "lms", "education", "study", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Education",
+]
+dependencies = ["platformdirs>=2.10", "pymupdf>=1.23", "rich>=13.0"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+yaml = ["PyYAML>=6.0"]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/yaminmushtaqr/worsaga"
+Repository = "https://github.com/yaminmushtaqr/worsaga"
+Issues = "https://github.com/yaminmushtaqr/worsaga/issues"
+
+[project.scripts]
+worsaga = "worsaga.cli:main"
+worsaga-mcp = "worsaga.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

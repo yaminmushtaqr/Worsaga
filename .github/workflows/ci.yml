@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: python -m pip install --upgrade pip ruff
+      - name: Run ruff
+        run: python -m ruff check src tests
+
+  version-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check pyproject and package versions match
+        run: |
+          python - <<'EOF'
+          import re, sys, tomllib
+          with open("pyproject.toml", "rb") as f:
+              proj = tomllib.load(f)["project"]["version"]
+          src = open("src/worsaga/__init__.py", encoding="utf-8").read()
+          pkg = re.search(r'__version__\s*=\s*"([^"]+)"', src).group(1)
+          if proj != pkg:
+              sys.exit(f"version mismatch: pyproject={proj} __init__={pkg}")
+          print(f"version OK: {proj}")
+          EOF
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+      - name: Public release audit (tracked files + built artifacts)
+        run: bash scripts/audit_public_release.sh
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.12", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package with dev extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp,yaml]"
+      - name: Run pytest
+        run: python -m pytest -q
+
+  package-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            venv-bin: bin
+          - os: macos-latest
+            venv-bin: bin
+          - os: windows-latest
+            venv-bin: Scripts
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Smoke-test wheel install
+        shell: bash
+        run: |
+          python -m venv test-wheel
+          test-wheel/${{ matrix.venv-bin }}/pip install dist/*.whl
+          test-wheel/${{ matrix.venv-bin }}/worsaga --help
+          test-wheel/${{ matrix.venv-bin }}/python -m worsaga.cli --help
+          test-wheel/${{ matrix.venv-bin }}/worsaga config --json
+      - name: Smoke-test sdist install
+        shell: bash
+        run: |
+          python -m venv test-sdist
+          test-sdist/${{ matrix.venv-bin }}/pip install dist/*.tar.gz
+          test-sdist/${{ matrix.venv-bin }}/worsaga --help
+          test-sdist/${{ matrix.venv-bin }}/python -m worsaga.cli --help
+          test-sdist/${{ matrix.venv-bin }}/worsaga config --json
