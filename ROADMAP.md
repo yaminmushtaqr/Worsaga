@@ -5,7 +5,7 @@ local scratch files must stay out of the repository.
 
 ## Current baseline
 
-Version `0.5.0` (unreleased) includes:
+Version `0.5.0` includes:
 
 - CLI and MCP server entrypoints.
 - Read-only Moodle client with a hardcoded allowlist.
