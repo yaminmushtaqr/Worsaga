@@ -17,6 +17,9 @@ Usage:
     worsaga calendar [id|code]   Show calendar events
     worsaga summary <id|code>    Generate weekly study summary
     worsaga search <id|code> <q> Search course content by keyword
+    worsaga index [id|code]      Build the local full-text search index
+    worsaga search-text <q>      Search indexed material text (no network)
+    worsaga study-pack <id|code> Export a Markdown study pack for a week
     worsaga sync                 Sync metadata to the local cache
     worsaga changes              Show changes detected by syncs
     worsaga doctor               Check auth and connectivity
@@ -73,7 +76,13 @@ from worsaga.materials import (
 )
 from worsaga.output import render_structured, wants_structured
 from worsaga.sections import find_best_section, summarize_modules
+from worsaga.studypack import build_study_pack, write_study_pack
 from worsaga.summaries import build_weekly_summary, format_bullets
+from worsaga.textindex import (
+    INDEX_MAX_FILES_PER_RUN,
+    build_text_index,
+    search_text_index,
+)
 from worsaga.sync import (
     SYNC_CATEGORIES,
     SYNC_LOOKAHEAD_DAYS,
@@ -457,6 +466,79 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Moodle course ID (integer) or course short-code (e.g. ECON101)",
     )
     sr.add_argument("query", help="Search keyword (case-insensitive)")
+
+    ix = sub.add_parser(
+        "index", parents=[_shared],
+        help="Build or update the local full-text search index",
+        description=(
+            "Fetch supported course materials (PDF, PPTX, DOCX, TXT) in "
+            "memory, extract their text, and store it page by page in a "
+            "local SQLite full-text index. Files unchanged since the "
+            "last run are skipped, so re-running is cheap. Tokens and "
+            "authenticated URLs are never stored."
+        ),
+    )
+    ix.add_argument(
+        "course", nargs="?", default=None,
+        help="Moodle course ID or short-code (default: all courses)",
+    )
+    ix.add_argument(
+        "--week", default=None,
+        help="Only index sections matching this week number or name",
+    )
+    ix.add_argument(
+        "--max-files", type=_non_negative_int, default=INDEX_MAX_FILES_PER_RUN,
+        help=(
+            "Cap on files fetched this run "
+            f"(default: {INDEX_MAX_FILES_PER_RUN})"
+        ),
+    )
+
+    st = sub.add_parser(
+        "search-text", parents=[_shared],
+        help="Full-text search over indexed material text (no network)",
+        description=(
+            "Search the local full-text index built by 'worsaga index'. "
+            "Runs entirely offline against previously indexed material "
+            "text and reports the course, file, and page of each hit."
+        ),
+    )
+    st.add_argument("query", help="Search terms (matched with AND)")
+    st.add_argument(
+        "--course", default=None,
+        help="Limit hits to one course (ID or short-code)",
+    )
+    st.add_argument(
+        "--limit", type=_non_negative_int, default=20,
+        help="Maximum hits to show (default: 20)",
+    )
+
+    sk = sub.add_parser(
+        "study-pack", parents=[_shared],
+        help="Export a Markdown study pack for a course week",
+        description=(
+            "Build a single Markdown document for one teaching week: "
+            "study notes, a materials overview, and the extracted "
+            "per-page content of every supported file in the section."
+        ),
+    )
+    sk.add_argument(
+        "course",
+        help="Moodle course ID (integer) or course short-code (e.g. ECON101)",
+    )
+    sk.add_argument(
+        "--week",
+        required=True,
+        help="Teaching week number or name query (e.g. 3, revision, reading)",
+    )
+    sk.add_argument(
+        "--output", default=None, metavar="DIR",
+        help="Directory to write the pack into (default: current directory)",
+    )
+    sk.add_argument(
+        "--stdout", action="store_true",
+        help="Print the Markdown to stdout instead of writing a file",
+    )
 
     sy = sub.add_parser(
         "sync", parents=[_shared],
@@ -1254,6 +1336,139 @@ def cmd_search(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_index(args: argparse.Namespace) -> None:
+    client = _client(args)
+    course_id = None
+    if args.course is not None:
+        course_id = _resolve_course_id(client, args.course)
+
+    def _on_file(filename: str) -> None:
+        if not wants_structured(args) and not args.quiet:
+            print(f"  Indexing {filename}...", file=sys.stderr)
+
+    result = build_text_index(
+        client,
+        course_id=course_id,
+        week=args.week,
+        max_files=args.max_files,
+        on_file=_on_file,
+    )
+
+    if _emit_data(args, result):
+        return
+
+    print(f"Indexed {result['site']}")
+    print(
+        f"  files: {result['files_indexed']} indexed, "
+        f"{result['files_unchanged']} unchanged, "
+        f"{result['files_failed']} failed, "
+        f"{result['files_skipped_unsupported']} skipped (no extractor)"
+    )
+    stats = result["index"]
+    print(
+        f"  index: {stats['documents']} files / {stats['pages']} pages "
+        f"across {stats['courses']} course(s)"
+    )
+    print(f"  path:  {result['index_path']}")
+    if result["budget_exhausted"]:
+        print("\nFile budget reached - run 'worsaga index' again to continue.")
+    for warning in result["warnings"]:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def cmd_search_text(args: argparse.Namespace) -> None:
+    client = _client(args)
+    course_id = None
+    course_shortname = None
+    if args.course is not None:
+        # Resolve locally against the index (no network): numeric input
+        # is a course ID, anything else matches the stored short-code.
+        try:
+            course_id = int(args.course)
+        except ValueError:
+            course_shortname = args.course.strip()
+
+    result = search_text_index(
+        client.base_url,
+        args.query,
+        course_id=course_id,
+        course_shortname=course_shortname,
+        limit=args.limit,
+    )
+
+    if _emit_data(args, result):
+        return
+
+    hits = result["hits"]
+    if not hits:
+        if result["index"]["documents"] == 0:
+            print(
+                "Nothing indexed for this site yet. "
+                "Run 'worsaga index' first."
+            )
+        else:
+            print(f"No matches for '{args.query}'.")
+        return
+
+    print(f"{len(hits)} match(es) for '{args.query}':\n")
+    for hit in hits:
+        page_ref = f"p.{hit['page']}" if hit.get("page") else ""
+        location = "  ".join(
+            part for part in (
+                hit.get("course_shortname", ""),
+                hit.get("file_name", "") or hit.get("module_name", ""),
+                page_ref,
+            ) if part
+        )
+        print(location)
+        snippet = " ".join(str(hit.get("snippet", "")).split())
+        print(f"  {snippet}\n")
+
+
+def cmd_study_pack(args: argparse.Namespace) -> None:
+    client = _client(args)
+    course_id = _resolve_course_id(client, args.course)
+
+    def _on_file(filename: str) -> None:
+        if not wants_structured(args) and not args.quiet:
+            print(f"  Extracting {filename}...", file=sys.stderr)
+
+    result = build_study_pack(
+        client, course_id, args.week, on_file=_on_file,
+    )
+
+    if args.stdout:
+        if _emit_data(args, result):
+            return
+        print(result["markdown"])
+        for warning in result.get("warnings", []):
+            print(f"Warning: {warning}", file=sys.stderr)
+        return
+
+    path = write_study_pack(
+        result["markdown"],
+        args.output or os.getcwd(),
+        result["suggested_filename"],
+    )
+    # The markdown itself lives in the written file; keep the emitted
+    # payload compact.
+    payload = {key: value for key, value in result.items() if key != "markdown"}
+    payload["path"] = str(path)
+
+    if _emit_data(args, payload):
+        return
+
+    print(f"Study pack written to {path}")
+    print(
+        f"  {result['section_name'] or '(no section found)'} - "
+        f"{len(result['files'])} file(s), "
+        f"{sum(f['page_count'] for f in result['files'])} page(s), "
+        f"notes: {result['summary_method']}"
+    )
+    for warning in result.get("warnings", []):
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
 def _print_change_table(changes: list[dict]) -> None:
     print(f"{'Detected':<22}  {'Kind':<26}  {'Course':<12}  {'Title'}")
     print(f"{'-' * 22}  {'-' * 26}  {'-' * 12}  {'-' * 30}")
@@ -1587,6 +1802,9 @@ def main(argv: list[str] | None = None) -> None:
         "summary": cmd_summary,
         "setup": cmd_setup,
         "search": cmd_search,
+        "index": cmd_index,
+        "search-text": cmd_search_text,
+        "study-pack": cmd_study_pack,
         "sync": cmd_sync,
         "changes": cmd_changes,
         "doctor": cmd_doctor,

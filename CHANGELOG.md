@@ -2,6 +2,37 @@
 
 All notable changes to Worsaga are documented in this file.
 
+## 0.7.0 (unreleased)
+
+### Added
+
+- Local full-text search over course materials. `worsaga index` (CLI)
+  and `build_search_index` (MCP) fetch supported files (PDF, PPTX,
+  DOCX, TXT) in memory, extract their text, and store it page by page
+  in a SQLite FTS5 index in the platform-native user data directory
+  (`WORSAGA_INDEX_PATH` overrides the location). Files unchanged since
+  the last run are skipped without a fetch, and a per-run file budget
+  makes repeated runs resume where the previous one stopped.
+- `worsaga search-text <query>` (CLI) and `search_text` (MCP): offline
+  full-text search over the indexed material text, with course
+  filtering, per-hit course/section/file/page context, highlighted
+  snippets, and relevance ranking. Results distinguish "no match" from
+  "nothing indexed yet".
+- Markdown study-pack exports. `worsaga study-pack <course> --week N`
+  (CLI) and `export_study_pack` (MCP) build a single self-contained
+  Markdown document for a teaching week — deterministic study notes, a
+  materials overview, and the extracted per-page content of every
+  supported file in the section. Each file is downloaded once, in
+  memory; packs are written UTF-8 and never overwrite existing files.
+- Token hygiene extends to both new storage/output surfaces: raw
+  `file_url` values are never stored or exported, the only URL kept is
+  the token-free `view_url`, embedded `token=`-style values are
+  redacted, and the index database is owner-only (0600) on POSIX.
+- New public API: `worsaga.build_text_index`, `worsaga.search_text_index`,
+  `worsaga.TextIndexStore`, `worsaga.TextIndexError`,
+  `worsaga.default_index_path`, `worsaga.build_study_pack`,
+  `worsaga.write_study_pack`.
+
 ## 0.6.0
 
 ### Added

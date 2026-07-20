@@ -33,11 +33,14 @@ Version `0.6.0` includes:
 - Tokens and authenticated URLs stay out of the cache.
 - HTTPS-only Moodle URLs (localhost development excepted).
 
-## Next: full-text search and study exports
+## New in 0.7.0 (unreleased): full-text search and study exports
 
-- Local full-text index over downloaded materials.
-- `worsaga search-text`.
-- Markdown study-pack exports for a course week.
+- Local full-text index over course material text (SQLite FTS5), built
+  in memory from authenticated fetches — `worsaga index`.
+- `worsaga search-text`: offline, ranked full-text search with
+  per-page snippets and course filtering.
+- Markdown study-pack exports for a course week — `worsaga study-pack`.
+- Tokens and authenticated URLs stay out of the index and the exports.
 
 ## Later: notifications and auto-sync
 

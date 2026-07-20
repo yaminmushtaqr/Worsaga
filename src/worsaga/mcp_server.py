@@ -25,6 +25,9 @@ Exposes tools:
     - get_calendar_events
     - sync_now
     - get_changes
+    - build_search_index
+    - search_text
+    - export_study_pack
 
 Requires the ``mcp`` extra: pip install worsaga[mcp]
 
@@ -64,7 +67,15 @@ from worsaga.materials import (
     select_material as _select_material,
     strip_file_urls,
 )
+from worsaga.studypack import build_study_pack as _build_study_pack
+from worsaga.studypack import write_study_pack as _write_study_pack
 from worsaga.summaries import build_weekly_summary, format_bullets
+from worsaga.textindex import (
+    INDEX_MAX_FILES_PER_RUN,
+    TextIndexError,
+    build_text_index as _build_text_index,
+    search_text_index as _search_text_index,
+)
 from worsaga.sync import (
     SYNC_LOOKAHEAD_DAYS,
     get_recent_changes as _get_recent_changes,
@@ -499,6 +510,142 @@ def get_changes(
         )
     except ValueError as exc:
         return [{"error": str(exc)}]
+
+
+@mcp.tool()
+def build_search_index(
+    course_id: int = 0,
+    week: str = "",
+    max_files: int = INDEX_MAX_FILES_PER_RUN,
+) -> dict[str, Any]:
+    """Build or update the local full-text search index.
+
+    Fetches supported course materials (PDF, PPTX, DOCX, TXT) in memory
+    with authenticated credentials, extracts their text, and stores it
+    page by page in a local SQLite full-text index for ``search_text()``.
+    Files unchanged since the last build are skipped without a fetch, so
+    repeated calls are cheap and resume where the previous run's file
+    budget stopped. Tokens and authenticated URLs are never stored.
+
+    Parameters
+    ----------
+    course_id : int
+        Limit indexing to one course (0 = all enrolled courses).
+    week : str
+        Only index sections matching this week number or name
+        (empty = the whole course).
+    max_files : int
+        Cap on files fetched this run (default 100).
+    """
+    try:
+        return _build_text_index(
+            _get_client(),
+            course_id=course_id or None,
+            week=week or None,
+            max_files=max_files,
+        )
+    except TextIndexError as exc:
+        return {"error": str(exc), "error_code": "index_unavailable"}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+def search_text(
+    query: str,
+    course_id: int = 0,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Full-text search over indexed material text (no network).
+
+    Searches the local index built by ``build_search_index()`` and
+    returns the best-matching pages — each hit carries course, section,
+    file, 1-based ``page``, a bracket-highlighted ``snippet``, and a
+    relevance ``score`` (higher is better). The ``index`` stats in the
+    result distinguish "no match" from "nothing indexed yet"; run
+    ``build_search_index()`` first in the latter case.
+
+    Parameters
+    ----------
+    query : str
+        Search terms; all terms must match (AND).
+    course_id : int
+        Limit hits to one course (0 = all courses).
+    limit : int
+        Maximum hits to return (default 20).
+    """
+    try:
+        return _search_text_index(
+            _get_client().base_url,
+            query,
+            course_id=course_id or None,
+            limit=limit,
+        )
+    except TextIndexError as exc:
+        return {"error": str(exc), "error_code": "index_unavailable"}
+
+
+@mcp.tool()
+def export_study_pack(
+    course_id: int,
+    week: str,
+    output_dir: str = "",
+    include_markdown: bool = False,
+) -> dict[str, Any]:
+    """Export a Markdown study pack for a course week.
+
+    Builds a single Markdown document — study notes, a materials
+    overview, and the extracted per-page content of every supported
+    file in the week's section — and writes it inside Worsaga's own
+    downloads directory. The response reports the written ``path`` and
+    pack metadata; set ``include_markdown=True`` to also return the
+    full Markdown inline. No tokens or authenticated URLs appear in
+    the pack or the response.
+
+    Parameters
+    ----------
+    course_id : int
+        The Moodle course ID.
+    week : str
+        Week number (e.g. "3") or section name query.
+    output_dir : str
+        Optional subdirectory (relative path) inside Worsaga's own
+        downloads directory. Absolute paths and path traversal are
+        rejected.
+    include_markdown : bool
+        Also return the full Markdown content inline (default False).
+    """
+    downloads_root = default_downloads_dir()
+    if output_dir:
+        candidate = (downloads_root / output_dir).resolve()
+        if not candidate.is_relative_to(downloads_root.resolve()):
+            return {
+                "error": (
+                    "output_dir must be a relative path inside the Worsaga "
+                    f"downloads directory ({downloads_root})."
+                ),
+                "error_code": "invalid_output_dir",
+            }
+        dest_dir: Path = candidate
+    else:
+        dest_dir = downloads_root
+
+    try:
+        result = _build_study_pack(_get_client(), course_id, week)
+    except DownloadError as exc:
+        return {"error": str(exc), "error_code": exc.code}
+    except RuntimeError as exc:
+        return {"error": str(exc)}
+
+    path = _write_study_pack(
+        result["markdown"], dest_dir, result["suggested_filename"],
+    )
+    if not include_markdown:
+        result = {
+            key: value for key, value in result.items() if key != "markdown"
+        }
+    result["path"] = str(path)
+    return result
 
 
 def main() -> None:

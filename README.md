@@ -148,6 +148,9 @@ worsaga download ECON101 --week 3 --index 0       # Download by index
 worsaga extract ECON101 --week 3 --match slides   # Per-page text, nothing saved
 worsaga summary ECON101 --week 3   # Study notes for a week (extractive)
 worsaga search ECON101 regression  # Search course content by keyword
+worsaga index                # Build the local full-text search index
+worsaga search-text "price elasticity"  # Full-text search, no network
+worsaga study-pack ECON101 --week 3     # Export a Markdown study pack
 worsaga sync                 # Sync metadata to the local cache, report changes
 worsaga changes --since 7d   # Show changes detected by previous syncs
 worsaga doctor               # Check auth and connectivity
@@ -189,7 +192,9 @@ The server runs over stdio. Tools: `list_courses`, `get_deadlines`,
 `search_course_content`, `get_weekly_summary`, `download_material`
 (authenticated fetch), `extract_material` (per-page text, in memory),
 `sync_now` (metadata sync + change detection), `get_changes` (recorded
-changes, no network).
+changes, no network), `build_search_index` (local full-text index),
+`search_text` (offline full-text search), `export_study_pack` (Markdown
+study pack for a week).
 
 Minimal MCP configuration:
 
@@ -292,6 +297,37 @@ The cache lives in the platform-native user data directory
 are never written to it, and cache rows are keyed by Moodle site, so demo-mode
 data never mixes with real course data. The MCP equivalents are `sync_now()`
 and `get_changes()`.
+
+## Full-text search and study packs
+
+`worsaga index` builds a local full-text index over your course materials:
+supported files (PDF, PPTX, DOCX, TXT) are fetched in memory, their text is
+extracted page by page, and only that text is stored — in a SQLite FTS5
+database in the platform-native user data directory (`WORSAGA_INDEX_PATH`
+overrides the location). Files unchanged since the last run are skipped, so
+re-running is cheap; a per-run file budget makes large sites indexable in
+resumable steps.
+
+```bash
+worsaga index                          # index all courses
+worsaga index ECON101 --week 3         # index one week of one course
+worsaga search-text "price elasticity" # search — offline, ranked, snippets
+worsaga search-text tax --course ECON101 --limit 5
+```
+
+`worsaga study-pack` exports a single Markdown document for a teaching week:
+deterministic study notes, a materials overview, and the full extracted
+per-page content of every supported file in the section.
+
+```bash
+worsaga study-pack ECON101 --week 3            # writes ECON101-week-3-study-pack.md
+worsaga study-pack ECON101 --week 3 --output packs/
+worsaga study-pack ECON101 --week 3 --stdout   # print instead of writing
+```
+
+Like every other surface, both features keep tokens and authenticated URLs
+out of storage and output, and both work in demo mode. The MCP equivalents
+are `build_search_index()`, `search_text()`, and `export_study_pack()`.
 
 ## Safety and privacy
 
