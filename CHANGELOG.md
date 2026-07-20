@@ -2,7 +2,7 @@
 
 All notable changes to Worsaga are documented in this file.
 
-## 0.6.0 (unreleased)
+## 0.6.0
 
 ### Added
 
