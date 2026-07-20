@@ -64,9 +64,6 @@ class _FakeClient:
     def get_assignment_submission_status(self, assignment_id):
         return self._assignment_status.get(assignment_id, {})
 
-    def get_assignment_grades(self, assignment_ids):
-        return {"assignments": []}
-
     def get_forums_by_courses(self, course_ids):
         return self._forums_payload
 

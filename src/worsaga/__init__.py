@@ -1,6 +1,6 @@
 """worsaga — Open-source, local-first, read-only study toolkit for Moodle."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from worsaga.assignments import get_assignment_status, get_assignments, normalize_assignment
 from worsaga.calendar import get_calendar_events, normalize_calendar_events
@@ -62,6 +62,13 @@ from worsaga.sections import (
     score_section_match,
     summarize_modules,
 )
+from worsaga.cache import CacheStore, default_cache_path
+from worsaga.sync import (
+    SYNC_CATEGORIES,
+    SYNC_LOOKAHEAD_DAYS,
+    get_recent_changes,
+    run_sync,
+)
 from worsaga.summaries import (
     build_deterministic_summary,
     build_summary,
@@ -83,6 +90,12 @@ __all__ = [
     "MoodleConfig",
     "MoodleWriteAttemptError",
     "SUPPORTED_EXTENSIONS",
+    "SYNC_CATEGORIES",
+    "SYNC_LOOKAHEAD_DAYS",
+    "CacheStore",
+    "default_cache_path",
+    "get_recent_changes",
+    "run_sync",
     "download_material",
     "build_deterministic_summary",
     "build_summary",

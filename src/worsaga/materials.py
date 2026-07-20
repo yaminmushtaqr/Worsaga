@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -326,6 +327,24 @@ def _available_path(path: Path) -> Path:
         counter += 1
 
 
+def _reserve_path(path: Path) -> Path:
+    """Atomically claim a non-existing destination path.
+
+    Creates the chosen path with ``O_EXCL`` (an empty placeholder that
+    the caller later overwrites via ``os.replace``), so two concurrent
+    downloads can never both pick the same final name and silently
+    overwrite each other.
+    """
+    while True:
+        candidate = _available_path(path)
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+
+
 def select_material(
     materials: list[dict],
     *,
@@ -482,16 +501,22 @@ def download_material(
 
     dest_dir = Path(output_dir) if output_dir else Path.cwd()
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = _available_path(dest_dir / _sanitize_filename(file_name))
+    dest_path = _reserve_path(dest_dir / _sanitize_filename(file_name))
 
-    # Write to a temp file and rename so a crash mid-write can never
-    # leave a plausible-looking partial download at the final path.
-    tmp_path = dest_path.with_name(dest_path.name + ".part")
+    # Write to a uniquely named temp file and rename over the reserved
+    # destination: a crash mid-write can never leave a plausible-looking
+    # partial download, and concurrent downloads can never share (or
+    # truncate) each other's temp file or final name.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=dest_dir, prefix=f"{dest_path.name}.", suffix=".part",
+    )
     try:
-        tmp_path.write_bytes(data)
-        os.replace(tmp_path, dest_path)
+        with os.fdopen(fd, "wb") as tmp_file:
+            tmp_file.write(data)
+        os.replace(tmp_name, dest_path)
     except OSError:
-        tmp_path.unlink(missing_ok=True)
+        Path(tmp_name).unlink(missing_ok=True)
+        dest_path.unlink(missing_ok=True)  # remove the empty placeholder
         raise
 
     result = {

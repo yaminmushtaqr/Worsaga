@@ -649,9 +649,6 @@ class DemoMoodleClient:
             self._data["submission_statuses"].get(int(assignment_id), {})
         )
 
-    def get_assignment_grades(self, assignment_ids: list[int]) -> dict:
-        return {"assignments": []}
-
     def get_user_grade_items(self, course_id: int, user_id: int | None = None) -> dict:
         return copy.deepcopy(
             self._data["grades"].get(int(course_id), {"usergrades": []})

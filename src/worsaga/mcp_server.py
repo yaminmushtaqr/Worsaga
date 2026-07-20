@@ -23,6 +23,8 @@ Exposes tools:
     - get_messages
     - get_digest
     - get_calendar_events
+    - sync_now
+    - get_changes
 
 Requires the ``mcp`` extra: pip install worsaga[mcp]
 
@@ -63,6 +65,11 @@ from worsaga.materials import (
     strip_file_urls,
 )
 from worsaga.summaries import build_weekly_summary, format_bullets
+from worsaga.sync import (
+    SYNC_LOOKAHEAD_DAYS,
+    get_recent_changes as _get_recent_changes,
+    run_sync as _run_sync,
+)
 from worsaga.messages import get_messages as _get_messages
 from worsaga.messages import get_notifications as _get_notifications
 
@@ -438,6 +445,60 @@ def extract_material(
         return {"error": str(exc), "error_code": exc.code}
     except RuntimeError as exc:
         return {"error": str(exc)}
+
+
+@mcp.tool()
+def sync_now(lookahead_days: int = SYNC_LOOKAHEAD_DAYS) -> dict[str, Any]:
+    """Sync metadata into the local cache and return detected changes.
+
+    Fetches metadata-only snapshots — deadlines, file metadata, grades,
+    and forum discussions; never file contents — into the local SQLite
+    cache and diffs them against the previous sync. Detected changes
+    (new deadlines, new files, grade updates, forum updates) are
+    returned and recorded so ``get_changes()`` can replay them later.
+
+    The first sync for a site establishes a baseline and reports no
+    changes. Tokens and authenticated URLs are never stored in the
+    cache.
+
+    Parameters
+    ----------
+    lookahead_days : int
+        Deadline look-ahead window in days (default 60).
+    """
+    return _run_sync(_get_client(), lookahead_days=lookahead_days)
+
+
+@mcp.tool()
+def get_changes(
+    since_days: int = 7,
+    category: str = "",
+) -> list[dict[str, Any]]:
+    """Return change events recorded by previous syncs (no network).
+
+    Reads the local cache only; run ``sync_now()`` first to detect new
+    changes. Each event has ``kind`` (``new_deadline``,
+    ``deadline_changed``, ``new_file``, ``file_updated``,
+    ``grade_updated``, ``new_forum_discussion``,
+    ``forum_discussion_updated``), course context, a ``title``, compact
+    ``before``/``after`` views, and ``detected_at``.
+
+    Parameters
+    ----------
+    since_days : int
+        Lookback window in days (default 7).
+    category : str
+        Optional filter: ``deadlines``, ``files``, ``grades``, or
+        ``forums``.
+    """
+    try:
+        return _get_recent_changes(
+            _get_client().base_url,
+            since_days=since_days,
+            category=category or None,
+        )
+    except ValueError as exc:
+        return [{"error": str(exc)}]
 
 
 def main() -> None:

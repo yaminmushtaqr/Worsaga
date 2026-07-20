@@ -17,6 +17,8 @@ Usage:
     worsaga calendar [id|code]   Show calendar events
     worsaga summary <id|code>    Generate weekly study summary
     worsaga search <id|code> <q> Search course content by keyword
+    worsaga sync                 Sync metadata to the local cache
+    worsaga changes              Show changes detected by syncs
     worsaga doctor               Check auth and connectivity
     worsaga config [path]        Show active config file location
     worsaga setup                Guided first-time configuration
@@ -72,6 +74,12 @@ from worsaga.materials import (
 from worsaga.output import render_structured, wants_structured
 from worsaga.sections import find_best_section, summarize_modules
 from worsaga.summaries import build_weekly_summary, format_bullets
+from worsaga.sync import (
+    SYNC_CATEGORIES,
+    SYNC_LOOKAHEAD_DAYS,
+    get_recent_changes,
+    run_sync,
+)
 from worsaga.messages import get_messages as get_messages_data
 from worsaga.messages import get_notifications as get_notifications_data
 from worsaga.time_utils import parse_since, timestamp_to_display
@@ -82,6 +90,13 @@ PUBLIC_INSTALL_SPEC = "worsaga[mcp]"
 
 class CourseResolutionError(ValueError):
     """Raised when a course identifier cannot be resolved."""
+
+
+def _non_negative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or a positive integer")
+    return number
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -288,7 +303,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip boilerplate cleaning; return extractor output unchanged",
     )
     ex.add_argument(
-        "--max-chars", type=int, default=None, metavar="N",
+        "--max-chars", type=_non_negative_int, default=None, metavar="N",
         help=(
             "Cap total extracted text at N characters "
             f"(default: {MAX_TEXT_PER_FILE}; 0 = no cap)"
@@ -344,7 +359,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ag.add_argument(
         "--include-feedback",
         action="store_true",
-        help="Ask Moodle for grade/feedback metadata where available",
+        help=(
+            "Deprecated no-op: grade/feedback fields always derive from "
+            "your own submission status"
+        ),
     )
 
     fm = sub.add_parser("forums", parents=[_shared], help="Show course forums")
@@ -439,6 +457,40 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Moodle course ID (integer) or course short-code (e.g. ECON101)",
     )
     sr.add_argument("query", help="Search keyword (case-insensitive)")
+
+    sy = sub.add_parser(
+        "sync", parents=[_shared],
+        help="Sync metadata to the local cache and report changes",
+        description=(
+            "Fetch metadata-only snapshots (deadlines, file metadata, "
+            "grades, forum discussions — never file contents) into the "
+            "local SQLite cache and report what changed since the last "
+            "sync. The first sync establishes a baseline and reports no "
+            "changes. Tokens and authenticated URLs are never stored."
+        ),
+    )
+    sy.add_argument(
+        "--days",
+        type=int,
+        default=SYNC_LOOKAHEAD_DAYS,
+        help=f"Deadline look-ahead window in days (default: {SYNC_LOOKAHEAD_DAYS})",
+    )
+
+    ch = sub.add_parser(
+        "changes", parents=[_shared],
+        help="Show changes detected by previous syncs (no network)",
+    )
+    ch.add_argument(
+        "--since",
+        default="7d",
+        help="Lookback window like 7d, 24h, or YYYY-MM-DD",
+    )
+    ch.add_argument(
+        "--category",
+        default=None,
+        choices=list(SYNC_CATEGORIES),
+        help="Only show changes from one category",
+    )
 
     sub.add_parser("doctor", parents=[_shared], help="Check auth and connectivity")
     sub.add_parser("update", parents=[_shared], help="Show how to upgrade safely")
@@ -1202,6 +1254,83 @@ def cmd_search(args: argparse.Namespace) -> None:
         )
 
 
+def _print_change_table(changes: list[dict]) -> None:
+    print(f"{'Detected':<22}  {'Kind':<26}  {'Course':<12}  {'Title'}")
+    print(f"{'-' * 22}  {'-' * 26}  {'-' * 12}  {'-' * 30}")
+    for change in changes:
+        detected = _display_timestamp(change.get("detected_at"))
+        print(
+            f"{detected:<22}  "
+            f"{str(change.get('kind', ''))[:26]:<26}  "
+            f"{str(change.get('course_shortname', ''))[:12]:<12}  "
+            f"{change.get('title', '')}"
+        )
+
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    client = _client(args)
+    if not args.quiet and not wants_structured(args):
+        print("Syncing metadata (nothing is downloaded)...", file=sys.stderr)
+    result = run_sync(client, lookahead_days=args.days)
+
+    if _emit_data(args, result):
+        return
+
+    print(f"Synced {result['site']}")
+    for name, stats in result["categories"].items():
+        if not stats["synced"]:
+            print(f"  {name:<10}  (skipped - fetch failed, see warnings)")
+            continue
+        notes = []
+        if stats["baseline"]:
+            notes.append("baseline")
+        if stats["new"]:
+            notes.append(f"{stats['new']} new")
+        if stats["updated"]:
+            notes.append(f"{stats['updated']} updated")
+        if stats["adopted"]:
+            notes.append(f"{stats['adopted']} adopted (newly visible course)")
+        note_text = f"  ({', '.join(notes)})" if notes else ""
+        print(f"  {name:<10}  {stats['items']:>4} items{note_text}")
+
+    changes = result["changes"]
+    if any(s["baseline"] for s in result["categories"].values() if s["synced"]):
+        print("\nBaseline established - changes will be reported from the next sync.")
+    if changes:
+        print(f"\nChanges detected: {len(changes)}")
+        _print_change_table(changes)
+    else:
+        print("\nNo changes since the last sync.")
+    for warning in result["warnings"]:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def cmd_changes(args: argparse.Namespace) -> None:
+    import time as _time
+
+    client = _client(args)
+    # Use the exact --since timestamp: "1h" must mean one hour, not a
+    # whole day rounded up.
+    since_ts = parse_since(args.since, now=int(_time.time()))
+    if since_ts is None:
+        since_ts = int(_time.time()) - 7 * 86400
+    changes = get_recent_changes(
+        client.base_url,
+        since_ts=since_ts,
+        category=args.category,
+    )
+    if _emit_data(args, changes):
+        return
+    if not changes:
+        label = f" in category '{args.category}'" if args.category else ""
+        print(
+            f"No changes recorded{label} in the requested window "
+            f"(--since {args.since}). Run 'worsaga sync' to check for new ones."
+        )
+        return
+    _print_change_table(changes)
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     if _demo_mode(args):
         info = DemoMoodleClient().site_info()
@@ -1458,6 +1587,8 @@ def main(argv: list[str] | None = None) -> None:
         "summary": cmd_summary,
         "setup": cmd_setup,
         "search": cmd_search,
+        "sync": cmd_sync,
+        "changes": cmd_changes,
         "doctor": cmd_doctor,
         "update": cmd_update,
         "config": cmd_config,

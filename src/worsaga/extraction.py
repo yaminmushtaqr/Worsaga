@@ -27,16 +27,55 @@ MAX_TEXT_PER_FILE = 120_000  # max chars returned per file
 MAX_PDF_PAGES = 150  # pages beyond this are not extracted
 
 # Supported extensions in download priority order (lower = preferred).
+# Legacy binary formats (.ppt, .doc) have no extractor and are therefore
+# not supported — listing them here would let unextractable files consume
+# the summary pipeline's download budget.
 FILE_PRIORITY: dict[str, int] = {
     ".pdf": 0,
     ".pptx": 1,
-    ".ppt": 2,
-    ".docx": 3,
-    ".doc": 4,
-    ".txt": 5,
+    ".docx": 2,
+    ".txt": 3,
 }
 
 SUPPORTED_EXTENSIONS = frozenset(FILE_PRIORITY)
+
+# ── OOXML archive safety budgets ─────────────────────────────────
+#
+# PPTX/DOCX are ZIP archives; a small download can decompress into a
+# huge XML payload (zip bomb). Parsing is bounded by these budgets and
+# aborted with a structured warning when exceeded.
+
+MAX_PPTX_SLIDES = 300
+_MAX_ARCHIVE_MEMBERS = 10_000
+_MAX_XML_MEMBER_BYTES = 20 * 1024 * 1024
+_MAX_TOTAL_XML_BYTES = 100 * 1024 * 1024
+
+
+class _OoxmlLimitError(Exception):
+    """Raised when an OOXML archive exceeds a safety budget."""
+
+
+def _read_xml_member(zf: zipfile.ZipFile, name: str, state: dict) -> bytes:
+    """Read one XML member with per-member and cumulative size caps.
+
+    ``state`` carries the running ``total`` of decompressed bytes for
+    the archive. Reads are capped on actual decompressed output, not on
+    the (spoofable) sizes declared in the archive directory.
+    """
+    with zf.open(name) as member:
+        data = member.read(_MAX_XML_MEMBER_BYTES + 1)
+    if len(data) > _MAX_XML_MEMBER_BYTES:
+        raise _OoxmlLimitError(
+            "Archive member expands beyond the safety limit; "
+            "extraction stopped."
+        )
+    state["total"] = state.get("total", 0) + len(data)
+    if state["total"] > _MAX_TOTAL_XML_BYTES:
+        raise _OoxmlLimitError(
+            "Archive expands beyond the total safety limit; "
+            "extraction stopped."
+        )
+    return data
 
 
 # ── HTML stripping ───────────────────────────────────────────────
@@ -249,23 +288,36 @@ def is_boilerplate(line: str, *, aggressive: bool = False) -> bool:
     return False
 
 
-def clean_text(text: str, *, aggressive: bool = False) -> str:
+def clean_text(
+    text: str,
+    *,
+    aggressive: bool = False,
+    line_frequencies: dict[str, int] | None = None,
+) -> str:
     """Remove boilerplate lines, repeated headers, and normalize whitespace.
 
     The default keeps educational content — figure/table captions,
     source lines, learning objectives, agenda/outline slides, and
     references. Pass ``aggressive=True`` to also strip those (used by
     the summary-bullet pipeline).
+
+    ``line_frequencies`` supplies precomputed lowercase-line counts for
+    repeated-header detection. Per-page callers (structured extraction)
+    pass document-wide counts here — a header repeated on every slide
+    would otherwise appear only once per cleaning call and survive.
     """
     lines = text.split("\n")
 
     # Pass 1: count line frequencies to detect repeated headers.
     # Lines appearing 3+ times are almost certainly per-slide headers.
-    freq: dict[str, int] = {}
-    for line in lines:
-        key = line.strip().lower()
-        if key:
-            freq[key] = freq.get(key, 0) + 1
+    if line_frequencies is not None:
+        freq = line_frequencies
+    else:
+        freq = {}
+        for line in lines:
+            key = line.strip().lower()
+            if key:
+                freq[key] = freq.get(key, 0) + 1
 
     cleaned: list[str] = []
     for line in lines:
@@ -311,40 +363,11 @@ def extract_pdf_text(data: bytes) -> str:
         return ""
 
 
-def _pptx_slide_texts(data: bytes) -> list[str]:
-    """Return per-slide text from PPTX bytes via zipfile + slide XML."""
-    a_ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            slide_names = sorted(
-                (
-                    n for n in zf.namelist()
-                    if n.startswith("ppt/slides/slide") and n.endswith(".xml")
-                ),
-                key=_pptx_slide_sort_key,
-            )
-            all_slides: list[str] = []
-            for sn in slide_names:
-                tree = ET.parse(zf.open(sn))
-                paras: list[str] = []
-                for p_elem in tree.iter(f"{a_ns}p"):
-                    runs: list[str] = []
-                    for t_elem in p_elem.iter(f"{a_ns}t"):
-                        if t_elem.text:
-                            runs.append(t_elem.text)
-                    line = "".join(runs).strip()
-                    if line:
-                        paras.append(line)
-                if paras:
-                    all_slides.append("\n".join(paras))
-            return all_slides
-    except Exception:
-        return []
-
-
-def extract_pptx_text(data: bytes) -> str:
-    """Extract text from PPTX bytes via zipfile + slide XML parsing."""
-    return "\n\n".join(_pptx_slide_texts(data))
+_PML_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_DML_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_WML_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_REL_ATTR_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKG_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
 
 def _pptx_slide_sort_key(name: str) -> tuple[int, str]:
@@ -355,26 +378,158 @@ def _pptx_slide_sort_key(name: str) -> tuple[int, str]:
     return (0, name)
 
 
-def extract_docx_text(data: bytes) -> str:
-    """Extract text from DOCX bytes via document.xml parsing."""
-    w_ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+def _pptx_slide_order(zf: zipfile.ZipFile, state: dict) -> list[str]:
+    """Return slide XML paths in true presentation order.
+
+    Slide order comes from ``presentation.xml``'s ``sldIdLst`` resolved
+    through the relationship table — slides can be reordered in an
+    editor without renaming their XML parts, so ``slideN.xml`` numbering
+    is only a fallback.
+    """
+    names = set(zf.namelist())
+    fallback = sorted(
+        (
+            n for n in names
+            if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+        ),
+        key=_pptx_slide_sort_key,
+    )
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            if "word/document.xml" not in zf.namelist():
-                return ""
-            tree = ET.parse(zf.open("word/document.xml"))
-            lines: list[str] = []
-            for p_elem in tree.iter(f"{w_ns}p"):
-                runs: list[str] = []
-                for t_elem in p_elem.iter(f"{w_ns}t"):
-                    if t_elem.text:
-                        runs.append(t_elem.text)
+        presentation = ET.fromstring(
+            _read_xml_member(zf, "ppt/presentation.xml", state)
+        )
+        relationships = ET.fromstring(
+            _read_xml_member(zf, "ppt/_rels/presentation.xml.rels", state)
+        )
+    except (KeyError, ET.ParseError, _OoxmlLimitError):
+        return fallback
+
+    id_to_target: dict[str, str] = {}
+    for relationship in relationships.iter(f"{_PKG_REL_NS}Relationship"):
+        target = str(relationship.get("Target") or "")
+        normalized = (
+            target.lstrip("/") if target.startswith("/")
+            else str(PurePosixPath("ppt") / target)
+        )
+        id_to_target[str(relationship.get("Id") or "")] = normalized
+
+    ordered: list[str] = []
+    for slide_id in presentation.iter(f"{_PML_NS}sldId"):
+        target = id_to_target.get(str(slide_id.get(f"{_REL_ATTR_NS}id") or ""))
+        if target and target in names:
+            ordered.append(target)
+    return ordered or fallback
+
+
+def _pptx_structured(data: bytes) -> tuple[list[dict], list[str]]:
+    """Extract raw per-slide records from PPTX bytes.
+
+    Every slide produces a page record — image-only and empty slides
+    are kept (with their real ``image_count``) so page numbers match
+    the deck. Parse failures and safety-budget hits become structured
+    warnings, never silent empties.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return [], ["PPTX could not be parsed."]
+    warnings: list[str] = []
+    pages: list[dict] = []
+    with archive as zf:
+        if len(zf.namelist()) > _MAX_ARCHIVE_MEMBERS:
+            return [], [
+                "PPTX archive has too many members to process safely."
+            ]
+        state: dict = {"total": 0}
+        slide_names = _pptx_slide_order(zf, state)
+        if len(slide_names) > MAX_PPTX_SLIDES:
+            warnings.append(
+                f"Only the first {MAX_PPTX_SLIDES} of {len(slide_names)} "
+                "slides were extracted."
+            )
+        for slide_name in slide_names[:MAX_PPTX_SLIDES]:
+            try:
+                xml_bytes = _read_xml_member(zf, slide_name, state)
+            except KeyError:
+                pages.append({
+                    "text": "", "image_count": 0,
+                    "warnings": ["Slide data is missing from the archive."],
+                })
+                continue
+            except _OoxmlLimitError as exc:
+                warnings.append(str(exc))
+                break
+            try:
+                root = ET.fromstring(xml_bytes)
+            except ET.ParseError:
+                pages.append({
+                    "text": "", "image_count": 0,
+                    "warnings": ["Slide could not be parsed."],
+                })
+                continue
+            paragraphs: list[str] = []
+            for p_elem in root.iter(f"{_DML_NS}p"):
+                runs = [t.text for t in p_elem.iter(f"{_DML_NS}t") if t.text]
                 line = "".join(runs).strip()
                 if line:
-                    lines.append(line)
-            return "\n".join(lines)
-    except Exception:
-        return ""
+                    paragraphs.append(line)
+            image_count = sum(1 for _ in root.iter(f"{_PML_NS}pic"))
+            pages.append({
+                "text": "\n".join(paragraphs),
+                "image_count": image_count,
+                "warnings": [],
+            })
+    return pages, warnings
+
+
+def _pptx_slide_texts(data: bytes) -> list[str]:
+    """Return per-slide text from PPTX bytes (non-empty slides only)."""
+    pages, _ = _pptx_structured(data)
+    return [page["text"] for page in pages if page["text"].strip()]
+
+
+def extract_pptx_text(data: bytes) -> str:
+    """Extract text from PPTX bytes via zipfile + slide XML parsing."""
+    return "\n\n".join(_pptx_slide_texts(data))
+
+
+def _docx_structured(data: bytes) -> tuple[list[dict], list[str]]:
+    """Extract the document body from DOCX bytes as one page record."""
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return [], ["DOCX could not be parsed."]
+    with archive as zf:
+        if len(zf.namelist()) > _MAX_ARCHIVE_MEMBERS:
+            return [], [
+                "DOCX archive has too many members to process safely."
+            ]
+        if "word/document.xml" not in zf.namelist():
+            return [], ["DOCX has no document body."]
+        try:
+            xml_bytes = _read_xml_member(zf, "word/document.xml", {"total": 0})
+        except _OoxmlLimitError as exc:
+            return [], [str(exc)]
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return [], ["DOCX could not be parsed."]
+        lines: list[str] = []
+        for p_elem in root.iter(f"{_WML_NS}p"):
+            runs = [t.text for t in p_elem.iter(f"{_WML_NS}t") if t.text]
+            line = "".join(runs).strip()
+            if line:
+                lines.append(line)
+    text = "\n".join(lines)
+    if not text:
+        return [], []
+    return [{"text": text, "image_count": 0, "warnings": []}], []
+
+
+def extract_docx_text(data: bytes) -> str:
+    """Extract text from DOCX bytes via document.xml parsing."""
+    pages, _ = _docx_structured(data)
+    return pages[0]["text"] if pages else ""
 
 
 def extract_txt_text(data: bytes) -> str:
@@ -564,19 +719,23 @@ def extract_file_structured(
         "warnings": [],
     }
     if ext not in _EXTRACTORS:
-        result["warnings"].append(
-            f"Unsupported file type: {ext or 'no extension'}."
-        )
+        if ext in {".ppt", ".doc"}:
+            result["warnings"].append(
+                f"Legacy format {ext} is not supported; "
+                f"convert the file to {ext}x."
+            )
+        else:
+            result["warnings"].append(
+                f"Unsupported file type: {ext or 'no extension'}."
+            )
         return result
 
     if ext == ".pdf":
         raw_pages, doc_warnings = _pdf_structured_pages(data)
     elif ext == ".pptx":
-        raw_pages = [
-            {"text": t, "image_count": 0, "warnings": []}
-            for t in _pptx_slide_texts(data)
-        ]
-        doc_warnings = []
+        raw_pages, doc_warnings = _pptx_structured(data)
+    elif ext == ".docx":
+        raw_pages, doc_warnings = _docx_structured(data)
     else:
         text = _EXTRACTORS[ext](data)
         raw_pages = (
@@ -585,12 +744,26 @@ def extract_file_structured(
         doc_warnings = []
     result["warnings"].extend(doc_warnings)
 
-    budget = max_chars if max_chars else None
+    # Repeated headers/footers recur across pages, so frequency counting
+    # must span the whole document — per-page counts would never reach
+    # the repetition threshold.
+    line_frequencies: dict[str, int] | None = None
+    if clean and len(raw_pages) > 1:
+        line_frequencies = {}
+        for raw in raw_pages:
+            for raw_line in raw["text"].split("\n"):
+                key = raw_line.strip().lower()
+                if key:
+                    line_frequencies[key] = line_frequencies.get(key, 0) + 1
+
+    budget = max_chars if max_chars and max_chars > 0 else None
     truncated = False
     for number, raw in enumerate(raw_pages, 1):
         text = raw["text"].strip()
         if clean:
-            text = clean_text(text, aggressive=aggressive)
+            text = clean_text(
+                text, aggressive=aggressive, line_frequencies=line_frequencies,
+            )
         if budget is not None:
             if budget <= 0:
                 truncated = True

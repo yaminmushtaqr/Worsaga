@@ -81,6 +81,28 @@ extract_material(course_id=42, week="3", match="Lec 3")   # read in memory
 download_material(course_id=42, week="3", match="Lec 3")  # save the file
 ```
 
+## Sync and change detection
+
+`worsaga sync` (CLI) / `sync_now()` (MCP) fetch metadata-only snapshots —
+deadlines, file metadata, grades, forum discussions; never file contents —
+into a local SQLite cache and return detected changes (new deadlines, moved
+deadlines, new/updated files, grade updates, new/updated forum discussions).
+The first sync for a site is a baseline and reports no changes.
+
+`worsaga changes [--since 7d] [--category deadlines|files|grades|forums]` /
+`get_changes(since_days=..., category=...)` replay recorded changes from the
+cache without touching the network — run a sync first to detect new ones.
+
+Cache invariants:
+
+- Lives in the platform-native user data dir (`WORSAGA_CACHE_PATH` overrides;
+  useful for tests).
+- Rows are keyed by Moodle site, so demo-mode data stays separate.
+- Tokens, `file_url` values, and authenticated URLs are stripped at the
+  storage boundary and must never appear in the cache file.
+- A failed category fetch is a warning + skip (`"synced": false`), never an
+  empty snapshot.
+
 ## Output expectations
 
 `download` / `download_material` should return metadata like:

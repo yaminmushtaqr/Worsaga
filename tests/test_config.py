@@ -277,3 +277,32 @@ class TestConfigCLIJson:
         output = json.loads(buf.getvalue())
         assert output["found"] is True
         assert output["config_path"] == str(platform_cfg)
+
+
+class TestHttpsEnforcement:
+    def test_https_url_accepted(self):
+        cfg = MoodleConfig(url="https://moodle.example.ac.uk", token="t")
+        assert cfg.url.startswith("https://")
+
+    def test_http_localhost_accepted_for_development(self):
+        MoodleConfig(url="http://localhost:8080/moodle", token="t")
+        MoodleConfig(url="http://127.0.0.1/moodle", token="t")
+
+    def test_http_remote_rejected(self):
+        with pytest.raises(ValueError, match="https"):
+            MoodleConfig(url="http://moodle.example.ac.uk", token="t")
+
+    def test_load_rejects_http_env_url(self, monkeypatch):
+        monkeypatch.setenv("WORSAGA_URL", "http://moodle.example.ac.uk")
+        monkeypatch.setenv("WORSAGA_TOKEN", "tok")
+        monkeypatch.setenv("WORSAGA_USERID", "1")
+        with pytest.raises(ValueError, match="https"):
+            MoodleConfig.load()
+
+    def test_write_config_rejects_http_url(self, tmp_path):
+        with pytest.raises(ValueError, match="https"):
+            MoodleConfig.write_config(
+                url="http://moodle.example.ac.uk",
+                token="tok",
+                path=tmp_path / "config.json",
+            )

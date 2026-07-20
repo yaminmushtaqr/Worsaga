@@ -62,8 +62,9 @@ PAT_LOCAL_PATH='[A-Z]:\\+Users\\+[A-Za-z]|/home/[a-z]+/|/Users/[a-z]+/'
 ALLOW_PLACEHOLDER_PATH='/home/user/|/Users/user/'
 # Obvious credential shapes: long hex tokens, key markers, inline secrets.
 PAT_CREDENTIALS='\b[a-f0-9]{32,}\b|BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|(api|access|auth)[_-]?token["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9]{8,}|password[[:space:]]*=[[:space:]]*[A-Za-z0-9]{6,}'
-# Files where long hashes are expected and not credentials.
-HASH_FILE_ALLOW='(^|/)(uv[.]lock|poetry[.]lock|package-lock[.]json|.*[.]dist-info/RECORD)([:,]|$)'
+# Files where long hashes are expected and not credentials, plus GitHub
+# Actions pinned by full commit SHA ("uses: owner/repo@<40-hex>").
+HASH_FILE_ALLOW='(^|/)(uv[.]lock|poetry[.]lock|package-lock[.]json|.*[.]dist-info/RECORD)([:,]|$)|uses:[[:space:]]+[^[:space:]]+@[a-f0-9]{40}'
 # Private planning / local-agent / secret files that must not be tracked
 # or shipped (checked against file NAMES, not contents).
 PRIVATE_FILE_NAMES='newplan[.]md|oldplan[.]md|plan-private[.]md|notes-private|settings[.]local[.]json|(^|/)[.]env($|[.])|[.]token$|[.]secret$|worsaga-creds[.]json'
@@ -74,11 +75,15 @@ tracked_files() {
 
 echo "== Scanning tracked files =="
 
-tracked_files | scan_files "non-public distribution language in tracked files" "$PAT_PRIVATE_DIST"
-tracked_files | scan_files "closed licence language in tracked files" "$PAT_CLOSED" "$ALLOW_MARKED"
-tracked_files | scan_files "non-example Moodle hostname in tracked files" "$PAT_MOODLE_HOST" "$ALLOW_EXAMPLE_HOST"
-tracked_files | scan_files "local absolute path in tracked files" "$PAT_LOCAL_PATH" "$ALLOW_PLACEHOLDER_PATH"
-tracked_files | scan_files "credential-shaped string in tracked files" "$PAT_CREDENTIALS" "$HASH_FILE_ALLOW"
+# scan_files reads the file list from stdin via process substitution, NOT
+# a pipeline: a pipeline would run the function in a subshell, where its
+# FAILURES increment is silently lost and findings could never fail the
+# audit.
+scan_files "non-public distribution language in tracked files" "$PAT_PRIVATE_DIST" < <(tracked_files)
+scan_files "closed licence language in tracked files" "$PAT_CLOSED" "$ALLOW_MARKED" < <(tracked_files)
+scan_files "non-example Moodle hostname in tracked files" "$PAT_MOODLE_HOST" "$ALLOW_EXAMPLE_HOST" < <(tracked_files)
+scan_files "local absolute path in tracked files" "$PAT_LOCAL_PATH" "$ALLOW_PLACEHOLDER_PATH" < <(tracked_files)
+scan_files "credential-shaped string in tracked files" "$PAT_CREDENTIALS" "$HASH_FILE_ALLOW" < <(tracked_files)
 
 bad_tracked=$(git ls-files | grep -E "$PRIVATE_FILE_NAMES" || true)
 if [ -n "$bad_tracked" ]; then
@@ -126,11 +131,11 @@ if [ "${1:-}" != "--no-build" ]; then
             fail "shell script shipped inside built artifact"
         fi
 
-        find "$AUDIT_TMP" -type f | scan_files "non-public distribution language in built artifact" "$PAT_PRIVATE_DIST"
-        find "$AUDIT_TMP" -type f | scan_files "closed licence language in built artifact" "$PAT_CLOSED" "$ALLOW_MARKED"
-        find "$AUDIT_TMP" -type f | scan_files "non-example Moodle hostname in built artifact" "$PAT_MOODLE_HOST" "$ALLOW_EXAMPLE_HOST"
-        find "$AUDIT_TMP" -type f | scan_files "local absolute path in built artifact" "$PAT_LOCAL_PATH" "$ALLOW_PLACEHOLDER_PATH"
-        find "$AUDIT_TMP" -type f | scan_files "credential-shaped string in built artifact" "$PAT_CREDENTIALS" "$HASH_FILE_ALLOW"
+        scan_files "non-public distribution language in built artifact" "$PAT_PRIVATE_DIST" < <(find "$AUDIT_TMP" -type f)
+        scan_files "closed licence language in built artifact" "$PAT_CLOSED" "$ALLOW_MARKED" < <(find "$AUDIT_TMP" -type f)
+        scan_files "non-example Moodle hostname in built artifact" "$PAT_MOODLE_HOST" "$ALLOW_EXAMPLE_HOST" < <(find "$AUDIT_TMP" -type f)
+        scan_files "local absolute path in built artifact" "$PAT_LOCAL_PATH" "$ALLOW_PLACEHOLDER_PATH" < <(find "$AUDIT_TMP" -type f)
+        scan_files "credential-shaped string in built artifact" "$PAT_CREDENTIALS" "$HASH_FILE_ALLOW" < <(find "$AUDIT_TMP" -type f)
     fi
 fi
 

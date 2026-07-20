@@ -229,6 +229,41 @@ class TestDownloadMaterial:
         assert nested.exists()
         assert Path(result["local_path"]).exists()
 
+    def test_preexisting_part_file_is_never_touched(self, tmp_path):
+        """A user's own <name>.part file must survive a download intact."""
+        material = _materials()[0]
+        sentinel = tmp_path / "week3_slides.pdf.part"
+        sentinel.write_bytes(b"precious unrelated bytes")
+        mock_client = MagicMock()
+        mock_client.download_file.return_value = b"%PDF-new"
+
+        result = download_material(mock_client, material, output_dir=tmp_path)
+
+        assert sentinel.read_bytes() == b"precious unrelated bytes"
+        assert Path(result["local_path"]).read_bytes() == b"%PDF-new"
+
+    def test_no_temp_files_left_behind(self, tmp_path):
+        material = _materials()[0]
+        mock_client = MagicMock()
+        mock_client.download_file.return_value = b"data"
+
+        download_material(mock_client, material, output_dir=tmp_path)
+        leftovers = [p.name for p in tmp_path.iterdir() if ".part" in p.name]
+        assert leftovers == []
+
+    def test_existing_file_is_not_overwritten(self, tmp_path):
+        material = _materials()[0]
+        existing = tmp_path / "week3_slides.pdf"
+        existing.write_bytes(b"original file")
+        mock_client = MagicMock()
+        mock_client.download_file.return_value = b"second download"
+
+        result = download_material(mock_client, material, output_dir=tmp_path)
+
+        assert existing.read_bytes() == b"original file"
+        assert Path(result["local_path"]).name == "week3_slides_1.pdf"
+        assert Path(result["local_path"]).read_bytes() == b"second download"
+
     def test_default_output_dir_is_cwd(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         material = _materials()[0]

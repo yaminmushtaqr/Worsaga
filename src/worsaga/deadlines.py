@@ -19,17 +19,22 @@ logger = logging.getLogger(__name__)
 def get_upcoming_deadlines(
     client: MoodleClient,
     lookahead_days: int = 14,
+    *,
+    strict: bool = False,
 ) -> list[dict]:
     """Return upcoming deadlines for assignments AND quizzes, sorted by due date.
 
     Assignments and quizzes are fetched in one batched call each. If either
     batched fetch fails, a warning is logged via ``worsaga.deadlines`` and that
     category is omitted from the result; the other category still returns.
+    With ``strict=True`` those fetch failures propagate instead — callers
+    doing change detection must never mistake a partial snapshot for a
+    complete one.
     :class:`MoodleWriteAttemptError` always propagates so the read-only
     guarantee remains observable to callers.
 
     Each entry contains:
-        name, type, course, due_ts, due_str, due_iso, days_left
+        id, name, type, course, due_ts, due_str, due_iso, days_left
     """
     now = time.time()
     cutoff = now + lookahead_days * 86400
@@ -46,6 +51,8 @@ def get_upcoming_deadlines(
     except MoodleWriteAttemptError:
         raise
     except Exception as exc:
+        if strict:
+            raise
         logger.warning(
             "Moodle assignment fetch failed for %d course(s); "
             "deadline list will omit assignments: %s",
@@ -63,6 +70,7 @@ def get_upcoming_deadlines(
                     seen.add(key)
                     due_dt = datetime.fromtimestamp(due, tz=timezone.utc)
                     upcoming.append({
+                        "id": a["id"],
                         "name": a["name"],
                         "type": "assignment",
                         "course": course_shortname,
@@ -78,6 +86,8 @@ def get_upcoming_deadlines(
     except MoodleWriteAttemptError:
         raise
     except Exception as exc:
+        if strict:
+            raise
         logger.warning(
             "Moodle quiz fetch failed for %d course(s); "
             "deadline list will omit quizzes: %s",
@@ -94,6 +104,7 @@ def get_upcoming_deadlines(
                 due_dt = datetime.fromtimestamp(close, tz=timezone.utc)
                 course_name = course_map.get(q.get("course", 0), "Unknown")
                 upcoming.append({
+                    "id": q["id"],
                     "name": q["name"],
                     "type": "quiz",
                     "course": course_name,
