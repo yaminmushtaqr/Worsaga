@@ -555,3 +555,172 @@ class TestExtractFileStructured:
         result = extract_file_structured(b"not a pdf", "bad.pdf")
         assert result["pages"] == []
         assert any("could not be parsed" in w for w in result["warnings"])
+
+
+# ── PPTX structured contract (0.6.0 hardening) ──────────────────
+
+
+_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _slide_xml(paragraphs: list[str], image_count: int = 0) -> bytes:
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    sld = Element(f"{{{_P_NS}}}sld")
+    cSld = SubElement(sld, f"{{{_P_NS}}}cSld")
+    spTree = SubElement(cSld, f"{{{_P_NS}}}spTree")
+    sp = SubElement(spTree, f"{{{_P_NS}}}sp")
+    txBody = SubElement(sp, f"{{{_P_NS}}}txBody")
+    for para_text in paragraphs:
+        p_el = SubElement(txBody, f"{{{_A_NS}}}p")
+        r_el = SubElement(p_el, f"{{{_A_NS}}}r")
+        t_el = SubElement(r_el, f"{{{_A_NS}}}t")
+        t_el.text = para_text
+    for _ in range(image_count):
+        SubElement(spTree, f"{{{_P_NS}}}pic")
+    return tostring(sld)
+
+
+def _make_pptx_with_order(
+    slides: dict[str, bytes], order: list[str],
+) -> bytes:
+    """Build a PPTX whose sldIdLst orders slides via relationships."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    rels = Element(f"{{{_REL_NS}}}Relationships")
+    pres = Element(f"{{{_P_NS}}}presentation")
+    sld_lst = SubElement(pres, f"{{{_P_NS}}}sldIdLst")
+    for i, slide_file in enumerate(order, 1):
+        rel = SubElement(rels, f"{{{_REL_NS}}}Relationship")
+        rel.set("Id", f"rId{i}")
+        rel.set("Target", f"slides/{slide_file}")
+        sld = SubElement(sld_lst, f"{{{_P_NS}}}sldId")
+        sld.set("id", str(255 + i))
+        sld.set(f"{{{_R_NS}}}id", f"rId{i}")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("ppt/presentation.xml", tostring(pres))
+        zf.writestr("ppt/_rels/presentation.xml.rels", tostring(rels))
+        for name, xml_bytes in slides.items():
+            zf.writestr(f"ppt/slides/{name}", xml_bytes)
+    return buf.getvalue()
+
+
+class TestPptxStructuredContract:
+    def test_image_only_slides_keep_their_page_number(self):
+        # Slide 2 has no text, only an image — it must still be page 2.
+        data = _make_pptx_with_order(
+            {
+                "slide1.xml": _slide_xml(["Intro text"]),
+                "slide2.xml": _slide_xml([], image_count=2),
+                "slide3.xml": _slide_xml(["Closing text"]),
+            },
+            order=["slide1.xml", "slide2.xml", "slide3.xml"],
+        )
+        result = extract_file_structured(data, "deck.pptx")
+        assert [p["page"] for p in result["pages"]] == [1, 2, 3]
+        assert [p["image_count"] for p in result["pages"]] == [0, 2, 0]
+        assert result["pages"][1]["text"] == ""
+        assert result["pages"][1]["has_low_text_density"] is True
+        assert any("images" in w for w in result["warnings"])
+
+    def test_relationship_order_beats_filename_numbering(self):
+        data = _make_pptx_with_order(
+            {
+                "slide1.xml": _slide_xml(["I am shown second"]),
+                "slide2.xml": _slide_xml(["I am shown first"]),
+            },
+            order=["slide2.xml", "slide1.xml"],
+        )
+        result = extract_file_structured(data, "deck.pptx")
+        assert "shown first" in result["pages"][0]["text"]
+        assert "shown second" in result["pages"][1]["text"]
+
+    def test_repeated_headers_are_cleaned_across_slides(self):
+        header = "ECON101 Elasticity Lecture Deck Header"
+        data = _make_pptx_with_order(
+            {
+                f"slide{i}.xml": _slide_xml([
+                    header, f"Unique substantive point number {i}",
+                ])
+                for i in (1, 2, 3)
+            },
+            order=["slide1.xml", "slide2.xml", "slide3.xml"],
+        )
+        result = extract_file_structured(data, "deck.pptx", clean=True)
+        joined = "\n".join(p["text"] for p in result["pages"])
+        assert header not in joined
+        assert "Unique substantive point number 2" in joined
+
+    def test_corrupt_pptx_warns(self):
+        result = extract_file_structured(b"not a zip at all", "deck.pptx")
+        assert result["pages"] == []
+        assert any("could not be parsed" in w for w in result["warnings"])
+
+    def test_corrupt_docx_warns(self):
+        result = extract_file_structured(b"not a zip at all", "essay.docx")
+        assert result["pages"] == []
+        assert any("could not be parsed" in w for w in result["warnings"])
+
+    def test_unparsable_slide_gets_page_warning(self):
+        data = _make_pptx_with_order(
+            {
+                "slide1.xml": b"<broken",
+                "slide2.xml": _slide_xml(["Fine slide"]),
+            },
+            order=["slide1.xml", "slide2.xml"],
+        )
+        result = extract_file_structured(data, "deck.pptx")
+        assert len(result["pages"]) == 2
+        assert result["pages"][0]["warnings"]
+        assert "Fine slide" in result["pages"][1]["text"]
+
+
+class TestOoxmlBudgets:
+    def test_oversized_member_stops_with_warning(self, monkeypatch):
+        from worsaga import extraction
+
+        monkeypatch.setattr(extraction, "_MAX_XML_MEMBER_BYTES", 64)
+        data = _make_pptx([["x" * 500]])
+        result = extract_file_structured(data, "deck.pptx")
+        assert any("safety limit" in w for w in result["warnings"])
+
+    def test_total_budget_stops_with_warning(self, monkeypatch):
+        from worsaga import extraction
+
+        monkeypatch.setattr(extraction, "_MAX_TOTAL_XML_BYTES", 700)
+        data = _make_pptx([["y" * 300], ["z" * 300], ["w" * 300]])
+        result = extract_file_structured(data, "deck.pptx")
+        assert any("safety limit" in w for w in result["warnings"])
+        assert len(result["pages"]) < 3
+
+    def test_too_many_members_refused(self, monkeypatch):
+        from worsaga import extraction
+
+        monkeypatch.setattr(extraction, "_MAX_ARCHIVE_MEMBERS", 3)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for i in range(5):
+                zf.writestr(f"ppt/slides/slide{i + 1}.xml", b"<x/>")
+        result = extract_file_structured(buf.getvalue(), "deck.pptx")
+        assert result["pages"] == []
+        assert any("too many members" in w for w in result["warnings"])
+
+
+class TestLegacyFormats:
+    def test_ppt_and_doc_are_not_supported(self):
+        from worsaga.extraction import FILE_PRIORITY, SUPPORTED_EXTENSIONS
+
+        assert ".ppt" not in SUPPORTED_EXTENSIONS
+        assert ".doc" not in SUPPORTED_EXTENSIONS
+        assert ".ppt" not in FILE_PRIORITY
+        assert ".doc" not in FILE_PRIORITY
+
+    def test_legacy_extension_gets_conversion_warning(self):
+        result = extract_file_structured(b"binary junk", "old-slides.ppt")
+        assert result["pages"] == []
+        assert any("convert" in w.lower() for w in result["warnings"])

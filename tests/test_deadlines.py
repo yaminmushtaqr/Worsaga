@@ -200,7 +200,8 @@ class TestAssignmentBatching:
         assert len(result) == 1
         entry = result[0]
         assert set(entry.keys()) == {
-            "name", "type", "course", "due_ts", "due_str", "due_iso", "days_left",
+            "id", "name", "type", "course", "due_ts", "due_str", "due_iso",
+            "days_left",
         }
         assert entry["type"] == "assignment"
         assert entry["course"] == "ECON101"

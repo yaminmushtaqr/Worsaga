@@ -117,9 +117,6 @@ class FakeAssignmentClient:
     def get_assignment_submission_status(self, assignment_id):
         return self.statuses[assignment_id]
 
-    def get_assignment_grades(self, assignment_ids):
-        return {"assignments": []}
-
 
 def test_get_assignments_fetches_statuses():
     records = get_assignments(FakeAssignmentClient(), course_id=1, now=NOW)
@@ -143,3 +140,17 @@ def test_get_assignment_status_returns_one_record():
 def test_get_assignment_status_raises_for_missing_assignment():
     with pytest.raises(ValueError, match="No assignment"):
         get_assignment_status(FakeAssignmentClient(), course_id=1, assignment_id=99)
+
+
+def test_include_feedback_is_a_noop_without_broad_grade_fetch():
+    """include_feedback must not require (or trigger) mod_assign_get_grades.
+
+    The broad grade fetch was removed in 0.6.0: feedback derives from the
+    per-user submission status only. FakeAssignmentClient deliberately has
+    no get_assignment_grades method, so any reintroduced call would fail.
+    """
+    records = get_assignments(
+        FakeAssignmentClient(), course_id=1, include_feedback=True, now=NOW,
+    )
+    assert len(records) == 1
+    assert records[0]["submitted"] is True

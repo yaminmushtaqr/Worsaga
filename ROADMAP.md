@@ -24,15 +24,16 @@ Version `0.5.0` includes:
   default.
 - Unit tests with mocked Moodle payloads.
 
-## Next: cache, sync, and changes
+## In development: 0.6.0 — cache, sync, and changes (unreleased)
 
 - Local SQLite cache in the platform-native user data directory.
 - `worsaga sync` with metadata-only defaults.
 - Change detection for new deadlines, new files, grade updates, and forum
-  updates.
+  updates, with explicit per-category baselines.
 - Tokens and authenticated URLs stay out of the cache.
+- HTTPS-only Moodle URLs (localhost development excepted).
 
-## Later: full-text search and study exports
+## Next: full-text search and study exports
 
 - Local full-text index over downloaded materials.
 - `worsaga search-text`.

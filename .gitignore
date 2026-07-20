@@ -34,6 +34,14 @@ worsaga-downloads/
 .local/
 artifacts/
 
+# Local metadata cache (WORSAGA_CACHE_PATH may point inside a checkout)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Virtual environments
 .venv/
 venv/

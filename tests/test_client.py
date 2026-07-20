@@ -143,16 +143,14 @@ class TestClientConvenienceMethods:
             assignid=10,
         )
 
-    def test_get_assignment_grades(self, client):
-        with patch.object(client, "call", return_value={}) as mock_call:
-            client.get_assignment_grades([10, 11])
-        mock_call.assert_called_once_with(
-            "mod_assign_get_grades",
-            **{"assignmentids[0]": 10, "assignmentids[1]": 11},
-        )
+    def test_mod_assign_get_grades_is_not_allowlisted(self, client):
+        # Removed in 0.6.0: the response can include other students'
+        # grades for teacher-capable tokens and no feature needs it.
+        from worsaga.client import ALLOWED_FUNCTIONS, MoodleWriteAttemptError
 
-    def test_get_assignment_grades_empty(self, client):
-        assert client.get_assignment_grades([]) == {"assignments": []}
+        assert "mod_assign_get_grades" not in ALLOWED_FUNCTIONS
+        with pytest.raises(MoodleWriteAttemptError):
+            client.call("mod_assign_get_grades", **{"assignmentids[0]": 10})
 
     def test_get_user_grade_items_defaults_to_config_userid(self, client):
         with patch.object(client, "call", return_value={}) as mock_call:

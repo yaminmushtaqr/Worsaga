@@ -69,11 +69,11 @@ ALLOWED_FUNCTION_POLICIES = {
         "changes_user_state": False,
         "exposed": True,
     },
-    "mod_assign_get_grades": {
-        "purpose": "read assignment grade payloads where permitted",
-        "changes_user_state": False,
-        "exposed": True,
-    },
+    # mod_assign_get_grades is deliberately NOT allowlisted: its response
+    # can include other students' grades for teacher-capable tokens, and
+    # the authenticated user's own grades/feedback already come from
+    # mod_assign_get_submission_status and gradereport_user_get_grade_items.
+    # Re-add only alongside a real feature and a privacy review.
     "gradereport_user_get_grade_items": {
         "purpose": "read gradebook items for a user/course",
         "changes_user_state": False,
@@ -255,16 +255,6 @@ class MoodleClient:
     def get_assignment_submission_status(self, assignment_id: int) -> dict:
         """Return submission status for one assignment."""
         return self.call("mod_assign_get_submission_status", assignid=assignment_id)
-
-    def get_assignment_grades(self, assignment_ids: list[int]) -> dict:
-        """Return grades for one or more assignments where Moodle permits it."""
-        if not assignment_ids:
-            return {"assignments": []}
-        params = {
-            f"assignmentids[{i}]": assignment_id
-            for i, assignment_id in enumerate(assignment_ids)
-        }
-        return self.call("mod_assign_get_grades", **params)
 
     def get_user_grade_items(self, course_id: int, user_id: int | None = None) -> dict:
         """Return gradebook items for a course and user."""

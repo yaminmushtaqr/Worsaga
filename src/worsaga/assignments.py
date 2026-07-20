@@ -236,17 +236,13 @@ def get_assignments(
                 exc,
             )
 
-    if include_feedback:
-        try:
-            client.get_assignment_grades([
-                as_int(assignment.get("id"), 0) or 0
-                for assignment in assignments
-                if as_int(assignment.get("id"), 0)
-            ])
-        except MoodleWriteAttemptError:
-            raise
-        except Exception as exc:
-            logger.warning("Moodle assignment grade fetch failed: %s", exc)
+    # ``include_feedback`` is accepted for compatibility but is a no-op:
+    # grade and feedback fields always derive from the per-user
+    # submission-status payloads fetched above. The former broad
+    # ``mod_assign_get_grades`` call was removed — its response (which
+    # can include other students' grades for teacher-capable tokens)
+    # was never used, so the request only widened data exposure.
+    del include_feedback
 
     return normalize_assignments(
         payload if isinstance(payload, dict) else {},

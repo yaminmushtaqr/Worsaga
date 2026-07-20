@@ -104,6 +104,10 @@ Credentials are resolved in this order:
    - `$WORSAGA_CREDS_PATH` (if set)
    - Platform-native config directory (see below)
 
+The Moodle URL must use `https://` — the API token is sent with every
+request, so plain HTTP would expose it. `http://` is accepted only for
+localhost development servers.
+
 The config directory follows each OS's conventions via `platformdirs`:
 `~/.config/worsaga/` on Linux, `~/Library/Application Support/worsaga/` on
 macOS, and `%APPDATA%\worsaga\` on Windows. Run `worsaga config` to see the
@@ -144,6 +148,8 @@ worsaga download ECON101 --week 3 --index 0       # Download by index
 worsaga extract ECON101 --week 3 --match slides   # Per-page text, nothing saved
 worsaga summary ECON101 --week 3   # Study notes for a week (extractive)
 worsaga search ECON101 regression  # Search course content by keyword
+worsaga sync                 # Sync metadata to the local cache, report changes
+worsaga changes --since 7d   # Show changes detected by previous syncs
 worsaga doctor               # Check auth and connectivity
 worsaga setup                # Guided first-time setup
 worsaga update               # Show the safe upgrade command
@@ -181,7 +187,9 @@ The server runs over stdio. Tools: `list_courses`, `get_deadlines`,
 `get_notifications`, `get_messages`, `get_digest`, `get_calendar_events`,
 `get_course_contents`, `get_week_materials` (discovery),
 `search_course_content`, `get_weekly_summary`, `download_material`
-(authenticated fetch), `extract_material` (per-page text, in memory).
+(authenticated fetch), `extract_material` (per-page text, in memory),
+`sync_now` (metadata sync + change detection), `get_changes` (recorded
+changes, no network).
 
 Minimal MCP configuration:
 
@@ -247,9 +255,13 @@ partially written file behind.
 
 ```bash
 worsaga materials ECON101 --week 3               # discover
-worsaga download ECON101 --week 3 --match slides # fetch
+worsaga download ECON101 --week 3 --match slides --output downloads/
 worsaga extract ECON101 --week 3 --match slides  # read, page by page
 ```
+
+CLI downloads save to the current directory by default; pass `--output DIR`
+to keep course files in a dedicated folder (recommended inside a git
+checkout, so private course material never sits next to `git add`).
 
 `extract` fetches the file into memory and returns structured per-page text
 (per-slide for PPTX) with light Markdown rendering — captions, learning
@@ -259,6 +271,27 @@ written to disk.
 
 If multiple materials match, you get a structured candidate list with indices
 to pick from (`--index 0`).
+
+## Sync and change detection
+
+`worsaga sync` fetches metadata-only snapshots — upcoming deadlines, file
+metadata, grades, and forum discussions; never file contents — into a local
+SQLite cache and reports what changed since the last sync: new deadlines,
+moved deadlines, new or updated files, grade updates, and new or updated
+forum discussions. The first sync establishes a baseline and reports no
+changes.
+
+```bash
+worsaga sync                     # sync and report changes
+worsaga changes --since 7d       # replay recorded changes (no network)
+worsaga changes --category grades
+```
+
+The cache lives in the platform-native user data directory
+(`WORSAGA_CACHE_PATH` overrides the location). Tokens and authenticated URLs
+are never written to it, and cache rows are keyed by Moodle site, so demo-mode
+data never mixes with real course data. The MCP equivalents are `sync_now()`
+and `get_changes()`.
 
 ## Safety and privacy
 

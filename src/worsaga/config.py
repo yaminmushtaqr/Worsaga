@@ -60,11 +60,43 @@ def _load_config_file(path: Path) -> dict:
         return json.load(f)
 
 
+_LOCAL_DEV_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+def _validate_moodle_url(url: str) -> None:
+    """Require HTTPS for any non-local Moodle URL.
+
+    The token is sent with every API call and download, so plain HTTP
+    would expose it on the wire. ``http://`` is permitted only for
+    localhost development instances.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if scheme == "https":
+        return
+    if scheme == "http" and (
+        host in _LOCAL_DEV_HOSTS or host.startswith("127.")
+    ):
+        return
+    raise ValueError(
+        f"Moodle URL must use https:// (got '{url}'). The API token is "
+        "sent with every request, so plain HTTP would expose it. "
+        "http:// is allowed only for localhost development servers."
+    )
+
+
 @dataclass(frozen=True)
 class MoodleConfig:
     url: str
     token: str
     userid: int = 0
+
+    def __post_init__(self):
+        if self.url:
+            _validate_moodle_url(self.url)
 
     @classmethod
     def load(
@@ -140,6 +172,7 @@ class MoodleConfig:
         path: Path | None = None,
     ) -> Path:
         """Write credentials to a JSON config file. Returns the path written."""
+        _validate_moodle_url(url.rstrip("/"))
         dest = path or DEFAULT_CONFIG_PATH
         dest.parent.mkdir(parents=True, exist_ok=True)
         payload = {"url": url.rstrip("/"), "token": token, "userid": userid}

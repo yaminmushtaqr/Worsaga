@@ -2,6 +2,95 @@
 
 All notable changes to Worsaga are documented in this file.
 
+## 0.6.0 (unreleased)
+
+### Added
+
+- Local metadata cache and sync. `worsaga sync` (CLI) and `sync_now`
+  (MCP) fetch metadata-only snapshots — upcoming deadlines, file
+  metadata, grades, and forum discussions; never file contents — into a
+  local SQLite cache in the platform-native user data directory
+  (`WORSAGA_CACHE_PATH` overrides the location).
+- Change detection across syncs: new deadlines, moved deadlines, new
+  files, updated files, grade updates, and new/updated forum
+  discussions. The first sync establishes a baseline and reports no
+  changes; detected changes are recorded and can be replayed with
+  `worsaga changes [--since 7d] [--category ...]` (CLI) or
+  `get_changes` (MCP) without touching the network.
+- Cache rows are keyed by Moodle site, so demo-mode data never mixes
+  with real course data. Tokens and authenticated URLs are stripped at
+  the storage boundary and never reach the cache file; a failed
+  category fetch is reported as a warning and skipped rather than
+  mistaken for an empty (or changed) Moodle.
+- New public API: `worsaga.run_sync`, `worsaga.get_recent_changes`,
+  `worsaga.CacheStore`, `worsaga.default_cache_path`.
+
+### Changed
+
+- Deadline entries (CLI `deadlines`, MCP `get_deadlines`) now include
+  the Moodle activity `id` alongside the existing fields.
+- `worsaga changes --since` is now exact: `--since 1h` queries one hour,
+  not a whole day rounded up. `get_recent_changes` accepts `since_ts`.
+- `get_upcoming_deadlines` accepts `strict=True` to propagate
+  assignment/quiz fetch failures instead of returning a partial list
+  (sync uses this so a partial snapshot is never treated as complete).
+- Change events include every fingerprinted field in `before`/`after`,
+  so no change is opaque (e.g. feedback-only grade updates).
+
+### Changed (breaking)
+
+- Moodle URLs must use HTTPS. The API token travels with every request,
+  so plain `http://` would expose it on the wire; `http://` is accepted
+  only for localhost development servers. Existing configs with
+  non-local `http://` URLs now fail with a clear error.
+- The `mod_assign_get_grades` web-service function was removed from the
+  read-only allowlist along with `MoodleClient.get_assignment_grades`.
+  Its response can include other students' grades for teacher-capable
+  tokens, and the authenticated user's own grade/feedback data already
+  comes from per-user submission status and the gradebook report. The
+  CLI `--include-feedback` flag is now a documented no-op.
+- Legacy `.ppt` and `.doc` files are no longer listed as supported
+  extraction formats (there was never an extractor for them); they no
+  longer consume the summary pipeline's download budget, and extraction
+  reports a clear "convert to .pptx/.docx" warning.
+
+### Fixed
+
+- PPTX extraction now honours the real presentation slide order (from
+  `presentation.xml` relationships, not XML file names), keeps
+  image-only and empty slides as numbered pages, reports true per-slide
+  image counts, and strips headers repeated across slides (cleaning
+  frequencies are computed document-wide, not per page). Corrupt
+  archives produce a structured warning instead of silent zero pages.
+- PPTX/DOCX parsing is bounded by archive safety budgets (member count,
+  per-member and total decompressed size), so a small download can no
+  longer decompress into unbounded memory (zip bomb).
+- Downloads write to a uniquely named temporary file and atomically
+  claim their destination, so concurrent or repeated downloads can no
+  longer truncate a pre-existing `.part` file or overwrite each other.
+- Concurrent `sync` runs serialize through an immediate SQLite
+  transaction instead of recording duplicate change events.
+- Baseline state is recorded explicitly per site and category, so a
+  legitimately empty category still finishes baselining and its first
+  real item is reported as a change.
+- Grades sync records per-course coverage: items from a course whose
+  gradebook was previously unreadable are adopted silently on recovery
+  instead of being reported as spurious `grade_updated` events.
+- Cache sanitization now also drops any key containing `token`, redacts
+  `token=`/`sesskey=` values embedded in stored strings, and the cache
+  file is created owner-only (0600) on POSIX, matching the credentials
+  file.
+- The public-release audit script piped file lists into its scan
+  function, which ran the failure counter in a subshell — scan findings
+  printed but could never fail the audit. Scans now run in the main
+  shell (process substitution), so findings are fatal again. GitHub
+  Actions pinned by full commit SHA are explicitly allowed by the
+  credential-shape scan.
+- The publish workflow now verifies that the pushed tag matches the
+  package version, publishes only on tag pushes (manual dispatch is a
+  dry run), and pins all actions to full commit SHAs. A `.gitattributes`
+  keeps shell scripts LF so the audit runs from Windows checkouts.
+
 ## 0.5.0
 
 ### Added
