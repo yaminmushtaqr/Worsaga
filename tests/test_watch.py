@@ -184,6 +184,20 @@ class TestCliSurface:
         docs = [doc for doc in yaml.safe_load_all(out) if doc is not None]
         assert [doc["cycle"] for doc in docs] == [1, 2]
 
+    def test_watch_yaml_missing_pyyaml_leaves_no_stray_separator(
+        self, capsys,
+    ):
+        with patch("worsaga.cli.render_structured",
+                   side_effect=RuntimeError("PyYAML required")):
+            with pytest.raises(SystemExit) as exc:
+                main(["--demo", "--yaml", "watch", "--cycles", "1",
+                      "--no-notify"])
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        # Render-before-separator: a failed render emits nothing at all.
+        assert "---" not in captured.out
+        assert "PyYAML" in captured.err
+
     def test_watch_zero_cycles_cli(self, capsys):
         main(["--demo", "watch", "--cycles", "0", "--no-notify"])
         captured = capsys.readouterr()

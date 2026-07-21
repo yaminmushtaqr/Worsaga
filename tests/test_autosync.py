@@ -316,6 +316,43 @@ class TestRemoveStrictness:
         assert "daemon-reload" in result["warning"]
         assert not (units / "worsaga-autosync.timer").exists()
 
+    def test_unknown_scheduler_state_aborts_macos_removal(self, plist):
+        autosync._write_record({"interval_minutes": 30})
+        unknown = {"installed": False, "method": "launchd",
+                   "error": "scheduler unavailable", "record": None}
+        with patch.object(autosync, "autosync_status",
+                          return_value=unknown), \
+             patch.object(autosync, "_run") as run:
+            result = remove_autosync()
+        assert result["removed"] is False
+        assert "cannot determine scheduler state" in result["error"]
+        assert plist.exists()
+        assert autosync.autosync_record_path().exists()
+        run.assert_not_called()
+
+    def test_unknown_scheduler_state_aborts_windows_removal(self, windows):
+        autosync._write_record({"interval_minutes": 30})
+        unknown = {"installed": False, "method": "schtasks",
+                   "error": "timed out", "record": None}
+        with patch.object(autosync, "autosync_status",
+                          return_value=unknown), \
+             patch.object(autosync, "_run") as run:
+            result = remove_autosync()
+        assert result["removed"] is False
+        assert "timed out" in result["error"]
+        assert autosync.autosync_record_path().exists()
+        run.assert_not_called()
+
+    def test_unknown_state_dry_run_still_previews(self, windows):
+        unknown = {"installed": False, "method": "schtasks",
+                   "error": "timed out", "record": None}
+        with patch.object(autosync, "autosync_status",
+                          return_value=unknown):
+            result = remove_autosync(dry_run=True)
+        assert result["removed"] is False
+        assert "error" not in result
+        assert result["actions"]
+
     def test_linux_no_systemctl_dry_run_keeps_record(self, linux, monkeypatch):
         monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
         autosync._write_record({"interval_minutes": 30})
@@ -356,6 +393,17 @@ class TestLastSyncReporting:
                    side_effect=RuntimeError("no config")):
             result = autosync_status()
         assert "last_sync_at" not in result
+
+    def test_status_never_creates_the_cache(self, windows, tmp_path,
+                                            monkeypatch):
+        cache = tmp_path / "brand-new" / "cache.db"
+        monkeypatch.setenv("WORSAGA_CACHE_PATH", str(cache))
+        monkeypatch.setenv("WORSAGA_DEMO", "1")
+        with patch.object(autosync, "_run", return_value=_ok()):
+            result = autosync_status()
+        assert "last_sync_at" not in result
+        assert not cache.exists()
+        assert not cache.parent.exists()
 
 
 class TestCliSurface:

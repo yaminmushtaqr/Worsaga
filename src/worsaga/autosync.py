@@ -358,24 +358,25 @@ def autosync_status() -> dict[str, Any]:
 
 
 def _attach_last_sync(result: dict[str, Any]) -> None:
-    """Best-effort last-run evidence for the status report.
+    """Attach the site's most recent sync time, read-only.
 
-    The scheduled job's whole purpose is advancing the local cache, so
-    the cache's most recent sync time is honest, locale-independent
-    last-run reporting — unlike parsing scheduler output. Skipped
-    silently when no site is configured.
+    The timestamp covers **any** sync — manual or scheduled; the cache
+    records no provenance — so it shows the data is moving, not that
+    the scheduler specifically ran. Uses the read-only cache reader
+    (status must never create the cache as a side effect) and is
+    skipped silently when no site is configured or no cache exists.
     """
     try:
+        from worsaga.cache import read_last_sync_at
         from worsaga.client import MoodleClient
         from worsaga.config import MoodleConfig
         from worsaga.demo import DemoMoodleClient, demo_mode_enabled
-        from worsaga.sync import last_sync_at
 
         client = (
             DemoMoodleClient() if demo_mode_enabled()
             else MoodleClient(MoodleConfig.load())
         )
-        ts = last_sync_at(client.base_url)
+        ts = read_last_sync_at(client.base_url)
         if ts is not None:
             result["last_sync_at"] = ts
     except Exception:
@@ -386,7 +387,14 @@ def _attach_last_sync(result: dict[str, Any]) -> None:
 
 
 def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
-    """Unregister the background sync and delete its metadata record."""
+    """Unregister the background sync and delete its metadata record.
+
+    Scheduler state is treated as three-valued: *installed*, *absent*
+    (the scheduler answered and knows no such job), or *unknown* (the
+    scheduler could not be queried at all). A real removal aborts
+    without touching anything on *unknown* — deleting local state while
+    a job may still be active would orphan it.
+    """
     platform = autosync_platform()
     result: dict[str, Any] = {
         "removed": False,
@@ -394,7 +402,22 @@ def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
         "platform": platform,
         "actions": [],
     }
-    was_installed = autosync_status().get("installed", False)
+    status = autosync_status()
+    # An error from a real scheduler backend means state is unknown; a
+    # "none" method (no user systemd) is a *known absent* scheduler and
+    # the record-only removal below is still safe.
+    if (
+        status.get("error")
+        and status.get("method") != "none"
+        and not dry_run
+    ):
+        result["method"] = status.get("method", "")
+        result["error"] = (
+            "cannot determine scheduler state, so nothing was removed: "
+            f"{status['error']}"
+        )
+        return result
+    was_installed = bool(status.get("installed"))
 
     if platform == "windows":
         delete = ["schtasks", "/Delete", "/F", "/TN", WINDOWS_TASK_NAME]

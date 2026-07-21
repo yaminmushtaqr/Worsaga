@@ -660,10 +660,13 @@ def get_autosync_status() -> dict[str, Any]:
 
     Read-only: inspects the platform scheduler (Task Scheduler on
     Windows, launchd on macOS, a systemd user timer on Linux) and the
-    local install record, and changes nothing. Installing or removing
-    the scheduled sync modifies system state and is deliberately CLI
-    only — direct the user to ``worsaga auto-sync install`` /
-    ``worsaga auto-sync remove`` (both support ``--dry-run``).
+    local install record, and changes nothing. ``last_sync_at``, when
+    present, is the site's most recent sync from **any** trigger —
+    manual or scheduled; sync provenance is not recorded. Installing
+    or removing the scheduled sync modifies system state and is
+    deliberately CLI only — direct the user to
+    ``worsaga auto-sync install`` / ``worsaga auto-sync remove``
+    (both support ``--dry-run``).
     """
     return _autosync_status()
 

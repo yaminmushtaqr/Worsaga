@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from worsaga.cache import CacheStore, default_cache_path, sanitize_payload
+from worsaga.cache import (
+    CacheStore,
+    default_cache_path,
+    read_last_sync_at,
+    sanitize_payload,
+)
 
 
 class TestDefaultCachePath:
@@ -19,6 +24,37 @@ class TestDefaultCachePath:
         path = default_cache_path()
         assert path.name == "cache.db"
         assert "worsaga" in str(path).lower()
+
+
+class TestReadLastSyncAt:
+    SITE = "https://moodle.example.com"
+
+    def test_missing_cache_returns_none_and_creates_nothing(self, tmp_path):
+        path = tmp_path / "brand-new" / "cache.db"
+        assert read_last_sync_at(self.SITE, path) is None
+        assert not path.exists()
+        assert not path.parent.exists()
+
+    def test_reads_existing_value_per_site(self, tmp_path):
+        path = tmp_path / "cache.db"
+        with CacheStore(path) as store:
+            store.record_sync_run(self.SITE, 100, 200, {})
+            store.record_sync_run(self.SITE, 300, 400, {})
+        assert read_last_sync_at(self.SITE, path) == 400
+        assert read_last_sync_at("https://other.example.com", path) is None
+
+    def test_read_only_never_modifies_the_file(self, tmp_path):
+        path = tmp_path / "cache.db"
+        with CacheStore(path) as store:
+            store.record_sync_run(self.SITE, 100, 200, {})
+        before = path.read_bytes()
+        read_last_sync_at(self.SITE, path)
+        assert path.read_bytes() == before
+
+    def test_non_database_file_returns_none(self, tmp_path):
+        path = tmp_path / "cache.db"
+        path.write_text("not a database")
+        assert read_last_sync_at(self.SITE, path) is None
 
 
 class TestSanitizePayload:

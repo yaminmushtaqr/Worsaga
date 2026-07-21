@@ -1636,10 +1636,11 @@ def cmd_watch(args: argparse.Namespace) -> None:
             # A clean stream contract: NDJSON (one compact object per
             # line) for JSON, explicit document separators for YAML.
             if getattr(args, "yaml", False):
+                # Render before emitting the separator so a missing
+                # PyYAML fails cleanly instead of leaving a stray "---".
+                rendered = render_structured(result, yaml_mode=True)
                 print("---")
-                print(
-                    render_structured(result, yaml_mode=True), flush=True,
-                )
+                print(rendered, flush=True)
             else:
                 print(json.dumps(result, default=str), flush=True)
             return
@@ -1699,7 +1700,8 @@ def cmd_autosync(args: argparse.Namespace) -> None:
             print(f"  command:  {' '.join(record.get('command', []))}")
         if result.get("last_sync_at"):
             print(
-                f"  last sync: {_display_timestamp(result['last_sync_at'])}"
+                "  last sync (manual or scheduled): "
+                f"{_display_timestamp(result['last_sync_at'])}"
             )
         if result.get("error"):
             print(f"Warning: {result['error']}", file=sys.stderr)

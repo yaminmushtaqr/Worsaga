@@ -120,10 +120,10 @@ def build_study_pack(
 
     files = []
     if section and section.get("modules"):
-        # Enumerate everything supported (the helper's own default cap
-        # is smaller than ours), then apply this pack's cap loudly.
+        # Enumerate everything supported (uncapped), then apply this
+        # pack's cap loudly so the warning states the exact total.
         all_files = get_downloadable_files(
-            section["modules"], max_files=10_000,
+            section["modules"], max_files=None,
         )
         if len(all_files) > max_files:
             warnings.append(

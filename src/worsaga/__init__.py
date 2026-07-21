@@ -67,7 +67,7 @@ from worsaga.autosync import (
     install_autosync,
     remove_autosync,
 )
-from worsaga.cache import CacheStore, default_cache_path
+from worsaga.cache import CacheStore, default_cache_path, read_last_sync_at
 from worsaga.notify import notification_backend, send_notification
 from worsaga.studypack import build_study_pack, write_study_pack
 from worsaga.watch import run_watch
@@ -121,6 +121,7 @@ __all__ = [
     "default_cache_path",
     "default_index_path",
     "get_recent_changes",
+    "read_last_sync_at",
     "run_sync",
     "search_text_index",
     "write_study_pack",

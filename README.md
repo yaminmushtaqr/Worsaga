@@ -329,12 +329,14 @@ worsaga auto-sync remove                            # unregister cleanly
 
 `--dry-run` prints the exact commands and files an install or remove would
 touch. Install re-checks the scheduler afterwards and reports whether the
-registration was verified; `status` also shows the cache's most recent sync
-time, which is the honest signal that background runs are actually
-happening. Removal refuses to delete anything while the scheduled job is
-still active. The scheduled command line never contains credentials — the
-background sync loads configuration the same way a manual run does. Check
-what it found later with `worsaga changes`.
+registration was verified; `status` is strictly read-only and also shows
+the cache's most recent sync time — manual or scheduled, since Worsaga
+does not record which trigger ran a sync — so you can see whether data has
+moved recently. Removal refuses to delete anything while the scheduled job
+is still active, or when the scheduler cannot be queried at all. The
+scheduled command line never contains credentials — the background sync
+loads configuration the same way a manual run does. Check what it found
+later with `worsaga changes`.
 
 ## Full-text search and study packs
 

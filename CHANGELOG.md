@@ -27,15 +27,18 @@ All notable changes to Worsaga are documented in this file.
   Linux; systems without user systemd get a clear cron suggestion).
   `install`/`remove` support `--dry-run`, which shows the exact
   commands and files involved without changing anything (including the
-  local metadata record); `status` is always read-only. Removal is
-  strict: a failed `launchctl unload` or `systemctl disable` reports
-  an error and deletes nothing, so an active job can never be
-  orphaned. Install re-queries the scheduler afterwards and reports
-  `verified`, since schedulers can accept a registration without
-  guaranteeing the job runs. The scheduled command line contains no
-  credentials. A local `autosync.json` record keeps `status` honest
-  without parsing locale-dependent scheduler output, and `status`
-  reports the cache's most recent sync time as last-run evidence.
+  local metadata record); `status` is strictly read-only (it never
+  creates the cache as a side effect). Removal is strict and
+  three-valued: a failed `launchctl unload` or `systemctl disable`
+  reports an error and deletes nothing, and when the scheduler cannot
+  be queried at all the removal aborts without mutation — an active
+  job can never be orphaned. Install re-queries the scheduler
+  afterwards and reports `verified`, since schedulers can accept a
+  registration without guaranteeing the job runs. The scheduled
+  command line contains no credentials. A local `autosync.json`
+  record keeps `status` honest without parsing locale-dependent
+  scheduler output, and `status` reports the cache's most recent sync
+  time (manual or scheduled — sync provenance is not recorded).
 - MCP: read-only `get_autosync_status` tool. Installing or removing
   the scheduled sync stays CLI-only by design.
 - New public API: `worsaga.run_watch`, `worsaga.send_notification`,

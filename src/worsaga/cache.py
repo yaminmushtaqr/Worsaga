@@ -124,6 +124,34 @@ def sanitize_payload(value: Any) -> Any:
     return value
 
 
+def read_last_sync_at(site: str, path: str | Path | None = None) -> int | None:
+    """Read the most recent sync finish time for *site*, read-only.
+
+    Unlike opening a :class:`CacheStore` (which creates the directory,
+    the database file, and the schema as a side effect), this opens the
+    existing database with SQLite's ``mode=ro`` and returns ``None``
+    when the cache does not exist yet — status-style callers must never
+    create state.
+    """
+    cache_path = Path(path) if path else default_cache_path()
+    if not cache_path.is_file():
+        return None
+    uri = "file:///" + cache_path.resolve().as_posix().lstrip("/") + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT MAX(finished_at) FROM sync_runs WHERE site = ?", (site,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return int(row[0]) if row and row[0] is not None else None
+
+
 class CacheStore:
     """SQLite-backed store for metadata snapshots and change events.
 

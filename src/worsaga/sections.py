@@ -96,7 +96,7 @@ def score_section_match(name: str, week: int) -> tuple[int, str]:
 def get_downloadable_files(
     modules: list[dict],
     *,
-    max_files: int = MAX_FILES_PER_SECTION,
+    max_files: int | None = MAX_FILES_PER_SECTION,
 ) -> list[dict]:
     """Extract downloadable files from section modules, prioritised by type.
 
@@ -104,7 +104,9 @@ def get_downloadable_files(
     ``filesize``, ``module_id``, ``module_name``, ``priority``.
 
     PDFs first, then PPTX, then other supported formats.
-    Deduplicates by ``(fileurl, filename)``.
+    Deduplicates by ``(fileurl, filename)``. ``max_files=None`` returns
+    everything (callers that apply their own cap use this to count the
+    real total first).
     """
     files: list[dict] = []
     seen_keys: set[str] = set()
@@ -145,7 +147,7 @@ def get_downloadable_files(
             })
 
     files.sort(key=lambda f: (f["priority"], f["module_id"]))
-    return files[:max_files]
+    return files if max_files is None else files[:max_files]
 
 
 # ── Best-section finder ─────────────────────────────────────────
