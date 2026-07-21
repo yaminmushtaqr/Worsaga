@@ -328,7 +328,11 @@ worsaga auto-sync remove                            # unregister cleanly
 ```
 
 `--dry-run` prints the exact commands and files an install or remove would
-touch. The scheduled command line never contains credentials — the
+touch. Install re-checks the scheduler afterwards and reports whether the
+registration was verified; `status` also shows the cache's most recent sync
+time, which is the honest signal that background runs are actually
+happening. Removal refuses to delete anything while the scheduled job is
+still active. The scheduled command line never contains credentials — the
 background sync loads configuration the same way a manual run does. Check
 what it found later with `worsaga changes`.
 
@@ -340,7 +344,9 @@ extracted page by page, and only that text is stored — in a SQLite FTS5
 database in the platform-native user data directory (`WORSAGA_INDEX_PATH`
 overrides the location). Files unchanged since the last run are skipped, so
 re-running is cheap; a per-run file budget makes large sites indexable in
-resumable steps.
+resumable steps; and full-course runs remove index entries for files that
+were deleted or renamed on Moodle (never on failed fetches, and never from
+week-scoped runs).
 
 ```bash
 worsaga index                          # index all courses
@@ -351,7 +357,8 @@ worsaga search-text tax --course ECON101 --limit 5
 
 `worsaga study-pack` exports a single Markdown document for a teaching week:
 deterministic study notes, a materials overview, and the full extracted
-per-page content of every supported file in the section.
+per-page content of the section's supported files (up to eight; a larger
+section is included in listed order with an explicit warning).
 
 ```bash
 worsaga study-pack ECON101 --week 3            # writes ECON101-week-3-study-pack.md

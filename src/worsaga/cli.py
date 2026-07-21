@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import sys
 import urllib.error
@@ -84,7 +85,7 @@ from worsaga.autosync import (
 )
 from worsaga.output import render_structured, wants_structured
 from worsaga.sections import find_best_section, summarize_modules
-from worsaga.watch import DEFAULT_WATCH_INTERVAL, run_watch
+from worsaga.watch import DEFAULT_WATCH_INTERVAL, MIN_WATCH_INTERVAL, run_watch
 from worsaga.studypack import build_study_pack, write_study_pack
 from worsaga.summaries import build_weekly_summary, format_bullets
 from worsaga.textindex import (
@@ -483,8 +484,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "Fetch supported course materials (PDF, PPTX, DOCX, TXT) in "
             "memory, extract their text, and store it page by page in a "
             "local SQLite full-text index. Files unchanged since the "
-            "last run are skipped, so re-running is cheap. Tokens and "
-            "authenticated URLs are never stored."
+            "last run are skipped, so re-running is cheap, and "
+            "full-course runs drop entries for files deleted on Moodle. "
+            "Tokens and authenticated URLs are never stored."
         ),
     )
     ix.add_argument(
@@ -1422,11 +1424,14 @@ def cmd_index(args: argparse.Namespace) -> None:
         return
 
     print(f"Indexed {result['site']}")
+    removed = result.get("files_removed", 0)
+    removed_note = f", {removed} removed" if removed else ""
     print(
         f"  files: {result['files_indexed']} indexed, "
         f"{result['files_unchanged']} unchanged, "
         f"{result['files_failed']} failed, "
         f"{result['files_skipped_unsupported']} skipped (no extractor)"
+        f"{removed_note}"
     )
     stats = result["index"]
     print(
@@ -1612,7 +1617,11 @@ def cmd_changes(args: argparse.Namespace) -> None:
 
 def cmd_watch(args: argparse.Namespace) -> None:
     client = _client(args)
-    interval = parse_interval(args.interval, default=DEFAULT_WATCH_INTERVAL)
+    # Clamp before announcing so the message matches actual behaviour.
+    interval = max(
+        MIN_WATCH_INTERVAL,
+        parse_interval(args.interval, default=DEFAULT_WATCH_INTERVAL),
+    )
     structured = wants_structured(args)
 
     if not structured and not args.quiet:
@@ -1624,15 +1633,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
     def _on_cycle(result: dict) -> None:
         if structured:
-            # One structured payload per cycle (JSON/YAML lines).
-            print(
-                render_structured(
-                    result,
-                    json_mode=getattr(args, "json", False),
-                    yaml_mode=getattr(args, "yaml", False),
-                ),
-                flush=True,
-            )
+            # A clean stream contract: NDJSON (one compact object per
+            # line) for JSON, explicit document separators for YAML.
+            if getattr(args, "yaml", False):
+                print("---")
+                print(
+                    render_structured(result, yaml_mode=True), flush=True,
+                )
+            else:
+                print(json.dumps(result, default=str), flush=True)
             return
         stamp = _display_timestamp(result.get("synced_at"))
         if not result.get("ok"):
@@ -1688,6 +1697,10 @@ def cmd_autosync(args: argparse.Namespace) -> None:
         if record:
             print(f"  interval: {record.get('interval_minutes', '?')} min")
             print(f"  command:  {' '.join(record.get('command', []))}")
+        if result.get("last_sync_at"):
+            print(
+                f"  last sync: {_display_timestamp(result['last_sync_at'])}"
+            )
         if result.get("error"):
             print(f"Warning: {result['error']}", file=sys.stderr)
         return
@@ -1728,8 +1741,12 @@ def cmd_autosync(args: argparse.Namespace) -> None:
             print(f"  write:  {action['write']}")
         elif "delete" in action:
             print(f"  delete: {action['delete']}")
+    if result.get("warning"):
+        print(f"Warning: {result['warning']}", file=sys.stderr)
     if not result["dry_run"]:
         done = "installed" if args.action == "install" else "removed"
+        if args.action == "install" and result.get("verified"):
+            done += " and verified with the scheduler"
         print(f"Auto-sync {done}.")
 
 

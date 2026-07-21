@@ -45,6 +45,12 @@ def record_in_tmp(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def isolated_cache(tmp_path, monkeypatch):
+    """Keep status's last-sync lookup away from the real user cache."""
+    monkeypatch.setenv("WORSAGA_CACHE_PATH", str(tmp_path / "cache.db"))
+
+
 @pytest.fixture
 def windows(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
@@ -96,6 +102,8 @@ class TestInstallWindows:
         with patch.object(autosync, "_run", return_value=_ok()):
             result = install_autosync(45)
         assert result["installed"] is True
+        # The post-install health check re-queried the scheduler.
+        assert result["verified"] is True
         record = json.loads(
             autosync.autosync_record_path().read_text(encoding="utf-8")
         )
@@ -116,6 +124,18 @@ class TestInstallWindows:
             high = install_autosync(999999)
         assert low["interval_minutes"] == MIN_INTERVAL_MINUTES
         assert high["interval_minutes"] == MAX_INTERVAL_MINUTES
+
+    def test_install_verification_failure_warns(self, windows):
+        def flaky(args):
+            if args[:2] == ["schtasks", "/Create"]:
+                return _ok()
+            return _fail("task vanished")
+
+        with patch.object(autosync, "_run", side_effect=flaky):
+            result = install_autosync(30)
+        assert result["installed"] is True
+        assert result["verified"] is False
+        assert "not report the job" in result["warning"]
 
     def test_command_paths_with_spaces_are_quoted(self, windows):
         with patch.object(autosync, "sync_command",
@@ -228,6 +248,114 @@ class TestRemove:
             call.args[0][:2] != ["schtasks", "/Delete"]
             for call in run.call_args_list
         )
+
+
+class TestRemoveStrictness:
+    """A failed unload/disable must never be reported as a removal."""
+
+    @pytest.fixture
+    def plist(self, macos, tmp_path, monkeypatch):
+        path = tmp_path / "com.worsaga.autosync.plist"
+        path.write_text("<plist/>", encoding="utf-8")
+        monkeypatch.setattr(autosync, "_macos_plist_path", lambda: path)
+        return path
+
+    @pytest.fixture
+    def units(self, linux, tmp_path, monkeypatch):
+        unit_dir = tmp_path / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        (unit_dir / "worsaga-autosync.service").write_text("s")
+        (unit_dir / "worsaga-autosync.timer").write_text("t")
+        monkeypatch.setattr(autosync, "_linux_unit_dir", lambda: unit_dir)
+        monkeypatch.setattr(autosync.shutil, "which",
+                            lambda name: "/usr/bin/systemctl")
+        return unit_dir
+
+    def test_macos_failed_unload_keeps_everything(self, plist):
+        autosync._write_record({"interval_minutes": 30})
+        with patch.object(autosync, "autosync_status",
+                          return_value={"installed": True}), \
+             patch.object(autosync, "_run", return_value=_fail("busy")):
+            result = remove_autosync()
+        assert result["removed"] is False
+        assert result["error"] == "busy"
+        assert plist.exists()
+        assert autosync.autosync_record_path().exists()
+
+    def test_macos_unloaded_agent_skips_unload(self, plist):
+        with patch.object(autosync, "autosync_status",
+                          return_value={"installed": False}), \
+             patch.object(autosync, "_run") as run:
+            result = remove_autosync()
+        assert result["removed"] is True
+        assert not plist.exists()
+        run.assert_not_called()
+
+    def test_linux_failed_disable_keeps_everything(self, units):
+        autosync._write_record({"interval_minutes": 30})
+        with patch.object(autosync, "autosync_status",
+                          return_value={"installed": True}), \
+             patch.object(autosync, "_run", return_value=_fail("in use")):
+            result = remove_autosync()
+        assert result["removed"] is False
+        assert result["error"] == "in use"
+        assert (units / "worsaga-autosync.timer").exists()
+        assert autosync.autosync_record_path().exists()
+
+    def test_linux_daemon_reload_failure_warns(self, units):
+        def flaky(args):
+            if args[:3] == ["systemctl", "--user", "daemon-reload"]:
+                return _fail("bus down")
+            return _ok()
+
+        with patch.object(autosync, "autosync_status",
+                          return_value={"installed": True}), \
+             patch.object(autosync, "_run", side_effect=flaky):
+            result = remove_autosync()
+        assert result["removed"] is True
+        assert "daemon-reload" in result["warning"]
+        assert not (units / "worsaga-autosync.timer").exists()
+
+    def test_linux_no_systemctl_dry_run_keeps_record(self, linux, monkeypatch):
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        autosync._write_record({"interval_minutes": 30})
+        result = remove_autosync(dry_run=True)
+        assert result["removed"] is False
+        assert autosync.autosync_record_path().exists()
+        assert any("delete" in action for action in result["actions"])
+
+    def test_linux_no_systemctl_real_remove_deletes_record(
+        self, linux, monkeypatch,
+    ):
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        autosync._write_record({"interval_minutes": 30})
+        result = remove_autosync()
+        assert result["removed"] is True
+        assert not autosync.autosync_record_path().exists()
+
+
+class TestLastSyncReporting:
+    def test_status_includes_cache_last_sync(self, windows, tmp_path,
+                                             monkeypatch):
+        from worsaga.demo import DemoMoodleClient
+        from worsaga.sync import run_sync
+
+        cache = tmp_path / "cache.db"
+        monkeypatch.setenv("WORSAGA_CACHE_PATH", str(cache))
+        monkeypatch.setenv("WORSAGA_DEMO", "1")
+        run_sync(DemoMoodleClient(), cache_path=cache)
+
+        with patch.object(autosync, "_run", return_value=_ok()):
+            result = autosync_status()
+        assert result["last_sync_at"] > 0
+
+    def test_status_without_site_omits_last_sync(self, windows, monkeypatch):
+        monkeypatch.delenv("WORSAGA_DEMO", raising=False)
+        with patch.object(autosync, "_run", return_value=_ok()), \
+             patch("worsaga.config.MoodleConfig.load",
+                   side_effect=RuntimeError("no config")):
+            result = autosync_status()
+        assert "last_sync_at" not in result
 
 
 class TestCliSurface:

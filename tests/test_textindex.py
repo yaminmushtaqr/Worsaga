@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from worsaga.cli import main
+from worsaga.client import MoodleWriteAttemptError
 from worsaga.demo import DemoMoodleClient
 from worsaga.textindex import (
     TextIndexStore,
@@ -17,6 +18,50 @@ from worsaga.textindex import (
 )
 
 SITE = "https://moodle.example.com"
+
+
+class _MutableClient:
+    """Minimal offline client whose course files can change between builds."""
+
+    base_url = SITE
+
+    def __init__(self):
+        self.files = {
+            "alpha-notes.txt": b"The alpha topic covers gradient descent.",
+            "beta-notes.txt": b"The beta topic covers convex duality.",
+        }
+        self.module_ids = {"alpha-notes.txt": 100, "beta-notes.txt": 101}
+        self.fail_contents = False
+        self.raise_write_attempt = False
+
+    def get_courses(self):
+        return [{"id": 1, "shortname": "T101", "fullname": "Testing 101"}]
+
+    def get_course_contents(self, course_id):
+        if self.raise_write_attempt:
+            raise MoodleWriteAttemptError("blocked write")
+        if self.fail_contents:
+            raise OSError("network down")
+        modules = [
+            {
+                "id": self.module_ids[name],
+                "name": name,
+                "modname": "resource",
+                "contents": [{
+                    "type": "file",
+                    "filename": name,
+                    "filepath": "/",
+                    "fileurl": f"{self.base_url}/pluginfile.php/{name}",
+                    "filesize": len(data),
+                    "timemodified": 1000,
+                }],
+            }
+            for name, data in sorted(self.files.items())
+        ]
+        return [{"id": 10, "section": 1, "name": "Week 1", "modules": modules}]
+
+    def download_file(self, fileurl):
+        return self.files[fileurl.rsplit("/", 1)[-1]]
 
 
 @pytest.fixture
@@ -250,6 +295,87 @@ class TestBuildTextIndex:
         assert material_fingerprint(base) != material_fingerprint(
             {**base, "time_modified": 200}
         )
+
+
+class TestDeletionReconciliation:
+    def test_deleted_file_is_removed_from_index(self, index_path):
+        client = _MutableClient()
+        build_text_index(client, index_path=index_path)
+        assert search_text_index(SITE, "alpha", index_path=index_path)["hits"]
+
+        del client.files["alpha-notes.txt"]
+        result = build_text_index(client, index_path=index_path)
+
+        assert result["files_removed"] == 1
+        assert search_text_index(SITE, "alpha", index_path=index_path)["hits"] == []
+        assert search_text_index(SITE, "beta", index_path=index_path)["hits"]
+        assert result["index"]["documents"] == 1
+
+    def test_renamed_file_is_replaced_not_duplicated(self, index_path):
+        client = _MutableClient()
+        build_text_index(client, index_path=index_path)
+
+        data = client.files.pop("alpha-notes.txt")
+        client.files["alpha-renamed.txt"] = data
+        client.module_ids["alpha-renamed.txt"] = 100
+        result = build_text_index(client, index_path=index_path)
+
+        assert result["files_removed"] == 1
+        assert result["files_indexed"] == 1
+        assert result["index"]["documents"] == 2
+
+    def test_week_scoped_build_never_removes(self, index_path):
+        client = _MutableClient()
+        build_text_index(client, index_path=index_path)
+
+        del client.files["alpha-notes.txt"]
+        result = build_text_index(client, week=1, index_path=index_path)
+
+        assert result["files_removed"] == 0
+        assert result["index"]["documents"] == 2
+        assert search_text_index(SITE, "alpha", index_path=index_path)["hits"]
+
+    def test_failed_contents_fetch_never_removes(self, index_path):
+        client = _MutableClient()
+        build_text_index(client, index_path=index_path)
+
+        client.fail_contents = True
+        result = build_text_index(client, index_path=index_path)
+
+        assert result["files_removed"] == 0
+        assert result["index"]["documents"] == 2
+        assert any("contents fetch failed" in w for w in result["warnings"])
+
+    def test_budget_exhaustion_never_removes_unfetched(self, index_path):
+        client = _MutableClient()
+        build_text_index(client, index_path=index_path)
+
+        # Touch both files so both need re-fetching, then allow only one.
+        for name in list(client.files):
+            client.files[name] += b" updated"
+        result = build_text_index(client, index_path=index_path, max_files=1)
+
+        assert result["budget_exhausted"]
+        assert result["files_removed"] == 0
+        assert result["index"]["documents"] == 2
+
+
+class TestSafetyInvariants:
+    def test_write_attempt_error_propagates(self, index_path):
+        client = _MutableClient()
+        client.raise_write_attempt = True
+        with pytest.raises(MoodleWriteAttemptError):
+            build_text_index(client, index_path=index_path)
+
+    def test_build_response_is_sanitized(self, index_path):
+        client = _MutableClient()
+        courses = [{"id": 1, "shortname": "T101 token=SECRET1234",
+                    "fullname": "Testing"}]
+        client.get_courses = lambda: courses
+        result = build_text_index(client, index_path=index_path)
+        text = json.dumps(result)
+        assert "SECRET1234" not in text
+        assert "token=REDACTED" in text
 
 
 class TestCliSurface:

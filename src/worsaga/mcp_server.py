@@ -527,7 +527,10 @@ def build_search_index(
     page by page in a local SQLite full-text index for ``search_text()``.
     Files unchanged since the last build are skipped without a fetch, so
     repeated calls are cheap and resume where the previous run's file
-    budget stopped. Tokens and authenticated URLs are never stored.
+    budget stopped. Full-course builds also drop index entries for files
+    deleted or renamed on Moodle (reported as ``files_removed``; never
+    on failed fetches, and never from week-scoped builds). Tokens and
+    authenticated URLs are never stored.
 
     Parameters
     ----------
@@ -597,8 +600,9 @@ def export_study_pack(
     """Export a Markdown study pack for a course week.
 
     Builds a single Markdown document — study notes, a materials
-    overview, and the extracted per-page content of every supported
-    file in the week's section — and writes it inside Worsaga's own
+    overview, and the extracted per-page content of the week's
+    supported files (up to 8; larger sections are included in listed
+    order with a warning) — and writes it inside Worsaga's own
     downloads directory. The response reports the written ``path`` and
     pack metadata; set ``include_markdown=True`` to also return the
     full Markdown inline. No tokens or authenticated URLs appear in

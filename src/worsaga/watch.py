@@ -97,6 +97,14 @@ def run_watch(
         sleep_fn = time.sleep
     cycles = failures = changes_total = 0
 
+    if max_cycles is not None and max_cycles <= 0:
+        return {
+            "cycles": 0,
+            "changes_total": 0,
+            "failures": 0,
+            "interval_seconds": interval_seconds,
+        }
+
     while True:
         cycles += 1
         result: dict[str, Any]
@@ -109,7 +117,13 @@ def run_watch(
             raise
         except Exception as exc:
             failures += 1
-            result = {"ok": False, "error": str(exc), "changes": []}
+            result = {
+                "ok": False,
+                "error": str(exc),
+                "changes": [],
+                # Failed cycles still carry a timestamp for display.
+                "synced_at": int(time.time()),
+            }
         result["cycle"] = cycles
 
         changes = result.get("changes", [])

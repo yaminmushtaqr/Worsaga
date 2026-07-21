@@ -2,17 +2,19 @@
 
 A study pack is a single self-contained Markdown document for one
 teaching week: deterministic study notes, a materials overview, and the
-full extracted per-page content of every supported file in the week's
-section. It is built entirely from data fetched in memory through the
-authenticated client — each file is downloaded once and used for both
-the summary bullets and the content section.
+full extracted per-page content of the section's supported files (up to
+``MAX_PACK_FILES``; a larger section is included in listed order with
+an explicit warning). It is built entirely from data fetched in memory
+through the authenticated client — each file is downloaded once and
+used for both the summary bullets and the content section.
 
 ``build_study_pack`` is the shared orchestrator used by the CLI
 (``worsaga study-pack``) and the MCP server (``export_study_pack``).
 The returned markdown and metadata contain **no tokens, no raw
-``file_url`` values, and no authenticated URLs** — the final markdown
-is passed through :func:`worsaga.cache.sanitize_payload` as a
-belt-and-braces redaction.
+``file_url`` values, and no authenticated URLs** — the entire response
+(markdown, course names, bullets, file names, warnings) is passed
+through :func:`worsaga.cache.sanitize_payload` as a belt-and-braces
+redaction.
 
 All operations are read-only. Nothing is written to Moodle.
 """
@@ -118,7 +120,17 @@ def build_study_pack(
 
     files = []
     if section and section.get("modules"):
-        files = get_downloadable_files(section["modules"])[:max_files]
+        # Enumerate everything supported (the helper's own default cap
+        # is smaller than ours), then apply this pack's cap loudly.
+        all_files = get_downloadable_files(
+            section["modules"], max_files=10_000,
+        )
+        if len(all_files) > max_files:
+            warnings.append(
+                f"Including the first {max_files} of {len(all_files)} "
+                "supported files in this section."
+            )
+        files = all_files[:max_files]
     for finfo in files:
         url = finfo.get("fileurl", "")
         name = finfo.get("filename", "")
@@ -200,9 +212,12 @@ def build_study_pack(
             lines.append(body)
             lines.append("")
 
-    markdown = sanitize_payload("\n".join(lines).rstrip() + "\n")
+    markdown = "\n".join(lines).rstrip() + "\n"
 
-    return {
+    # Sanitize the whole response, not just the markdown: course names,
+    # bullets, file names, and warnings all originate from Moodle data
+    # and pass through the same redaction as the cache boundary.
+    return sanitize_payload({
         "course_id": course_id,
         "course_shortname": course_shortname,
         "course_fullname": course_fullname,
@@ -222,7 +237,7 @@ def build_study_pack(
         "markdown": markdown,
         "suggested_filename": study_pack_filename(course_label, week),
         "warnings": warnings,
-    }
+    })
 
 
 def write_study_pack(

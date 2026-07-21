@@ -292,6 +292,15 @@ def install_autosync(
             "installed_at": int(time.time()),
         })
         result["installed"] = True
+        # Schedulers can accept a registration without guaranteeing the
+        # job will run (schtasks documents this explicitly), so re-query
+        # immediately instead of trusting the create call alone.
+        result["verified"] = bool(autosync_status().get("installed"))
+        if not result["verified"]:
+            result["warning"] = (
+                "the scheduler does not report the job as registered "
+                "after install; check it manually"
+            )
     return result
 
 
@@ -344,7 +353,33 @@ def autosync_status() -> dict[str, Any]:
             return result
         result["installed"] = proc.returncode == 0
 
+    _attach_last_sync(result)
     return result
+
+
+def _attach_last_sync(result: dict[str, Any]) -> None:
+    """Best-effort last-run evidence for the status report.
+
+    The scheduled job's whole purpose is advancing the local cache, so
+    the cache's most recent sync time is honest, locale-independent
+    last-run reporting — unlike parsing scheduler output. Skipped
+    silently when no site is configured.
+    """
+    try:
+        from worsaga.client import MoodleClient
+        from worsaga.config import MoodleConfig
+        from worsaga.demo import DemoMoodleClient, demo_mode_enabled
+        from worsaga.sync import last_sync_at
+
+        client = (
+            DemoMoodleClient() if demo_mode_enabled()
+            else MoodleClient(MoodleConfig.load())
+        )
+        ts = last_sync_at(client.base_url)
+        if ts is not None:
+            result["last_sync_at"] = ts
+    except Exception:
+        pass
 
 
 # ── Remove ───────────────────────────────────────────────────────
@@ -373,20 +408,30 @@ def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
 
     elif platform == "macos":
         plist_path = _macos_plist_path()
+        unload = ["launchctl", "unload", "-w", str(plist_path)]
         result["method"] = "launchd"
-        result["actions"].append(
-            {"run": ["launchctl", "unload", "-w", str(plist_path)]}
-        )
+        result["actions"].append({"run": unload})
         result["actions"].append({"delete": str(plist_path)})
         if not dry_run and plist_path.is_file():
-            _run(["launchctl", "unload", "-w", str(plist_path)])
+            if was_installed:
+                # The agent is genuinely loaded: a failed unload means
+                # the job is still active — report it and change
+                # nothing, rather than deleting the plist and claiming
+                # success while an orphaned job keeps running.
+                proc = _run(unload)
+                if proc.returncode != 0:
+                    result["error"] = (proc.stderr or proc.stdout).strip()
+                    return result
             plist_path.unlink(missing_ok=True)
 
     else:
         if not shutil.which("systemctl"):
             result["method"] = "none"
-            _delete_record()
-            result["removed"] = not dry_run
+            result["actions"].append({"delete": str(autosync_record_path())})
+            if not dry_run:
+                _delete_record()
+                result["removed"] = True
+                result["was_installed"] = was_installed
             return result
         unit_dir = _linux_unit_dir()
         disable = [
@@ -403,10 +448,21 @@ def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
         result["actions"].append({"run": ["systemctl", "--user", "daemon-reload"]})
         if not dry_run:
             if was_installed:
-                _run(disable)
+                # Same contract as macOS: never delete unit files while
+                # the timer is still active.
+                proc = _run(disable)
+                if proc.returncode != 0:
+                    result["error"] = (proc.stderr or proc.stdout).strip()
+                    return result
             (unit_dir / f"{LINUX_UNIT}.service").unlink(missing_ok=True)
             (unit_dir / f"{LINUX_UNIT}.timer").unlink(missing_ok=True)
-            _run(["systemctl", "--user", "daemon-reload"])
+            reload_proc = _run(["systemctl", "--user", "daemon-reload"])
+            if reload_proc.returncode != 0:
+                result["warning"] = (
+                    "unit files removed but 'systemctl --user "
+                    "daemon-reload' failed: "
+                    + (reload_proc.stderr or reload_proc.stdout).strip()
+                )
 
     if not dry_run:
         _delete_record()

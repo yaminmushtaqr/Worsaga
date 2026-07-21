@@ -9,9 +9,12 @@ All notable changes to Worsaga are documented in this file.
 - Watch mode. `worsaga watch [--interval 15m] [--cycles N]` runs the
   metadata sync in a foreground loop, prints detected changes each
   cycle, and raises a local desktop notification when something
-  changed. Structured mode (`--json`/`--yaml`) emits one payload per
-  cycle. A failed cycle (network down) is reported and the loop
-  continues; intervals are clamped to at least 60 seconds.
+  changed. Structured mode is a clean stream: `--json` emits one
+  compact JSON object per line (NDJSON) and `--yaml` separates cycles
+  with `---` document markers. A failed cycle (network down) is
+  reported — with a timestamp — and the loop continues; intervals are
+  clamped to at least 60 seconds (announced post-clamp) and
+  `--cycles 0` runs nothing.
 - Local notification backends, best effort and dependency-free: a
   Windows toast via PowerShell/WinRT, macOS `osascript`, and Linux
   `notify-send`, with a structured no-backend result everywhere else.
@@ -23,10 +26,16 @@ All notable changes to Worsaga are documented in this file.
   on Windows, a launchd LaunchAgent on macOS, a systemd user timer on
   Linux; systems without user systemd get a clear cron suggestion).
   `install`/`remove` support `--dry-run`, which shows the exact
-  commands and files involved without changing anything; `status` is
-  always read-only. The scheduled command line contains no
+  commands and files involved without changing anything (including the
+  local metadata record); `status` is always read-only. Removal is
+  strict: a failed `launchctl unload` or `systemctl disable` reports
+  an error and deletes nothing, so an active job can never be
+  orphaned. Install re-queries the scheduler afterwards and reports
+  `verified`, since schedulers can accept a registration without
+  guaranteeing the job runs. The scheduled command line contains no
   credentials. A local `autosync.json` record keeps `status` honest
-  without parsing locale-dependent scheduler output.
+  without parsing locale-dependent scheduler output, and `status`
+  reports the cache's most recent sync time as last-run evidence.
 - MCP: read-only `get_autosync_status` tool. Installing or removing
   the scheduled sync stays CLI-only by design.
 - New public API: `worsaga.run_watch`, `worsaga.send_notification`,
@@ -44,6 +53,11 @@ All notable changes to Worsaga are documented in this file.
   (`WORSAGA_INDEX_PATH` overrides the location). Files unchanged since
   the last run are skipped without a fetch, and a per-run file budget
   makes repeated runs resume where the previous one stopped.
+  Full-course builds reconcile deletions: files removed or renamed on
+  Moodle disappear from the index (`files_removed` in the report), but
+  only for courses whose material list was successfully enumerated —
+  a failed fetch is never mistaken for an emptied course, and
+  week-scoped builds never delete.
 - `worsaga search-text <query>` (CLI) and `search_text` (MCP): offline
   full-text search over the indexed material text, with course
   filtering, per-hit course/section/file/page context, highlighted
@@ -52,13 +66,18 @@ All notable changes to Worsaga are documented in this file.
 - Markdown study-pack exports. `worsaga study-pack <course> --week N`
   (CLI) and `export_study_pack` (MCP) build a single self-contained
   Markdown document for a teaching week — deterministic study notes, a
-  materials overview, and the extracted per-page content of every
-  supported file in the section. Each file is downloaded once, in
-  memory; packs are written UTF-8 and never overwrite existing files.
+  materials overview, and the extracted per-page content of the
+  section's supported files (up to eight; larger sections are included
+  in listed order with an explicit warning). Each file is downloaded
+  once, in memory; packs are written UTF-8 and never overwrite
+  existing files.
 - Token hygiene extends to both new storage/output surfaces: raw
   `file_url` values are never stored or exported, the only URL kept is
   the token-free `view_url`, embedded `token=`-style values are
   redacted, and the index database is owner-only (0600) on POSIX.
+  Entire responses — index build reports, search hits, and every
+  study-pack field (course names, bullets, file names, warnings), not
+  just the markdown — pass through the same sanitizer.
 - New public API: `worsaga.build_text_index`, `worsaga.search_text_index`,
   `worsaga.TextIndexStore`, `worsaga.TextIndexError`,
   `worsaga.default_index_path`, `worsaga.build_study_pack`,

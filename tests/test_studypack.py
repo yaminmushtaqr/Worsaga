@@ -19,6 +19,41 @@ def _econ_course_id():
     raise AssertionError("demo dataset must include ECON101")
 
 
+class _ManyFilesClient:
+    """Offline client serving one section with N supported text files."""
+
+    base_url = "https://moodle.example.com"
+
+    def __init__(self, count, fullname="Testing 101"):
+        self.fullname = fullname
+        self.names = [f"reading-{i:02d}.txt" for i in range(count)]
+
+    def get_courses(self):
+        return [{"id": 1, "shortname": "T101", "fullname": self.fullname}]
+
+    def get_course_contents(self, course_id):
+        modules = [
+            {
+                "id": 100 + i,
+                "name": name,
+                "modname": "resource",
+                "contents": [{
+                    "type": "file",
+                    "filename": name,
+                    "fileurl": f"{self.base_url}/pluginfile.php/{name}",
+                    "filesize": 64,
+                    "timemodified": 1000,
+                }],
+            }
+            for i, name in enumerate(self.names)
+        ]
+        return [{"id": 10, "section": 1, "name": "Week 1", "modules": modules}]
+
+    def download_file(self, fileurl):
+        name = fileurl.rsplit("/", 1)[-1]
+        return f"Reading {name} discusses one distinct topic here.".encode()
+
+
 class TestStudyPackFilename:
     def test_basic(self):
         assert study_pack_filename("ECON101", 3) == (
@@ -73,6 +108,29 @@ class TestBuildStudyPack:
         # No section match still yields a coherent pack with fallback notes.
         assert result["bullets"]
         assert "_No downloadable materials" in result["markdown"]
+
+    def test_includes_more_than_five_files(self):
+        # The section helper's own default caps at 5; a pack must not
+        # silently inherit that.
+        result = build_study_pack(_ManyFilesClient(7), 1, 1)
+        assert len(result["files"]) == 7
+        assert not any("Including the first" in w for w in result["warnings"])
+
+    def test_cap_beyond_max_files_warns(self):
+        result = build_study_pack(_ManyFilesClient(10), 1, 1)
+        assert len(result["files"]) == 8  # MAX_PACK_FILES
+        assert any(
+            "first 8 of 10 supported files" in w for w in result["warnings"]
+        )
+
+    def test_all_metadata_fields_sanitized(self):
+        client = _ManyFilesClient(
+            1, fullname="Testing 101 token=SECRET1234 edition",
+        )
+        result = build_study_pack(client, 1, 1)
+        text = json.dumps(result)
+        assert "SECRET1234" not in text
+        assert "token=REDACTED" in result["course_fullname"]
 
 
 class TestWriteStudyPack:

@@ -123,7 +123,20 @@ class TestRunWatch:
         assert summary["cycles"] == 2
         assert seen[0]["ok"] is False
         assert "network down" in seen[0]["error"]
+        # Failed cycles still carry a display timestamp.
+        assert seen[0]["synced_at"] > 0
         assert seen[1]["ok"] is True
+
+    def test_zero_cycles_runs_nothing(self):
+        def explode(client, **kwargs):
+            raise AssertionError("must not sync")
+
+        with patch.object(watch_mod, "run_sync", explode):
+            summary = run_watch(
+                object(), max_cycles=0, sleep_fn=lambda s: None,
+            )
+        assert summary["cycles"] == 0
+        assert summary["changes_total"] == 0
 
     def test_write_attempt_error_propagates(self):
         def bad(client, **kwargs):
@@ -151,26 +164,37 @@ class TestCliSurface:
         out = capsys.readouterr().out
         assert "cycle 1:" in out
 
-    def test_watch_json_lines(self, capsys):
+    def test_watch_json_is_ndjson(self, capsys):
         main(["--demo", "--json", "watch", "--cycles", "2", "--no-notify",
               "--interval", "1m"])
         lines = [
             line for line in capsys.readouterr().out.splitlines() if line
         ]
-        # Structured mode emits one JSON document per cycle. A cycle's
-        # payload may span lines, so parse greedily from each start.
-        docs = []
-        buffer = ""
-        for line in lines:
-            buffer += line
-            try:
-                docs.append(json.loads(buffer))
-                buffer = ""
-            except json.JSONDecodeError:
-                buffer += "\n"
-        assert len(docs) == 2
+        # Stream contract: exactly one compact JSON object per line.
+        assert len(lines) == 2
+        docs = [json.loads(line) for line in lines]
         assert docs[0]["cycle"] == 1
         assert docs[1]["cycle"] == 2
+
+    def test_watch_yaml_uses_document_separators(self, capsys):
+        yaml = pytest.importorskip("yaml")
+        main(["--demo", "--yaml", "watch", "--cycles", "2", "--no-notify"])
+        out = capsys.readouterr().out
+        assert out.count("---") == 2
+        docs = [doc for doc in yaml.safe_load_all(out) if doc is not None]
+        assert [doc["cycle"] for doc in docs] == [1, 2]
+
+    def test_watch_zero_cycles_cli(self, capsys):
+        main(["--demo", "watch", "--cycles", "0", "--no-notify"])
+        captured = capsys.readouterr()
+        assert "cycle 1:" not in captured.out
+        assert "0 cycle(s)" in captured.err
+
+    def test_announced_interval_matches_clamp(self, capsys):
+        main(["--demo", "watch", "--cycles", "1", "--no-notify",
+              "--interval", "1s"])
+        err = capsys.readouterr().err
+        assert "every 60s" in err
 
     def test_watch_reports_summary(self, capsys):
         main(["--demo", "watch", "--cycles", "1", "--no-notify"])

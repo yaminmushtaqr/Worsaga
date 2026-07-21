@@ -11,7 +11,11 @@ Building the index (``build_text_index``) fetches files through the
 authenticated client in memory — nothing is written to disk except the
 index database itself. Documents are fingerprinted by material identity
 (name, size, modification time), so re-running the build only fetches
-files that changed since the last run.
+files that changed since the last run. Full-course builds also
+reconcile deletions: documents whose material no longer appears in the
+course are removed, but only for courses whose material list was
+successfully enumerated in this run — a failed fetch is never mistaken
+for an emptied course, and week-scoped builds never remove anything.
 
 Token hygiene is a hard invariant at this storage boundary, exactly as
 for the metadata cache: raw ``file_url`` values are never stored, the
@@ -34,7 +38,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import platformdirs
 
 from worsaga.cache import sanitize_payload
-from worsaga.client import DownloadError
+from worsaga.client import DownloadError, MoodleWriteAttemptError
 from worsaga.extraction import (
     MAX_TEXT_PER_FILE,
     SUPPORTED_EXTENSIONS,
@@ -253,6 +257,38 @@ class TextIndexStore:
             self._conn.execute("ROLLBACK")
             raise
 
+    def delete_missing(
+        self, site: str, course_id: int, keep_keys: set[str],
+    ) -> int:
+        """Delete a course's documents whose key is not in *keep_keys*.
+
+        Used by full-course builds to reconcile files deleted or
+        renamed on Moodle. Returns the number of documents removed
+        (their pages are removed with them).
+        """
+        rows = self._conn.execute(
+            "SELECT id, doc_key FROM documents"
+            " WHERE site = ? AND course_id = ?",
+            (site, int(course_id)),
+        ).fetchall()
+        stale = [(doc_id,) for doc_id, doc_key in rows
+                 if doc_key not in keep_keys]
+        if not stale:
+            return 0
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.executemany(
+                "DELETE FROM pages WHERE doc_id = ?", stale,
+            )
+            self._conn.executemany(
+                "DELETE FROM documents WHERE id = ?", stale,
+            )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        return len(stale)
+
     # ── Search ────────────────────────────────────────────────────
 
     def search(
@@ -374,7 +410,7 @@ def build_text_index(
     if course_id is not None and not courses:
         raise ValueError(f"no enrolled course with id {course_id}")
 
-    indexed = unchanged = failed = unsupported = 0
+    indexed = unchanged = failed = unsupported = removed = 0
     pages_indexed = 0
     budget_exhausted = False
     covered: list[dict[str, Any]] = []
@@ -385,6 +421,9 @@ def build_text_index(
             shortname = str(course.get("shortname", ""))
             try:
                 sections = client.get_course_contents(cid)
+            except MoodleWriteAttemptError:
+                # Safety invariant — never downgraded to a warning.
+                raise
             except Exception as exc:
                 warnings.append(f"{shortname or cid}: contents fetch failed: {exc}")
                 continue
@@ -397,6 +436,15 @@ def build_text_index(
                     sections, cid, week, base_url=client.base_url,
                 )
             covered.append({"course_id": cid, "course_shortname": shortname})
+
+            # Every supported material enumerated this run — including
+            # ones the fetch budget will skip — counts as still present
+            # for deletion reconciliation.
+            observed_keys = {
+                f"{cid}:{material.get('dedupe_key', '')}"
+                for material in materials
+                if material.get("file_url") and _supported(material)
+            }
 
             for material in materials:
                 if not material.get("file_url") or not _supported(material):
@@ -452,6 +500,14 @@ def build_text_index(
                 )
                 indexed += 1
                 pages_indexed += sum(1 for _, text in pages if text.strip())
+
+            if week is None:
+                # Full-course build: the material list above is the
+                # complete truth for this course (even when the fetch
+                # budget stopped mid-course), so anything indexed that
+                # is no longer listed was deleted or renamed on Moodle.
+                # Week-scoped builds see only a slice and never delete.
+                removed += store.delete_missing(site, cid, observed_keys)
             if budget_exhausted:
                 break
 
@@ -464,20 +520,23 @@ def build_text_index(
             "again to continue where this run stopped."
         )
 
-    return {
+    # Belt-and-braces: nothing here should carry tokens, but every
+    # returned string passes through the same redaction as storage.
+    return sanitize_payload({
         "site": site,
         "indexed_at": started_at,
         "courses": covered,
         "files_indexed": indexed,
         "files_unchanged": unchanged,
         "files_failed": failed,
+        "files_removed": removed,
         "files_skipped_unsupported": unsupported,
         "pages_indexed": pages_indexed,
         "budget_exhausted": budget_exhausted,
         "index": stats,
         "warnings": warnings,
         "index_path": resolved_path,
-    }
+    })
 
 
 def search_text_index(
@@ -503,13 +562,13 @@ def search_text_index(
         )
         stats = store.stats(site)
         resolved_path = str(store.path)
-    return {
+    return sanitize_payload({
         "site": site,
         "query": query,
         "hits": hits,
         "index": stats,
         "index_path": resolved_path,
-    }
+    })
 
 
 __all__ = [
