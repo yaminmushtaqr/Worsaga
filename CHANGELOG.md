@@ -2,6 +2,16 @@
 
 All notable changes to Worsaga are documented in this file.
 
+## 0.8.1
+
+### Changed
+
+- Maintenance re-release of the 0.8 feature set under a fresh, immutable
+  package version. Runtime behaviour is unchanged from 0.8.0.
+- Release automation now builds and tests without access to the PyPI OIDC
+  permission, grants that permission only to the isolated publish job, and
+  pins the GitHub-provided actions to current immutable revisions.
+
 ## 0.8.0
 
 ### Added

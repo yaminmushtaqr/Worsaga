@@ -1,6 +1,6 @@
 """worsaga — Open-source, local-first, read-only study toolkit for Moodle."""
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 from worsaga.assignments import get_assignment_status, get_assignments, normalize_assignment
 from worsaga.calendar import get_calendar_events, normalize_calendar_events

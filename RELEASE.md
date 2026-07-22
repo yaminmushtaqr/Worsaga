@@ -44,6 +44,11 @@ from git history.
 4. Commit the release.
 5. Tag with `vX.Y.Z` only after all checks pass.
 
+Published versions and release tags are immutable. Never move or reuse a tag
+after its distributions reach PyPI: PyPI will not replace a filename that has
+already been published. If history or release contents must change, increment
+the package version and create a new tag.
+
 ## Publish via trusted publishing
 
 The `publish.yml` workflow publishes tagged releases to PyPI using trusted
