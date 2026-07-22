@@ -46,7 +46,11 @@ All notable changes to Worsaga are documented in this file.
   Worsaga's local files, never queries or changes the scheduler, and
   reports the manual cleanup command. Install re-queries the scheduler
   afterwards and reports `verified`, since schedulers can accept a
-  registration without guaranteeing the job runs. The scheduled
+  registration without guaranteeing the job runs; a record-write
+  failure after successful registration is reported structurally
+  (`installed: true`, `record_written: false`, `record_error`) instead
+  of raising past an already-active job, and the record itself is
+  written atomically. The scheduled
   command line contains no credentials. A local `autosync.json`
   record keeps `status` honest without parsing locale-dependent
   scheduler output, and `status` reports the cache's most recent sync

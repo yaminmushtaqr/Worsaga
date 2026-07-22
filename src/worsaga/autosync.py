@@ -313,14 +313,31 @@ def install_autosync(
                 return result
 
     if not dry_run:
-        _write_record({
-            "platform": platform,
-            "method": result["method"],
-            "interval_minutes": interval_minutes,
-            "command": command,
-            "installed_at": int(time.time()),
-        })
+        # The scheduler entry is already registered at this point, so a
+        # failed record write must never escape as an exception — the
+        # caller would get no structured result while the job silently
+        # stays active. The install stands (it is what was asked for);
+        # the missing record only degrades status detail, and removal
+        # queries the scheduler live, so cleanup still works.
         result["installed"] = True
+        try:
+            _write_record({
+                "platform": platform,
+                "method": result["method"],
+                "interval_minutes": interval_minutes,
+                "command": command,
+                "installed_at": int(time.time()),
+            })
+            result["record_written"] = True
+        except OSError as exc:
+            result["record_written"] = False
+            result["record_error"] = (
+                "the scheduler entry was registered, but the local "
+                f"auto-sync record could not be written: {exc}. "
+                "'worsaga auto-sync status' will miss interval/command "
+                "detail; removal is unaffected (scheduler state is "
+                "queried live)."
+            )
         # Schedulers can accept a registration without guaranteeing the
         # job will run (schtasks documents this explicitly), so re-query
         # immediately instead of trusting the create call alone.

@@ -125,6 +125,29 @@ class TestInstallWindows:
         assert low["interval_minutes"] == MIN_INTERVAL_MINUTES
         assert high["interval_minutes"] == MAX_INTERVAL_MINUTES
 
+    def test_record_write_failure_is_structured(self, windows):
+        # The scheduler entry is registered before the record write; a
+        # failed os.replace must produce a structured result, never an
+        # exception that hides an active job.
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)), \
+             patch("worsaga.autosync.os.replace",
+                   side_effect=PermissionError("Access is denied")):
+            result = install_autosync(30)
+        assert result["installed"] is True
+        assert result["record_written"] is False
+        assert "scheduler entry was registered" in result["record_error"]
+        assert result["verified"] is True
+        assert not autosync.autosync_record_path().exists()
+        # The atomic writer cleaned up its temp file on failure.
+        parent = autosync.autosync_record_path().parent
+        assert not list(parent.glob("*.tmp"))
+
+    def test_record_write_success_reports_record_written(self, windows):
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)):
+            result = install_autosync(30)
+        assert result["record_written"] is True
+        assert "record_error" not in result
+
     def test_install_verification_failure_warns(self, windows):
         def flaky(args):
             if args[:2] == ["schtasks", "/Create"]:
@@ -776,6 +799,28 @@ class TestCliSurface:
                 main(["auto-sync", "install"])
         assert exc.value.code == 1
         assert "access denied" in capsys.readouterr().err
+
+    def test_install_record_failure_reaches_json_cli(self, windows, capsys):
+        # End-to-end: forced os.replace failure must surface in the
+        # --json payload (not just stderr), with exit code 0 — the
+        # install itself succeeded and the job may be active.
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)), \
+             patch("worsaga.autosync.os.replace",
+                   side_effect=PermissionError("Access is denied")):
+            main(["--json", "auto-sync", "install"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["installed"] is True
+        assert payload["record_written"] is False
+        assert "scheduler entry was registered" in payload["record_error"]
+
+    def test_install_record_failure_human_warns(self, windows, capsys):
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)), \
+             patch("worsaga.autosync.os.replace",
+                   side_effect=PermissionError("Access is denied")):
+            main(["auto-sync", "install"])
+        captured = capsys.readouterr()
+        assert "scheduler entry was registered" in captured.err
+        assert "Auto-sync installed and verified" in captured.out
 
     def test_force_local_flag_passes_through(self, capsys):
         fake = {"removed": True, "dry_run": False, "platform": "windows",

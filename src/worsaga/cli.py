@@ -1763,6 +1763,8 @@ def cmd_autosync(args: argparse.Namespace) -> None:
             print(f"  delete: {action['delete']}")
     if result.get("warning"):
         print(f"Warning: {result['warning']}", file=sys.stderr)
+    if result.get("record_error"):
+        print(f"Warning: {result['record_error']}", file=sys.stderr)
     if not result["dry_run"]:
         done = "installed" if args.action == "install" else "removed"
         if args.action == "install" and result.get("verified"):
