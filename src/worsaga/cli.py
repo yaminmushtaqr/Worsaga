@@ -1719,6 +1719,8 @@ def cmd_autosync(args: argparse.Namespace) -> None:
             )
         if result.get("error"):
             print(f"Warning: {result['error']}", file=sys.stderr)
+        if result.get("record_error"):
+            print(f"Warning: {result['record_error']}", file=sys.stderr)
         return
 
     if args.action == "install":
@@ -1765,7 +1767,10 @@ def cmd_autosync(args: argparse.Namespace) -> None:
         done = "installed" if args.action == "install" else "removed"
         if args.action == "install" and result.get("verified"):
             done += " and verified with the scheduler"
-        print(f"Auto-sync {done}.")
+        if result.get("scheduler_untouched"):
+            print("Local auto-sync files removed; scheduler unchanged.")
+        else:
+            print(f"Auto-sync {done}.")
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:

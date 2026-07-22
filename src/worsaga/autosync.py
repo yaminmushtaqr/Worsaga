@@ -34,6 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -118,21 +119,49 @@ def autosync_record_path() -> Path:
     return Path(platformdirs.user_data_dir(_APP_NAME)) / "autosync.json"
 
 
-def _read_record() -> dict[str, Any] | None:
+def _read_record_with_error() -> tuple[dict[str, Any] | None, str | None]:
+    """Return the local record and any read/validation error.
+
+    A missing file is a known-absent record and returns ``(None, None)``.
+    Every other read or validation failure remains distinguishable from
+    absence so scheduler removal can fail closed instead of discarding the
+    only evidence that a background job may still be registered.
+    """
     try:
         with open(autosync_record_path(), encoding="utf-8") as f:
             record = json.load(f)
-        return record if isinstance(record, dict) else None
-    except (OSError, ValueError):
-        return None
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, f"cannot read local auto-sync record: {exc}"
+    except ValueError as exc:
+        return None, f"invalid local auto-sync record: {exc}"
+    if not isinstance(record, dict):
+        return None, "invalid local auto-sync record: expected a JSON object"
+    return record, None
 
 
 def _write_record(record: dict[str, Any]) -> None:
+    """Write the record atomically (temp file + rename).
+
+    A crash mid-write must never leave a truncated record: an
+    unreadable record makes scheduler removal fail closed until the
+    user reaches for ``--force-local``.
+    """
     path = autosync_record_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp",
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(
+                json.dumps(record, indent=2, sort_keys=True) + "\n"
+            )
+        os.replace(tmp_name, path)
+    except OSError:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 def _delete_record() -> None:
@@ -395,13 +424,15 @@ def autosync_status() -> dict[str, Any]:
     ``state == "installed"``.
     """
     platform = autosync_platform()
-    record = _read_record()
+    record, record_error = _read_record_with_error()
     result: dict[str, Any] = {
         "platform": platform,
         "installed": False,
         "state": "unknown",
         "record": record,
     }
+    if record_error:
+        result["record_error"] = record_error
 
     if platform == "windows":
         result["method"] = "schtasks"
@@ -507,9 +538,21 @@ def remove_autosync(
         for target in targets:
             result["actions"].append({"delete": str(target)})
         if not dry_run:
+            # Deletion failures stay structured: report what could not
+            # be removed instead of raising mid-cleanup.
+            failures = []
             for target in targets:
-                Path(target).unlink(missing_ok=True)
-            result["removed"] = True
+                try:
+                    Path(target).unlink(missing_ok=True)
+                except OSError as exc:
+                    failures.append(f"{target}: {exc}")
+            if failures:
+                result["error"] = (
+                    "some local files could not be deleted: "
+                    + "; ".join(failures)
+                )
+            else:
+                result["removed"] = True
         result["warning"] = (
             "--force-local does not verify or change scheduler state. "
             "If the job is still registered, remove it manually: "
@@ -584,18 +627,33 @@ def remove_autosync(
             # for the provably clean case: no unit files and no record
             # of a systemd install.
             record = status.get("record")
-            systemd_was_installed = record is not None and record.get(
-                "method"
-            ) not in ("schtasks", "launchd")
-            if (units_exist or systemd_was_installed) and not dry_run:
-                result["error"] = (
-                    "systemctl not found but "
-                    + (
-                        "worsaga-autosync unit files exist"
-                        if units_exist
-                        else "the local record shows a systemd auto-sync"
-                        " was installed"
+            record_error = status.get("record_error")
+            record_method = (
+                record.get("method") if record is not None else None
+            )
+            record_requires_abort = (
+                record is not None
+                and record_method not in ("schtasks", "launchd")
+            )
+            if (
+                units_exist or record_requires_abort or record_error
+            ) and not dry_run:
+                if units_exist:
+                    evidence = "worsaga-autosync unit files exist"
+                elif record_error:
+                    evidence = "the local auto-sync record is unreadable"
+                elif record_method == "systemd-user":
+                    evidence = (
+                        "the local record shows a systemd auto-sync was "
+                        "installed"
                     )
+                else:
+                    evidence = (
+                        "the local auto-sync record has unknown scheduler "
+                        "provenance"
+                    )
+                result["error"] = (
+                    f"systemctl not found but {evidence}"
                     + "; cannot prove the timer is stopped, so nothing was"
                     " removed. Use 'worsaga auto-sync remove --force-local'"
                     " to delete only Worsaga's local files."

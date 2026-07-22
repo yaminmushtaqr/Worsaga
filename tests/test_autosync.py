@@ -233,6 +233,31 @@ class TestStatus:
             result = autosync_status()
         assert result["record"]["interval_minutes"] == 30
 
+    def test_invalid_local_record_is_reported(self, windows):
+        autosync.autosync_record_path().write_text("{not valid json")
+        with patch.object(autosync, "_run", return_value=_ok(_OTHER_ROW)):
+            result = autosync_status()
+        assert result["record"] is None
+        assert "invalid local auto-sync record" in result["record_error"]
+
+    def test_unreadable_record_is_reported(self, windows):
+        # An OSError (not just bad JSON) is also distinguishable from
+        # absence — here the record path is a directory.
+        autosync.autosync_record_path().mkdir()
+        with patch.object(autosync, "_run", return_value=_ok(_OTHER_ROW)):
+            result = autosync_status()
+        assert result["record"] is None
+        assert "cannot read local auto-sync record" in result["record_error"]
+
+    def test_record_write_is_atomic(self, windows):
+        # No .tmp residue and the record parses after a normal write.
+        autosync._write_record({"interval_minutes": 30, "method": "schtasks"})
+        parent = autosync.autosync_record_path().parent
+        assert not list(parent.glob("*.tmp"))
+        record, error = autosync._read_record_with_error()
+        assert error is None
+        assert record["interval_minutes"] == 30
+
     def test_status_never_writes(self, windows, record_in_tmp):
         with patch.object(autosync, "_run", return_value=_ok()):
             autosync_status()
@@ -556,7 +581,26 @@ class TestRemoveStrictness:
         autosync._write_record({"interval_minutes": 30})
         result = remove_autosync()
         assert result["removed"] is False
+        assert "unknown scheduler provenance" in result["error"]
         assert autosync.autosync_record_path().exists()
+
+    @pytest.mark.parametrize("contents", ["{not valid json", "[]"])
+    def test_linux_no_systemctl_unreadable_record_aborts(
+        self, linux, tmp_path, monkeypatch, contents,
+    ):
+        monkeypatch.setattr(
+            autosync, "_linux_unit_dir", lambda: tmp_path / "systemd" / "user",
+        )
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        record = autosync.autosync_record_path()
+        record.write_text(contents)
+
+        result = remove_autosync()
+
+        assert result["removed"] is False
+        assert "local auto-sync record is unreadable" in result["error"]
+        assert "--force-local" in result["error"]
+        assert record.read_text() == contents
 
     def test_linux_no_systemctl_with_unit_files_aborts(
         self, linux, tmp_path, monkeypatch,
@@ -635,6 +679,15 @@ class TestForceLocal:
         assert autosync.autosync_record_path().exists()
         assert result["actions"]
 
+    def test_undeletable_target_reports_instead_of_raising(self, windows):
+        # A record path that cannot be unlinked (here: a directory) must
+        # produce a structured error, not an unhandled OSError.
+        autosync.autosync_record_path().mkdir()
+        result = remove_autosync(force_local=True)
+        assert result["removed"] is False
+        assert "could not be deleted" in result["error"]
+        assert autosync.autosync_record_path().exists()
+
 
 class TestLastSyncReporting:
     def test_status_includes_cache_last_sync(self, windows, tmp_path,
@@ -694,7 +747,8 @@ class TestCliSurface:
     def test_status_unknown_human(self, capsys):
         fake = {"platform": "windows", "method": "schtasks",
                 "installed": False, "state": "unknown", "record": None,
-                "error": "ERROR: Access is denied."}
+                "error": "ERROR: Access is denied.",
+                "record_error": "invalid local auto-sync record"}
         with patch("worsaga.cli.autosync_status", return_value=fake):
             main(["auto-sync", "status"])
         captured = capsys.readouterr()
@@ -723,13 +777,16 @@ class TestCliSurface:
         assert exc.value.code == 1
         assert "access denied" in capsys.readouterr().err
 
-    def test_force_local_flag_passes_through(self):
+    def test_force_local_flag_passes_through(self, capsys):
         fake = {"removed": True, "dry_run": False, "platform": "windows",
                 "method": "local-only", "actions": [],
-                "warning": "not verified"}
+                "scheduler_untouched": True, "warning": "not verified"}
         with patch("worsaga.cli.remove_autosync", return_value=fake) as rm:
             main(["auto-sync", "remove", "--force-local"])
         assert rm.call_args.kwargs == {"dry_run": False, "force_local": True}
+        out = capsys.readouterr().out
+        assert "Local auto-sync files removed; scheduler unchanged." in out
+        assert "Auto-sync removed." not in out
 
     def test_force_local_rejected_for_status(self, capsys):
         with pytest.raises(SystemExit) as exc:
