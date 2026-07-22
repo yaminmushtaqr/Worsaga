@@ -54,6 +54,10 @@ def isolated_cache(tmp_path, monkeypatch):
 @pytest.fixture
 def windows(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
+    # Faking win32 on a POSIX host would send stdlib shutil.which down
+    # its Windows-only _winapi path; force sync_command's interpreter
+    # fallback so these tests are host-independent.
+    monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
 
 
 @pytest.fixture
