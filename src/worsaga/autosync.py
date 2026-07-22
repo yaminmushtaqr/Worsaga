@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -119,6 +120,12 @@ def autosync_record_path() -> Path:
     return Path(platformdirs.user_data_dir(_APP_NAME)) / "autosync.json"
 
 
+def _stale_record_path() -> Path:
+    """Path used to quarantine metadata from an earlier installation."""
+    path = autosync_record_path()
+    return path.with_name(f"{path.name}.stale")
+
+
 def _read_record_with_error() -> tuple[dict[str, Any] | None, str | None]:
     """Return the local record and any read/validation error.
 
@@ -164,8 +171,49 @@ def _write_record(record: dict[str, Any]) -> None:
         raise
 
 
+def _stage_existing_record() -> tuple[bool, str | None]:
+    """Quarantine the current record before changing the scheduler.
+
+    Reinstalling replaces an existing scheduler entry. Moving its metadata
+    aside first ensures a later record-write failure cannot leave the old
+    interval and command looking current. The move is atomic and happens
+    before any scheduler mutation; if it cannot be completed, installation
+    aborts while the old scheduler and record are still untouched.
+    """
+    path = autosync_record_path()
+    try:
+        record_stat = path.lstat()
+    except FileNotFoundError:
+        return False, None
+    except OSError as exc:
+        return False, str(exc)
+    if not stat.S_ISREG(record_stat.st_mode):
+        return False, "the record path is not a regular file"
+    try:
+        os.replace(path, _stale_record_path())
+    except FileNotFoundError:
+        # Another process removed it after lstat; there is nothing stale.
+        return False, None
+    except OSError as exc:
+        return False, str(exc)
+    return True, None
+
+
+def _stale_record_state() -> tuple[bool, str | None]:
+    """Return whether quarantined metadata exists, without mutating it."""
+    try:
+        _stale_record_path().stat()
+    except FileNotFoundError:
+        return False, None
+    except OSError as exc:
+        # An uninspectable marker is still not proof of absence.
+        return True, str(exc)
+    return True, None
+
+
 def _delete_record() -> None:
     autosync_record_path().unlink(missing_ok=True)
+    _stale_record_path().unlink(missing_ok=True)
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
@@ -236,6 +284,33 @@ def install_autosync(
         "actions": [],
     }
 
+    record_staged = False
+
+    def _prepare_record() -> bool:
+        nonlocal record_staged
+        record_staged, error = _stage_existing_record()
+        if error:
+            result["record_written"] = False
+            result["record_stale"] = False
+            result["error"] = (
+                "cannot safely invalidate the existing local auto-sync "
+                f"record before changing the scheduler: {error}. "
+                "The scheduler was not changed."
+            )
+            return False
+        return True
+
+    def _mark_scheduler_failure(message: str) -> None:
+        result["error"] = message
+        stale_marker, _ = _stale_record_state()
+        if record_staged or stale_marker:
+            result["record_stale"] = True
+            result["record_error"] = (
+                "the previous local auto-sync record was invalidated before "
+                "the reinstall; status will omit interval/command detail "
+                "until a later successful install"
+            )
+
     if platform == "windows":
         create = [
             "schtasks", "/Create", "/F",
@@ -246,9 +321,15 @@ def install_autosync(
         result["method"] = "schtasks"
         result["actions"].append({"run": create})
         if not dry_run:
-            proc = _run(create)
+            if not _prepare_record():
+                return result
+            try:
+                proc = _run(create)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                _mark_scheduler_failure(str(exc))
+                return result
             if proc.returncode != 0:
-                result["error"] = (proc.stderr or proc.stdout).strip()
+                _mark_scheduler_failure((proc.stderr or proc.stdout).strip())
                 return result
 
     elif platform == "macos":
@@ -267,14 +348,20 @@ def install_autosync(
             {"run": ["launchctl", "load", "-w", str(plist_path)]}
         )
         if not dry_run:
-            plist_path.parent.mkdir(parents=True, exist_ok=True)
-            plist_path.write_text(plist, encoding="utf-8")
-            # A stale agent with the same label must be unloaded first;
-            # failure here just means nothing was loaded.
-            _run(["launchctl", "unload", str(plist_path)])
-            proc = _run(["launchctl", "load", "-w", str(plist_path)])
+            if not _prepare_record():
+                return result
+            try:
+                plist_path.parent.mkdir(parents=True, exist_ok=True)
+                plist_path.write_text(plist, encoding="utf-8")
+                # A stale agent with the same label must be unloaded first;
+                # failure here just means nothing was loaded.
+                _run(["launchctl", "unload", str(plist_path)])
+                proc = _run(["launchctl", "load", "-w", str(plist_path)])
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                _mark_scheduler_failure(str(exc))
+                return result
             if proc.returncode != 0:
-                result["error"] = (proc.stderr or proc.stdout).strip()
+                _mark_scheduler_failure((proc.stderr or proc.stdout).strip())
                 return result
 
     else:
@@ -303,22 +390,28 @@ def install_autosync(
         result["actions"].append({"run": ["systemctl", "--user", "daemon-reload"]})
         result["actions"].append({"run": enable})
         if not dry_run:
-            unit_dir.mkdir(parents=True, exist_ok=True)
-            service_path.write_text(service, encoding="utf-8")
-            timer_path.write_text(timer, encoding="utf-8")
-            _run(["systemctl", "--user", "daemon-reload"])
-            proc = _run(enable)
+            if not _prepare_record():
+                return result
+            try:
+                unit_dir.mkdir(parents=True, exist_ok=True)
+                service_path.write_text(service, encoding="utf-8")
+                timer_path.write_text(timer, encoding="utf-8")
+                _run(["systemctl", "--user", "daemon-reload"])
+                proc = _run(enable)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                _mark_scheduler_failure(str(exc))
+                return result
             if proc.returncode != 0:
-                result["error"] = (proc.stderr or proc.stdout).strip()
+                _mark_scheduler_failure((proc.stderr or proc.stdout).strip())
                 return result
 
     if not dry_run:
         # The scheduler entry is already registered at this point, so a
         # failed record write must never escape as an exception — the
         # caller would get no structured result while the job silently
-        # stays active. The install stands (it is what was asked for);
-        # the missing record only degrades status detail, and removal
-        # queries the scheduler live, so cleanup still works.
+        # stays active. A prior record was quarantined before the scheduler
+        # mutation, so a failed rewrite cannot leave old metadata looking
+        # current to subsequent status calls.
         result["installed"] = True
         try:
             _write_record({
@@ -329,15 +422,37 @@ def install_autosync(
                 "installed_at": int(time.time()),
             })
             result["record_written"] = True
+            result["record_stale"] = False
+            try:
+                _stale_record_path().unlink(missing_ok=True)
+            except OSError as exc:
+                # The new record is authoritative, so a leftover quarantine
+                # file is harmless but should still be visible to callers.
+                result["record_cleanup_error"] = (
+                    "the new local auto-sync record was written, but old "
+                    f"quarantined metadata could not be deleted: {exc}"
+                )
         except OSError as exc:
             result["record_written"] = False
+            stale_marker, stale_error = _stale_record_state()
+            result["record_stale"] = record_staged or stale_marker
+            detail = (
+                "the previous record was invalidated before registration"
+                if result["record_stale"]
+                else "no current local record is available"
+            )
             result["record_error"] = (
                 "the scheduler entry was registered, but the local "
                 f"auto-sync record could not be written: {exc}. "
-                "'worsaga auto-sync status' will miss interval/command "
-                "detail; removal is unaffected (scheduler state is "
-                "queried live)."
+                f"Because {detail}, 'worsaga auto-sync status' will omit "
+                "interval/command detail; scheduler state is still queried "
+                "live."
             )
+            if stale_error:
+                result["record_error"] += (
+                    " The invalidated record could not be inspected: "
+                    f"{stale_error}."
+                )
         # Schedulers can accept a registration without guaranteeing the
         # job will run (schtasks documents this explicitly), so re-query
         # immediately instead of trusting the create call alone.
@@ -442,12 +557,28 @@ def autosync_status() -> dict[str, Any]:
     """
     platform = autosync_platform()
     record, record_error = _read_record_with_error()
+    stale_record = False
+    stale_error = None
+    if record is None:
+        stale_record, stale_error = _stale_record_state()
     result: dict[str, Any] = {
         "platform": platform,
         "installed": False,
         "state": "unknown",
         "record": record,
+        "record_stale": stale_record,
     }
+    if stale_record:
+        stale_message = (
+            "local auto-sync metadata was invalidated during an incomplete "
+            "install; interval/command detail is unavailable"
+        )
+        record_error = (
+            f"{record_error}; {stale_message}" if record_error
+            else stale_message
+        )
+    if stale_error:
+        record_error = f"{record_error}: {stale_error}"
     if record_error:
         result["record_error"] = record_error
 
@@ -542,7 +673,7 @@ def remove_autosync(
     if force_local:
         result["method"] = "local-only"
         result["scheduler_untouched"] = True
-        targets = [autosync_record_path()]
+        targets = [autosync_record_path(), _stale_record_path()]
         if platform == "macos":
             targets.insert(0, _macos_plist_path())
         elif platform == "linux":
@@ -551,6 +682,7 @@ def remove_autosync(
                 unit_dir / f"{LINUX_UNIT}.service",
                 unit_dir / f"{LINUX_UNIT}.timer",
                 autosync_record_path(),
+                _stale_record_path(),
             ]
         for target in targets:
             result["actions"].append({"delete": str(target)})
@@ -631,6 +763,7 @@ def remove_autosync(
         if not shutil.which("systemctl"):
             result["method"] = "none"
             result["actions"].append({"delete": str(autosync_record_path())})
+            result["actions"].append({"delete": str(_stale_record_path())})
             units_exist = (
                 (unit_dir / f"{LINUX_UNIT}.service").exists()
                 or (unit_dir / f"{LINUX_UNIT}.timer").exists()
@@ -657,6 +790,11 @@ def remove_autosync(
             ) and not dry_run:
                 if units_exist:
                     evidence = "worsaga-autosync unit files exist"
+                elif status.get("record_stale"):
+                    evidence = (
+                        "local auto-sync metadata was invalidated during an "
+                        "incomplete install"
+                    )
                 elif record_error:
                     evidence = "the local auto-sync record is unreadable"
                 elif record_method == "systemd-user":

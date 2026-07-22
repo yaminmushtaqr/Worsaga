@@ -49,7 +49,11 @@ All notable changes to Worsaga are documented in this file.
   registration without guaranteeing the job runs; a record-write
   failure after successful registration is reported structurally
   (`installed: true`, `record_written: false`, `record_error`) instead
-  of raising past an already-active job, and the record itself is
+  of raising past an already-active job. During reinstall, the prior
+  record is atomically quarantined before the scheduler changes; if that
+  cannot be done, installation aborts without touching the scheduler,
+  and a later write failure makes `status` omit the quarantined stale
+  interval/command instead of presenting it as current. The record is
   written atomically. The scheduled
   command line contains no credentials. A local `autosync.json`
   record keeps `status` honest without parsing locale-dependent

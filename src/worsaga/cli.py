@@ -1744,6 +1744,12 @@ def cmd_autosync(args: argparse.Namespace) -> None:
     if result.get("error"):
         print(f"Error: auto-sync {label} failed: {result['error']}",
               file=sys.stderr)
+        if result.get("record_error"):
+            print(f"Warning: {result['record_error']}", file=sys.stderr)
+        if result.get("record_cleanup_error"):
+            print(
+                f"Warning: {result['record_cleanup_error']}", file=sys.stderr,
+            )
         sys.exit(1)
 
     suffix = " (dry run - nothing was changed)" if result["dry_run"] else ""
@@ -1765,6 +1771,8 @@ def cmd_autosync(args: argparse.Namespace) -> None:
         print(f"Warning: {result['warning']}", file=sys.stderr)
     if result.get("record_error"):
         print(f"Warning: {result['record_error']}", file=sys.stderr)
+    if result.get("record_cleanup_error"):
+        print(f"Warning: {result['record_cleanup_error']}", file=sys.stderr)
     if not result["dry_run"]:
         done = "installed" if args.action == "install" else "removed"
         if args.action == "install" and result.get("verified"):

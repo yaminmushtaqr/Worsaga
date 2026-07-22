@@ -142,6 +142,82 @@ class TestInstallWindows:
         parent = autosync.autosync_record_path().parent
         assert not list(parent.glob("*.tmp"))
 
+    def test_reinstall_write_failure_quarantines_old_record(self, windows):
+        autosync._write_record({
+            "interval_minutes": 15,
+            "command": ["old"],
+            "method": "schtasks",
+        })
+        record_path = autosync.autosync_record_path()
+        old_bytes = record_path.read_bytes()
+        real_replace = autosync.os.replace
+
+        def fail_new_record(src, dst):
+            if str(dst) == str(record_path):
+                raise PermissionError("Access is denied")
+            return real_replace(src, dst)
+
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)), \
+             patch("worsaga.autosync.os.replace",
+                   side_effect=fail_new_record):
+            result = install_autosync(30)
+
+        assert result["installed"] is True
+        assert result["verified"] is True
+        assert result["record_written"] is False
+        assert result["record_stale"] is True
+        assert not record_path.exists()
+        stale_path = autosync._stale_record_path()
+        assert stale_path.read_bytes() == old_bytes
+        assert not list(record_path.parent.glob("*.tmp"))
+
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)):
+            status = autosync_status()
+        assert status["installed"] is True
+        assert status["record"] is None
+        assert status["record_stale"] is True
+        assert "invalidated" in status["record_error"]
+
+    def test_reinstall_aborts_if_old_record_cannot_be_quarantined(
+        self, windows,
+    ):
+        autosync._write_record({
+            "interval_minutes": 15,
+            "command": ["old"],
+            "method": "schtasks",
+        })
+        record_path = autosync.autosync_record_path()
+        old_bytes = record_path.read_bytes()
+
+        with patch.object(autosync, "_run") as run, \
+             patch("worsaga.autosync.os.replace",
+                   side_effect=PermissionError("record is locked")):
+            result = install_autosync(30)
+
+        assert result["installed"] is False
+        assert result["record_written"] is False
+        assert result["record_stale"] is False
+        assert "scheduler was not changed" in result["error"].lower()
+        assert record_path.read_bytes() == old_bytes
+        assert not autosync._stale_record_path().exists()
+        run.assert_not_called()
+
+    def test_successful_install_clears_quarantined_record(self, windows):
+        stale_path = autosync._stale_record_path()
+        stale_path.write_text('{"interval_minutes": 15}', encoding="utf-8")
+
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)):
+            result = install_autosync(30)
+
+        assert result["installed"] is True
+        assert result["record_written"] is True
+        assert result["record_stale"] is False
+        assert not stale_path.exists()
+        record = json.loads(
+            autosync.autosync_record_path().read_text(encoding="utf-8")
+        )
+        assert record["interval_minutes"] == 30
+
     def test_record_write_success_reports_record_written(self, windows):
         with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)):
             result = install_autosync(30)
@@ -607,6 +683,23 @@ class TestRemoveStrictness:
         assert "unknown scheduler provenance" in result["error"]
         assert autosync.autosync_record_path().exists()
 
+    def test_linux_no_systemctl_invalidated_record_aborts(
+        self, linux, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            autosync, "_linux_unit_dir", lambda: tmp_path / "systemd" / "user",
+        )
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        stale_path = autosync._stale_record_path()
+        stale_path.write_text('{"method": "systemd-user"}', encoding="utf-8")
+
+        result = remove_autosync()
+
+        assert result["removed"] is False
+        assert "metadata was invalidated" in result["error"]
+        assert "--force-local" in result["error"]
+        assert stale_path.exists()
+
     @pytest.mark.parametrize("contents", ["{not valid json", "[]"])
     def test_linux_no_systemctl_unreadable_record_aborts(
         self, linux, tmp_path, monkeypatch, contents,
@@ -688,11 +781,13 @@ class TestForceLocal:
 
     def test_windows_deletes_record_only(self, windows):
         autosync._write_record({"interval_minutes": 30, "method": "schtasks"})
+        autosync._stale_record_path().write_text("old", encoding="utf-8")
         with patch.object(autosync, "_run",
                           side_effect=AssertionError("must not run")):
             result = remove_autosync(force_local=True)
         assert result["removed"] is True
         assert not autosync.autosync_record_path().exists()
+        assert not autosync._stale_record_path().exists()
         assert "schtasks /Delete" in result["warning"]
 
     def test_dry_run_deletes_nothing(self, windows):
@@ -767,6 +862,22 @@ class TestCliSurface:
         assert "installed (schtasks)" in out
         assert "30 min" in out
 
+    def test_status_hides_quarantined_record_detail(
+        self, windows, capsys,
+    ):
+        autosync._stale_record_path().write_text(
+            '{"interval_minutes": 15, "command": ["old"]}',
+            encoding="utf-8",
+        )
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)):
+            main(["auto-sync", "status"])
+
+        captured = capsys.readouterr()
+        assert "installed (schtasks)" in captured.out
+        assert "15 min" not in captured.out
+        assert "old" not in captured.out
+        assert "metadata was invalidated" in captured.err
+
     def test_status_unknown_human(self, capsys):
         fake = {"platform": "windows", "method": "schtasks",
                 "installed": False, "state": "unknown", "record": None,
@@ -793,12 +904,15 @@ class TestCliSurface:
     def test_install_error_exits_nonzero(self, capsys):
         fake = {"installed": False, "dry_run": False, "platform": "windows",
                 "method": "schtasks", "interval_minutes": 30,
-                "command": [], "actions": [], "error": "access denied"}
+                "command": [], "actions": [], "error": "access denied",
+                "record_error": "previous record was invalidated"}
         with patch("worsaga.cli.install_autosync", return_value=fake):
             with pytest.raises(SystemExit) as exc:
                 main(["auto-sync", "install"])
         assert exc.value.code == 1
-        assert "access denied" in capsys.readouterr().err
+        stderr = capsys.readouterr().err
+        assert "access denied" in stderr
+        assert "previous record was invalidated" in stderr
 
     def test_install_record_failure_reaches_json_cli(self, windows, capsys):
         # End-to-end: forced os.replace failure must surface in the
