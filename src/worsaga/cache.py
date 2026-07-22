@@ -136,7 +136,14 @@ def read_last_sync_at(site: str, path: str | Path | None = None) -> int | None:
     cache_path = Path(path) if path else default_cache_path()
     if not cache_path.is_file():
         return None
-    uri = "file:///" + cache_path.resolve().as_posix().lstrip("/") + "?mode=ro"
+    # as_uri() percent-encodes '#', '%', spaces, etc. and renders UNC
+    # paths correctly — exactly the encoding SQLite's URI parser
+    # decodes. Hand-built URIs truncated at '#' and silently created a
+    # new database, breaking the read-only contract.
+    try:
+        uri = cache_path.resolve().as_uri() + "?mode=ro"
+    except ValueError:
+        return None
     try:
         conn = sqlite3.connect(uri, uri=True)
     except sqlite3.Error:

@@ -28,11 +28,17 @@ All notable changes to Worsaga are documented in this file.
   `install`/`remove` support `--dry-run`, which shows the exact
   commands and files involved without changing anything (including the
   local metadata record); `status` is strictly read-only (it never
-  creates the cache as a side effect). Removal is strict and
-  three-valued: a failed `launchctl unload` or `systemctl disable`
-  reports an error and deletes nothing, and when the scheduler cannot
-  be queried at all the removal aborts without mutation — an active
-  job can never be orphaned. Install re-queries the scheduler
+  creates the cache as a side effect) and reports a three-valued
+  `state`: installed, absent, or unknown. Absence is only concluded
+  from machine-readable evidence — a successful full task/job listing
+  without the job, or systemd's `LoadState=not-found` — never from a
+  bare nonzero exit, so access-denied or bus failures read as unknown
+  rather than absent. Removal is strict: a failed `launchctl unload`
+  or `systemctl disable` reports an error and deletes nothing, an
+  unknown scheduler state aborts without mutation, a launchd job that
+  outlived its plist is stopped by label, and an enabled-but-inactive
+  systemd timer still counts as installed — an active job can never
+  be orphaned. Install re-queries the scheduler
   afterwards and reports `verified`, since schedulers can accept a
   registration without guaranteeing the job runs. The scheduled
   command line contains no credentials. A local `autosync.json`
@@ -43,7 +49,8 @@ All notable changes to Worsaga are documented in this file.
   the scheduled sync stays CLI-only by design.
 - New public API: `worsaga.run_watch`, `worsaga.send_notification`,
   `worsaga.notification_backend`, `worsaga.install_autosync`,
-  `worsaga.autosync_status`, `worsaga.remove_autosync`.
+  `worsaga.autosync_status`, `worsaga.remove_autosync`,
+  `worsaga.read_last_sync_at` (read-only cache timestamp reader).
 
 ## 0.7.0 (unreleased)
 

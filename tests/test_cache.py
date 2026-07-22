@@ -56,6 +56,23 @@ class TestReadLastSyncAt:
         path.write_text("not a database")
         assert read_last_sync_at(self.SITE, path) is None
 
+    @pytest.mark.parametrize("name", [
+        "cache#one.db",     # '#' truncates naive file: URIs
+        "cache%20two.db",   # literal '%' must survive double-decoding
+        "cache three.db",   # spaces
+        "caché-ünïcode.db",
+    ])
+    def test_special_characters_in_path(self, tmp_path, name):
+        path = tmp_path / name
+        with CacheStore(path) as store:
+            store.record_sync_run(self.SITE, 100, 200, {})
+        before = sorted(p.name for p in tmp_path.iterdir())
+
+        assert read_last_sync_at(self.SITE, path) == 200
+        # Strictly read-only: no sibling database materialised out of a
+        # mis-encoded URI (the '#' failure mode created one).
+        assert sorted(p.name for p in tmp_path.iterdir()) == before
+
 
 class TestSanitizePayload:
     def test_strips_banned_keys_recursively(self):

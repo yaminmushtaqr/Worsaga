@@ -99,7 +99,7 @@ class TestInstallWindows:
         assert not autosync.autosync_record_path().exists()
 
     def test_real_install_writes_record(self, windows):
-        with patch.object(autosync, "_run", return_value=_ok()):
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)):
             result = install_autosync(45)
         assert result["installed"] is True
         # The post-install health check re-queried the scheduler.
@@ -188,21 +188,48 @@ class TestInstallLinux:
         assert ["systemctl", "--user", "daemon-reload"] in runs
 
 
+_TASK_ROW = '"\\WorsagaAutoSync","21/07/2026 15:00:00","Ready"'
+_OTHER_ROW = '"\\SomeOtherTask","21/07/2026 15:00:00","Ready"'
+
+
 class TestStatus:
+    """Absence requires machine-readable evidence, never a bare exit code."""
+
     def test_windows_installed(self, windows):
-        with patch.object(autosync, "_run", return_value=_ok("Ready")):
+        listing = _OTHER_ROW + "\n" + _TASK_ROW
+        with patch.object(autosync, "_run", return_value=_ok(listing)) as run:
             result = autosync_status()
+        assert result["state"] == "installed"
         assert result["installed"] is True
         assert result["method"] == "schtasks"
+        assert run.call_args[0][0] == [
+            "schtasks", "/Query", "/FO", "CSV", "/NH",
+        ]
 
-    def test_windows_not_installed(self, windows):
-        with patch.object(autosync, "_run", return_value=_fail("not found")):
+    def test_windows_absent_from_successful_listing(self, windows):
+        with patch.object(autosync, "_run", return_value=_ok(_OTHER_ROW)):
             result = autosync_status()
+        assert result["state"] == "absent"
         assert result["installed"] is False
+        assert "error" not in result
+
+    def test_windows_similar_name_is_not_a_match(self, windows):
+        listing = '"\\WorsagaAutoSync2","x","Ready"'
+        with patch.object(autosync, "_run", return_value=_ok(listing)):
+            result = autosync_status()
+        assert result["state"] == "absent"
+
+    def test_windows_query_failure_is_unknown(self, windows):
+        with patch.object(autosync, "_run",
+                          return_value=_fail("ERROR: Access is denied.")):
+            result = autosync_status()
+        assert result["state"] == "unknown"
+        assert result["installed"] is False
+        assert "denied" in result["error"]
 
     def test_includes_local_record(self, windows):
         autosync._write_record({"interval_minutes": 30, "command": ["x"]})
-        with patch.object(autosync, "_run", return_value=_ok()):
+        with patch.object(autosync, "_run", return_value=_ok(_TASK_ROW)):
             result = autosync_status()
         assert result["record"]["interval_minutes"] == 30
 
@@ -211,20 +238,95 @@ class TestStatus:
             autosync_status()
         assert not (record_in_tmp / "autosync.json").exists()
 
-    def test_macos_missing_plist(self, macos, tmp_path, monkeypatch):
+    def test_macos_loaded_without_plist_is_installed(self, macos, tmp_path,
+                                                     monkeypatch):
+        # A job can survive plist deletion; the listing is authoritative.
         monkeypatch.setattr(
             autosync, "_macos_plist_path",
             lambda: tmp_path / "com.worsaga.autosync.plist",
         )
+        listing = "123\t0\tcom.worsaga.autosync"
+        with patch.object(autosync, "_run", return_value=_ok(listing)):
+            result = autosync_status()
+        assert result["state"] == "installed"
+        assert result["plist_exists"] is False
+
+    def test_macos_absent_from_successful_listing(self, macos, tmp_path,
+                                                  monkeypatch):
+        monkeypatch.setattr(
+            autosync, "_macos_plist_path",
+            lambda: tmp_path / "com.worsaga.autosync.plist",
+        )
+        listing = "456\t0\tcom.apple.something"
+        with patch.object(autosync, "_run", return_value=_ok(listing)):
+            result = autosync_status()
+        assert result["state"] == "absent"
+
+    def test_macos_listing_failure_is_unknown(self, macos, tmp_path,
+                                              monkeypatch):
+        monkeypatch.setattr(
+            autosync, "_macos_plist_path",
+            lambda: tmp_path / "com.worsaga.autosync.plist",
+        )
+        with patch.object(autosync, "_run",
+                          return_value=_fail("Operation not permitted")):
+            result = autosync_status()
+        assert result["state"] == "unknown"
+        assert "not permitted" in result["error"]
+
+    def _linux_show(self, load_state, active_state="inactive"):
+        return _ok(f"LoadState={load_state}\nActiveState={active_state}")
+
+    def test_linux_loaded_but_inactive_is_installed(self, linux, monkeypatch):
+        # is-active would misclassify an enabled-but-inactive timer.
+        monkeypatch.setattr(autosync.shutil, "which",
+                            lambda name: "/usr/bin/systemctl")
+        with patch.object(autosync, "_run",
+                          return_value=self._linux_show("loaded", "inactive")):
+            result = autosync_status()
+        assert result["state"] == "installed"
+        assert result["timer_active"] is False
+
+    def test_linux_active_timer(self, linux, monkeypatch):
+        monkeypatch.setattr(autosync.shutil, "which",
+                            lambda name: "/usr/bin/systemctl")
+        with patch.object(autosync, "_run",
+                          return_value=self._linux_show("loaded", "active")):
+            result = autosync_status()
+        assert result["state"] == "installed"
+        assert result["timer_active"] is True
+
+    def test_linux_not_found_is_absent(self, linux, monkeypatch):
+        monkeypatch.setattr(autosync.shutil, "which",
+                            lambda name: "/usr/bin/systemctl")
+        with patch.object(autosync, "_run",
+                          return_value=self._linux_show("not-found")):
+            result = autosync_status()
+        assert result["state"] == "absent"
+
+    def test_linux_show_failure_is_unknown(self, linux, monkeypatch):
+        monkeypatch.setattr(autosync.shutil, "which",
+                            lambda name: "/usr/bin/systemctl")
+        with patch.object(autosync, "_run",
+                          return_value=_fail("Failed to connect to bus")):
+            result = autosync_status()
+        assert result["state"] == "unknown"
+        assert "bus" in result["error"]
+
+    def test_linux_missing_systemctl_is_unknown(self, linux, monkeypatch):
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
         result = autosync_status()
-        assert result["installed"] is False
+        assert result["state"] == "unknown"
+        assert result["method"] == "none"
+        assert "systemctl not found" in result["error"]
 
 
 class TestRemove:
     def test_dry_run_executes_nothing(self, windows):
         with patch.object(autosync, "_run", return_value=_ok()) as run:
             with patch.object(autosync, "autosync_status",
-                              return_value={"installed": True}):
+                              return_value={"installed": True,
+                                            "state": "installed"}):
                 result = remove_autosync(dry_run=True)
         assert result["removed"] is False
         assert result["actions"][0]["run"][:2] == ["schtasks", "/Delete"]
@@ -232,22 +334,39 @@ class TestRemove:
 
     def test_remove_deletes_record(self, windows):
         autosync._write_record({"interval_minutes": 30})
-        with patch.object(autosync, "_run", return_value=_ok()):
+
+        def by_command(args):
+            if args[:2] == ["schtasks", "/Query"]:
+                return _ok(_TASK_ROW)
+            return _ok()
+
+        with patch.object(autosync, "_run", side_effect=by_command):
             result = remove_autosync()
         assert result["removed"] is True
         assert result["was_installed"] is True
         assert not autosync.autosync_record_path().exists()
 
-    def test_remove_when_not_installed(self, windows):
-        with patch.object(autosync, "_run", return_value=_fail()) as run:
+    def test_remove_when_absent_skips_delete(self, windows):
+        # Authoritative absence: the listing succeeded without the task.
+        with patch.object(autosync, "_run",
+                          return_value=_ok(_OTHER_ROW)) as run:
             result = remove_autosync()
         assert result["removed"] is True
         assert result["was_installed"] is False
-        # Only the status query ran; no delete was attempted.
         assert all(
             call.args[0][:2] != ["schtasks", "/Delete"]
             for call in run.call_args_list
         )
+
+    def test_remove_on_query_failure_aborts(self, windows):
+        # Access-denied style nonzero exits are unknown, not absence.
+        autosync._write_record({"interval_minutes": 30})
+        with patch.object(autosync, "_run",
+                          return_value=_fail("ERROR: Access is denied.")):
+            result = remove_autosync()
+        assert result["removed"] is False
+        assert "cannot determine scheduler state" in result["error"]
+        assert autosync.autosync_record_path().exists()
 
 
 class TestRemoveStrictness:
@@ -274,7 +393,8 @@ class TestRemoveStrictness:
     def test_macos_failed_unload_keeps_everything(self, plist):
         autosync._write_record({"interval_minutes": 30})
         with patch.object(autosync, "autosync_status",
-                          return_value={"installed": True}), \
+                          return_value={"installed": True,
+                                        "state": "installed"}), \
              patch.object(autosync, "_run", return_value=_fail("busy")):
             result = remove_autosync()
         assert result["removed"] is False
@@ -284,17 +404,35 @@ class TestRemoveStrictness:
 
     def test_macos_unloaded_agent_skips_unload(self, plist):
         with patch.object(autosync, "autosync_status",
-                          return_value={"installed": False}), \
+                          return_value={"installed": False,
+                                        "state": "absent"}), \
              patch.object(autosync, "_run") as run:
             result = remove_autosync()
         assert result["removed"] is True
         assert not plist.exists()
         run.assert_not_called()
 
+    def test_macos_loaded_without_plist_removes_by_label(
+        self, macos, tmp_path, monkeypatch,
+    ):
+        # The plist is gone but the job is still loaded: stop by label.
+        missing = tmp_path / "com.worsaga.autosync.plist"
+        monkeypatch.setattr(autosync, "_macos_plist_path", lambda: missing)
+        with patch.object(autosync, "autosync_status",
+                          return_value={"installed": True,
+                                        "state": "installed"}), \
+             patch.object(autosync, "_run", return_value=_ok()) as run:
+            result = remove_autosync()
+        assert result["removed"] is True
+        assert run.call_args[0][0] == [
+            "launchctl", "remove", "com.worsaga.autosync",
+        ]
+
     def test_linux_failed_disable_keeps_everything(self, units):
         autosync._write_record({"interval_minutes": 30})
         with patch.object(autosync, "autosync_status",
-                          return_value={"installed": True}), \
+                          return_value={"installed": True,
+                                        "state": "installed"}), \
              patch.object(autosync, "_run", return_value=_fail("in use")):
             result = remove_autosync()
         assert result["removed"] is False
@@ -309,7 +447,8 @@ class TestRemoveStrictness:
             return _ok()
 
         with patch.object(autosync, "autosync_status",
-                          return_value={"installed": True}), \
+                          return_value={"installed": True,
+                                        "state": "installed"}), \
              patch.object(autosync, "_run", side_effect=flaky):
             result = remove_autosync()
         assert result["removed"] is True
@@ -318,7 +457,8 @@ class TestRemoveStrictness:
 
     def test_unknown_scheduler_state_aborts_macos_removal(self, plist):
         autosync._write_record({"interval_minutes": 30})
-        unknown = {"installed": False, "method": "launchd",
+        unknown = {"installed": False, "state": "unknown",
+                   "method": "launchd",
                    "error": "scheduler unavailable", "record": None}
         with patch.object(autosync, "autosync_status",
                           return_value=unknown), \
@@ -332,7 +472,8 @@ class TestRemoveStrictness:
 
     def test_unknown_scheduler_state_aborts_windows_removal(self, windows):
         autosync._write_record({"interval_minutes": 30})
-        unknown = {"installed": False, "method": "schtasks",
+        unknown = {"installed": False, "state": "unknown",
+                   "method": "schtasks",
                    "error": "timed out", "record": None}
         with patch.object(autosync, "autosync_status",
                           return_value=unknown), \
@@ -344,7 +485,8 @@ class TestRemoveStrictness:
         run.assert_not_called()
 
     def test_unknown_state_dry_run_still_previews(self, windows):
-        unknown = {"installed": False, "method": "schtasks",
+        unknown = {"installed": False, "state": "unknown",
+                   "method": "schtasks",
                    "error": "timed out", "record": None}
         with patch.object(autosync, "autosync_status",
                           return_value=unknown):
@@ -353,7 +495,10 @@ class TestRemoveStrictness:
         assert "error" not in result
         assert result["actions"]
 
-    def test_linux_no_systemctl_dry_run_keeps_record(self, linux, monkeypatch):
+    def test_linux_no_systemctl_dry_run_keeps_record(self, linux, tmp_path,
+                                                     monkeypatch):
+        monkeypatch.setattr(autosync, "_linux_unit_dir",
+                            lambda: tmp_path / "systemd" / "user")
         monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
         autosync._write_record({"interval_minutes": 30})
         result = remove_autosync(dry_run=True)
@@ -362,13 +507,34 @@ class TestRemoveStrictness:
         assert any("delete" in action for action in result["actions"])
 
     def test_linux_no_systemctl_real_remove_deletes_record(
-        self, linux, monkeypatch,
+        self, linux, tmp_path, monkeypatch,
     ):
+        # No unit files on disk: proven nothing schedulable remains, so
+        # the record-only removal proceeds.
+        monkeypatch.setattr(autosync, "_linux_unit_dir",
+                            lambda: tmp_path / "systemd" / "user")
         monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
         autosync._write_record({"interval_minutes": 30})
         result = remove_autosync()
         assert result["removed"] is True
         assert not autosync.autosync_record_path().exists()
+
+    def test_linux_no_systemctl_with_unit_files_aborts(
+        self, linux, tmp_path, monkeypatch,
+    ):
+        # Unit files exist but systemctl is gone: the timer may still be
+        # registered, so fail closed.
+        unit_dir = tmp_path / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        (unit_dir / "worsaga-autosync.timer").write_text("t")
+        monkeypatch.setattr(autosync, "_linux_unit_dir", lambda: unit_dir)
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        autosync._write_record({"interval_minutes": 30})
+        result = remove_autosync()
+        assert result["removed"] is False
+        assert "unit files" in result["error"]
+        assert autosync.autosync_record_path().exists()
+        assert (unit_dir / "worsaga-autosync.timer").exists()
 
 
 class TestLastSyncReporting:
@@ -425,6 +591,16 @@ class TestCliSurface:
         out = capsys.readouterr().out
         assert "installed (schtasks)" in out
         assert "30 min" in out
+
+    def test_status_unknown_human(self, capsys):
+        fake = {"platform": "windows", "method": "schtasks",
+                "installed": False, "state": "unknown", "record": None,
+                "error": "ERROR: Access is denied."}
+        with patch("worsaga.cli.autosync_status", return_value=fake):
+            main(["auto-sync", "status"])
+        captured = capsys.readouterr()
+        assert "state unknown (schtasks)" in captured.out
+        assert "denied" in captured.err
 
     def test_install_dry_run_human(self, capsys):
         fake = {"installed": False, "dry_run": True, "platform": "windows",

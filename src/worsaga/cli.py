@@ -1692,7 +1692,12 @@ def cmd_autosync(args: argparse.Namespace) -> None:
         result = autosync_status()
         if _emit_data(args, result):
             return
-        state = "installed" if result["installed"] else "not installed"
+        labels = {"installed": "installed", "absent": "not installed",
+                  "unknown": "state unknown"}
+        state = labels.get(
+            result.get("state", ""),
+            "installed" if result["installed"] else "not installed",
+        )
         print(f"Auto-sync: {state} ({result.get('method', '?')})")
         record = result.get("record")
         if record:

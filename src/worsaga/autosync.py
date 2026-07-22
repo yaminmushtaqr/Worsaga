@@ -307,52 +307,125 @@ def install_autosync(
 # ── Status ───────────────────────────────────────────────────────
 
 
+def _windows_state() -> tuple[str, str | None, dict[str, Any]]:
+    """Classify the Windows task state from a full CSV task listing.
+
+    ``schtasks /Query /TN`` exits nonzero both for "no such task" and
+    for real failures (access denied), and its messages are localized —
+    so absence is only ever concluded from a *successful* full listing
+    that does not contain the task's exact quoted CSV path field.
+    """
+    try:
+        proc = _run(["schtasks", "/Query", "/FO", "CSV", "/NH"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "unknown", str(exc), {}
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return "unknown", detail or f"schtasks exit {proc.returncode}", {}
+    present = f'"\\{WINDOWS_TASK_NAME}"' in proc.stdout
+    return ("installed" if present else "absent"), None, {}
+
+
+def _macos_state() -> tuple[str, str | None, dict[str, Any]]:
+    """Classify the launchd job state from the full job listing.
+
+    Queried regardless of whether the plist file exists — a job can
+    stay loaded after its plist is deleted. ``launchctl list`` prints
+    the label as the last column, so membership is an exact token
+    match, never exit-code guesswork.
+    """
+    try:
+        proc = _run(["launchctl", "list"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "unknown", str(exc), {}
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return "unknown", detail or f"launchctl exit {proc.returncode}", {}
+    loaded = any(
+        line.split()[-1] == MACOS_LABEL
+        for line in proc.stdout.splitlines()
+        if line.strip()
+    )
+    return ("installed" if loaded else "absent"), None, {}
+
+
+def _linux_state() -> tuple[str, str | None, dict[str, Any]]:
+    """Classify the systemd user timer via machine-readable properties.
+
+    ``systemctl show`` reports fixed enum values: ``LoadState=loaded``
+    (registered — including enabled-but-inactive or failed timers,
+    which ``is-active`` would misclassify) vs ``not-found`` (proven
+    absent). ``timer_active`` reports the live ActiveState separately.
+    """
+    try:
+        proc = _run([
+            "systemctl", "--user", "show", f"{LINUX_UNIT}.timer",
+            "-p", "LoadState", "-p", "ActiveState",
+        ])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "unknown", str(exc), {}
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return "unknown", detail or f"systemctl exit {proc.returncode}", {}
+    props: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            props[key.strip()] = value.strip()
+    load_state = props.get("LoadState", "")
+    if load_state == "not-found":
+        return "absent", None, {}
+    if load_state in ("loaded", "masked"):
+        return "installed", None, {
+            "timer_active": props.get("ActiveState") == "active",
+        }
+    return "unknown", f"unexpected LoadState '{load_state or '?'}'", {}
+
+
 def autosync_status() -> dict[str, Any]:
-    """Report whether the background sync is registered (read-only)."""
+    """Report whether the background sync is registered (read-only).
+
+    ``state`` is three-valued: ``"installed"`` (the scheduler
+    affirmatively lists the job), ``"absent"`` (the scheduler answered
+    and the job is not there), or ``"unknown"`` (the scheduler could
+    not be queried — missing binary, permissions, timeouts). Absence is
+    only ever concluded from machine-readable evidence — a successful
+    full listing without the job, or ``LoadState=not-found`` — never
+    from a bare nonzero exit code. ``installed`` is the boolean
+    ``state == "installed"``.
+    """
     platform = autosync_platform()
     record = _read_record()
     result: dict[str, Any] = {
         "platform": platform,
         "installed": False,
+        "state": "unknown",
         "record": record,
     }
 
     if platform == "windows":
         result["method"] = "schtasks"
-        try:
-            proc = _run(["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME])
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            result["error"] = str(exc)
-            return result
-        result["installed"] = proc.returncode == 0
-
+        state, error, extra = _windows_state()
     elif platform == "macos":
         result["method"] = "launchd"
         plist_path = _macos_plist_path()
         result["plist"] = str(plist_path)
-        if plist_path.is_file():
-            try:
-                proc = _run(["launchctl", "list", MACOS_LABEL])
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                result["error"] = str(exc)
-                return result
-            result["installed"] = proc.returncode == 0
-
+        result["plist_exists"] = plist_path.is_file()
+        state, error, extra = _macos_state()
     else:
         if not shutil.which("systemctl"):
             result["method"] = "none"
-            result["error"] = "no user systemd found on this system"
+            result["error"] = "systemctl not found; cannot inspect user systemd"
+            _attach_last_sync(result)
             return result
         result["method"] = "systemd-user"
-        try:
-            proc = _run(
-                ["systemctl", "--user", "is-active", f"{LINUX_UNIT}.timer"]
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            result["error"] = str(exc)
-            return result
-        result["installed"] = proc.returncode == 0
+        state, error, extra = _linux_state()
 
+    result["state"] = state
+    result["installed"] = state == "installed"
+    if error:
+        result["error"] = error
+    result.update(extra)
     _attach_last_sync(result)
     return result
 
@@ -403,21 +476,19 @@ def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
         "actions": [],
     }
     status = autosync_status()
-    # An error from a real scheduler backend means state is unknown; a
-    # "none" method (no user systemd) is a *known absent* scheduler and
-    # the record-only removal below is still safe.
-    if (
-        status.get("error")
-        and status.get("method") != "none"
-        and not dry_run
-    ):
+    state = status.get("state", "unknown")
+    # A real removal must know the scheduler's answer. "unknown" from a
+    # real backend aborts before touching anything; the no-user-systemd
+    # case (method "none") is decided in the Linux branch from local
+    # unit-file evidence instead.
+    if state == "unknown" and status.get("method") != "none" and not dry_run:
         result["method"] = status.get("method", "")
         result["error"] = (
-            "cannot determine scheduler state, so nothing was removed: "
-            f"{status['error']}"
+            "cannot determine scheduler state, so nothing was removed"
+            + (f": {status['error']}" if status.get("error") else "")
         )
         return result
-    was_installed = bool(status.get("installed"))
+    was_installed = state == "installed"
 
     if platform == "windows":
         delete = ["schtasks", "/Delete", "/F", "/TN", WINDOWS_TASK_NAME]
@@ -431,32 +502,52 @@ def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
 
     elif platform == "macos":
         plist_path = _macos_plist_path()
-        unload = ["launchctl", "unload", "-w", str(plist_path)]
+        # A job can stay loaded after its plist was deleted; stop it by
+        # label in that case instead of skipping the unload entirely.
+        stop_cmd = (
+            ["launchctl", "unload", "-w", str(plist_path)]
+            if plist_path.is_file()
+            else ["launchctl", "remove", MACOS_LABEL]
+        )
         result["method"] = "launchd"
-        result["actions"].append({"run": unload})
+        result["actions"].append({"run": stop_cmd})
         result["actions"].append({"delete": str(plist_path)})
-        if not dry_run and plist_path.is_file():
+        if not dry_run:
             if was_installed:
-                # The agent is genuinely loaded: a failed unload means
+                # The agent is genuinely loaded: a failed stop means
                 # the job is still active — report it and change
                 # nothing, rather than deleting the plist and claiming
                 # success while an orphaned job keeps running.
-                proc = _run(unload)
+                proc = _run(stop_cmd)
                 if proc.returncode != 0:
                     result["error"] = (proc.stderr or proc.stdout).strip()
                     return result
             plist_path.unlink(missing_ok=True)
 
     else:
+        unit_dir = _linux_unit_dir()
         if not shutil.which("systemctl"):
             result["method"] = "none"
             result["actions"].append({"delete": str(autosync_record_path())})
+            units_exist = (
+                (unit_dir / f"{LINUX_UNIT}.service").exists()
+                or (unit_dir / f"{LINUX_UNIT}.timer").exists()
+            )
+            if units_exist and not dry_run:
+                # Unit files on disk mean a timer may still be
+                # registered; without systemctl there is no way to
+                # prove it stopped, so fail closed.
+                result["error"] = (
+                    "systemctl not found but worsaga-autosync unit files "
+                    "exist; cannot prove the timer is stopped, so nothing "
+                    "was removed"
+                )
+                return result
             if not dry_run:
                 _delete_record()
                 result["removed"] = True
                 result["was_installed"] = was_installed
             return result
-        unit_dir = _linux_unit_dir()
         disable = [
             "systemctl", "--user", "disable", "--now", f"{LINUX_UNIT}.timer",
         ]
