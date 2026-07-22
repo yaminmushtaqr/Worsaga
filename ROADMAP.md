@@ -5,7 +5,7 @@ local scratch files must stay out of the repository.
 
 ## Current baseline
 
-Version `0.6.0` includes:
+Version `0.8.0` includes:
 
 - CLI and MCP server entrypoints.
 - Read-only Moodle client with a hardcoded allowlist.
@@ -33,22 +33,19 @@ Version `0.6.0` includes:
 - Tokens and authenticated URLs stay out of the cache.
 - HTTPS-only Moodle URLs (localhost development excepted).
 
-## New in 0.7.0 (unreleased): full-text search and study exports
+## New in 0.8.0: search, study exports, notifications, and auto-sync
 
 - Local full-text index over course material text (SQLite FTS5), built
   in memory from authenticated fetches — `worsaga index`.
 - `worsaga search-text`: offline, ranked full-text search with
   per-page snippets and course filtering.
 - Markdown study-pack exports for a course week — `worsaga study-pack`.
-- Tokens and authenticated URLs stay out of the index and the exports.
-
-## New in 0.8.0 (unreleased): notifications and auto-sync
-
 - Watch mode for local sync loops — `worsaga watch`.
 - Local notification backends where practical (Windows toast, macOS
   `osascript`, Linux `notify-send`), best effort and dependency-free.
 - `worsaga auto-sync install`, `status`, and `remove`, with `--dry-run`
-  previews of every scheduler change.
+  previews of every scheduler change and evidence-based state checks.
+- Tokens and authenticated URLs stay out of the index and the exports.
 
 ## Later: optional AI workflows
 

@@ -2,7 +2,7 @@
 
 All notable changes to Worsaga are documented in this file.
 
-## 0.8.0 (unreleased)
+## 0.8.0
 
 ### Added
 
@@ -66,7 +66,7 @@ All notable changes to Worsaga are documented in this file.
   `worsaga.autosync_status`, `worsaga.remove_autosync`,
   `worsaga.read_last_sync_at` (read-only cache timestamp reader).
 
-## 0.7.0 (unreleased)
+## 0.7.0 (not published separately — first shipped in 0.8.0)
 
 ### Added
 
