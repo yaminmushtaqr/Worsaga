@@ -639,6 +639,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="Show what install/remove would do without doing it",
     )
+    au.add_argument(
+        "--force-local", action="store_true",
+        help=(
+            "remove only: delete Worsaga's local files (record, plist, "
+            "unit files) without querying or changing the scheduler"
+        ),
+    )
 
     sub.add_parser("doctor", parents=[_shared], help="Check auth and connectivity")
     sub.add_parser("update", parents=[_shared], help="Show how to upgrade safely")
@@ -1688,6 +1695,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
 
 def cmd_autosync(args: argparse.Namespace) -> None:
+    if args.force_local and args.action != "remove":
+        raise ValueError("--force-local only applies to the 'remove' action")
     if args.action == "status":
         result = autosync_status()
         if _emit_data(args, result):
@@ -1720,7 +1729,9 @@ def cmd_autosync(args: argparse.Namespace) -> None:
             max(1, seconds // 60), dry_run=args.dry_run,
         )
     else:
-        result = remove_autosync(dry_run=args.dry_run)
+        result = remove_autosync(
+            dry_run=args.dry_run, force_local=args.force_local,
+        )
 
     if _emit_data(args, result):
         if result.get("error"):

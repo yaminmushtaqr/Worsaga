@@ -333,7 +333,10 @@ registration was verified; `status` is strictly read-only and also shows
 the cache's most recent sync time — manual or scheduled, since Worsaga
 does not record which trigger ran a sync — so you can see whether data has
 moved recently. Removal refuses to delete anything while the scheduled job
-is still active, or when the scheduler cannot be queried at all. The
+is still active, or when the scheduler cannot be queried at all; if you need
+to clear stale local state anyway, `worsaga auto-sync remove --force-local`
+deletes only Worsaga's own files, never touches the scheduler, and tells you
+what to remove manually. The
 scheduled command line never contains credentials — the background sync
 loads configuration the same way a manual run does. Check what it found
 later with `worsaga changes`.

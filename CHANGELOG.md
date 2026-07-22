@@ -38,7 +38,12 @@ All notable changes to Worsaga are documented in this file.
   unknown scheduler state aborts without mutation, a launchd job that
   outlived its plist is stopped by label, and an enabled-but-inactive
   systemd timer still counts as installed — an active job can never
-  be orphaned. Install re-queries the scheduler
+  be orphaned. A machine whose `systemctl` is missing fails closed
+  whenever unit files or a systemd install record exist (absent unit
+  files prove nothing: systemd can keep a loaded timer until reload);
+  the explicit `remove --force-local` escape hatch deletes only
+  Worsaga's local files, never queries or changes the scheduler, and
+  reports the manual cleanup command. Install re-queries the scheduler
   afterwards and reports `verified`, since schedulers can accept a
   registration without guaranteeing the job runs. The scheduled
   command line contains no credentials. A local `autosync.json`

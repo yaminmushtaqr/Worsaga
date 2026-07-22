@@ -459,7 +459,16 @@ def _attach_last_sync(result: dict[str, Any]) -> None:
 # ── Remove ───────────────────────────────────────────────────────
 
 
-def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
+_MANUAL_REMOVE_HINTS = {
+    "windows": f"schtasks /Delete /F /TN {WINDOWS_TASK_NAME}",
+    "macos": f"launchctl remove {MACOS_LABEL}",
+    "linux": f"systemctl --user disable --now {LINUX_UNIT}.timer",
+}
+
+
+def remove_autosync(
+    *, dry_run: bool = False, force_local: bool = False,
+) -> dict[str, Any]:
     """Unregister the background sync and delete its metadata record.
 
     Scheduler state is treated as three-valued: *installed*, *absent*
@@ -467,6 +476,12 @@ def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
     scheduler could not be queried at all). A real removal aborts
     without touching anything on *unknown* — deleting local state while
     a job may still be active would orphan it.
+
+    ``force_local=True`` is the explicit escape hatch for machines
+    where the scheduler cannot be queried but stale local state must
+    go: it deletes only Worsaga's own files (metadata record, plist,
+    unit files), never queries or changes the scheduler, and says so
+    in the result.
     """
     platform = autosync_platform()
     result: dict[str, Any] = {
@@ -475,6 +490,33 @@ def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
         "platform": platform,
         "actions": [],
     }
+
+    if force_local:
+        result["method"] = "local-only"
+        result["scheduler_untouched"] = True
+        targets = [autosync_record_path()]
+        if platform == "macos":
+            targets.insert(0, _macos_plist_path())
+        elif platform == "linux":
+            unit_dir = _linux_unit_dir()
+            targets = [
+                unit_dir / f"{LINUX_UNIT}.service",
+                unit_dir / f"{LINUX_UNIT}.timer",
+                autosync_record_path(),
+            ]
+        for target in targets:
+            result["actions"].append({"delete": str(target)})
+        if not dry_run:
+            for target in targets:
+                Path(target).unlink(missing_ok=True)
+            result["removed"] = True
+        result["warning"] = (
+            "--force-local does not verify or change scheduler state. "
+            "If the job is still registered, remove it manually: "
+            f"{_MANUAL_REMOVE_HINTS[platform]}"
+        )
+        return result
+
     status = autosync_status()
     state = status.get("state", "unknown")
     # A real removal must know the scheduler's answer. "unknown" from a
@@ -533,14 +575,30 @@ def remove_autosync(*, dry_run: bool = False) -> dict[str, Any]:
                 (unit_dir / f"{LINUX_UNIT}.service").exists()
                 or (unit_dir / f"{LINUX_UNIT}.timer").exists()
             )
-            if units_exist and not dry_run:
-                # Unit files on disk mean a timer may still be
-                # registered; without systemctl there is no way to
-                # prove it stopped, so fail closed.
+            # Missing unit files do not prove the timer is gone: systemd
+            # can keep a loaded timer until the manager reloads, and a
+            # missing systemctl binary does not mean the user manager is
+            # absent. If a systemd auto-sync was ever installed here
+            # (per the local record) — or the record's provenance is
+            # unreadable — fail closed. Record-only success is reserved
+            # for the provably clean case: no unit files and no record
+            # of a systemd install.
+            record = status.get("record")
+            systemd_was_installed = record is not None and record.get(
+                "method"
+            ) not in ("schtasks", "launchd")
+            if (units_exist or systemd_was_installed) and not dry_run:
                 result["error"] = (
-                    "systemctl not found but worsaga-autosync unit files "
-                    "exist; cannot prove the timer is stopped, so nothing "
-                    "was removed"
+                    "systemctl not found but "
+                    + (
+                        "worsaga-autosync unit files exist"
+                        if units_exist
+                        else "the local record shows a systemd auto-sync"
+                        " was installed"
+                    )
+                    + "; cannot prove the timer is stopped, so nothing was"
+                    " removed. Use 'worsaga auto-sync remove --force-local'"
+                    " to delete only Worsaga's local files."
                 )
                 return result
             if not dry_run:

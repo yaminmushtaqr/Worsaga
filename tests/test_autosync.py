@@ -506,18 +506,57 @@ class TestRemoveStrictness:
         assert autosync.autosync_record_path().exists()
         assert any("delete" in action for action in result["actions"])
 
-    def test_linux_no_systemctl_real_remove_deletes_record(
+    def test_linux_no_systemctl_removes_foreign_record(
         self, linux, tmp_path, monkeypatch,
     ):
-        # No unit files on disk: proven nothing schedulable remains, so
-        # the record-only removal proceeds.
+        # A record from another platform's scheduler plus no unit files
+        # is the provably clean case: record-only removal proceeds.
+        monkeypatch.setattr(autosync, "_linux_unit_dir",
+                            lambda: tmp_path / "systemd" / "user")
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        autosync._write_record({"interval_minutes": 30, "method": "launchd"})
+        result = remove_autosync()
+        assert result["removed"] is True
+        assert not autosync.autosync_record_path().exists()
+
+    def test_linux_no_systemctl_removes_with_no_record_and_no_units(
+        self, linux, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(autosync, "_linux_unit_dir",
+                            lambda: tmp_path / "systemd" / "user")
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        result = remove_autosync()
+        assert result["removed"] is True
+
+    def test_linux_no_systemctl_with_systemd_record_aborts(
+        self, linux, tmp_path, monkeypatch,
+    ):
+        # Missing unit files do not prove the timer is gone (systemd can
+        # keep a loaded timer until reload), so a systemd install record
+        # forces fail-closed even with no unit files on disk.
+        monkeypatch.setattr(autosync, "_linux_unit_dir",
+                            lambda: tmp_path / "systemd" / "user")
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        autosync._write_record(
+            {"interval_minutes": 30, "method": "systemd-user"},
+        )
+        result = remove_autosync()
+        assert result["removed"] is False
+        assert "local record shows a systemd auto-sync" in result["error"]
+        assert "--force-local" in result["error"]
+        assert autosync.autosync_record_path().exists()
+
+    def test_linux_no_systemctl_record_without_method_aborts(
+        self, linux, tmp_path, monkeypatch,
+    ):
+        # Unreadable provenance is not proof of anything: fail closed.
         monkeypatch.setattr(autosync, "_linux_unit_dir",
                             lambda: tmp_path / "systemd" / "user")
         monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
         autosync._write_record({"interval_minutes": 30})
         result = remove_autosync()
-        assert result["removed"] is True
-        assert not autosync.autosync_record_path().exists()
+        assert result["removed"] is False
+        assert autosync.autosync_record_path().exists()
 
     def test_linux_no_systemctl_with_unit_files_aborts(
         self, linux, tmp_path, monkeypatch,
@@ -535,6 +574,66 @@ class TestRemoveStrictness:
         assert "unit files" in result["error"]
         assert autosync.autosync_record_path().exists()
         assert (unit_dir / "worsaga-autosync.timer").exists()
+
+
+class TestForceLocal:
+    """--force-local deletes Worsaga's files and never touches the scheduler."""
+
+    def test_linux_deletes_local_files_without_any_query(
+        self, linux, tmp_path, monkeypatch,
+    ):
+        unit_dir = tmp_path / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        (unit_dir / "worsaga-autosync.service").write_text("s")
+        (unit_dir / "worsaga-autosync.timer").write_text("t")
+        monkeypatch.setattr(autosync, "_linux_unit_dir", lambda: unit_dir)
+        monkeypatch.setattr(autosync.shutil, "which", lambda name: None)
+        autosync._write_record(
+            {"interval_minutes": 30, "method": "systemd-user"},
+        )
+        with patch.object(autosync, "autosync_status",
+                          side_effect=AssertionError("must not query")), \
+             patch.object(autosync, "_run",
+                          side_effect=AssertionError("must not run")):
+            result = remove_autosync(force_local=True)
+        assert result["removed"] is True
+        assert result["scheduler_untouched"] is True
+        assert result["method"] == "local-only"
+        assert "does not verify or change scheduler state" in result["warning"]
+        assert "systemctl --user disable" in result["warning"]
+        assert not (unit_dir / "worsaga-autosync.timer").exists()
+        assert not (unit_dir / "worsaga-autosync.service").exists()
+        assert not autosync.autosync_record_path().exists()
+
+    def test_macos_deletes_plist_and_record(self, macos, tmp_path,
+                                            monkeypatch):
+        plist = tmp_path / "com.worsaga.autosync.plist"
+        plist.write_text("<plist/>")
+        monkeypatch.setattr(autosync, "_macos_plist_path", lambda: plist)
+        autosync._write_record({"interval_minutes": 30, "method": "launchd"})
+        with patch.object(autosync, "_run",
+                          side_effect=AssertionError("must not run")):
+            result = remove_autosync(force_local=True)
+        assert result["removed"] is True
+        assert not plist.exists()
+        assert not autosync.autosync_record_path().exists()
+        assert "launchctl remove" in result["warning"]
+
+    def test_windows_deletes_record_only(self, windows):
+        autosync._write_record({"interval_minutes": 30, "method": "schtasks"})
+        with patch.object(autosync, "_run",
+                          side_effect=AssertionError("must not run")):
+            result = remove_autosync(force_local=True)
+        assert result["removed"] is True
+        assert not autosync.autosync_record_path().exists()
+        assert "schtasks /Delete" in result["warning"]
+
+    def test_dry_run_deletes_nothing(self, windows):
+        autosync._write_record({"interval_minutes": 30, "method": "schtasks"})
+        result = remove_autosync(dry_run=True, force_local=True)
+        assert result["removed"] is False
+        assert autosync.autosync_record_path().exists()
+        assert result["actions"]
 
 
 class TestLastSyncReporting:
@@ -623,6 +722,20 @@ class TestCliSurface:
                 main(["auto-sync", "install"])
         assert exc.value.code == 1
         assert "access denied" in capsys.readouterr().err
+
+    def test_force_local_flag_passes_through(self):
+        fake = {"removed": True, "dry_run": False, "platform": "windows",
+                "method": "local-only", "actions": [],
+                "warning": "not verified"}
+        with patch("worsaga.cli.remove_autosync", return_value=fake) as rm:
+            main(["auto-sync", "remove", "--force-local"])
+        assert rm.call_args.kwargs == {"dry_run": False, "force_local": True}
+
+    def test_force_local_rejected_for_status(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["auto-sync", "status", "--force-local"])
+        assert exc.value.code == 1
+        assert "only applies to the 'remove'" in capsys.readouterr().err
 
     def test_default_interval(self):
         fake = {"installed": False, "dry_run": True, "platform": "windows",
