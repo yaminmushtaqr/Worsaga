@@ -2,6 +2,9 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
+
+from worsaga.client import CourseNotFoundError, ForumNotFoundError
 from worsaga.forums import (
     get_forum_discussions,
     get_latest_updates,
@@ -78,6 +81,28 @@ def test_get_forum_discussions_degrades_on_forum_failure():
     client = FakeForumClient()
     client.get_forum_discussions = Mock(side_effect=RuntimeError("denied"))
     assert get_forum_discussions(client, 1) == []
+
+
+def test_forum_outside_the_course_is_not_fabricated():
+    """An unknown forum id used to become a placeholder forum record.
+
+    The fabricated entry carried the caller's id straight through to
+    ``mod_forum_get_forum_discussions``; the course's forum list is already
+    in hand, so the id is now checked against it first.
+    """
+    client = FakeForumClient()
+    client.get_forum_discussions = Mock(side_effect=AssertionError("must not fetch"))
+    with pytest.raises(ForumNotFoundError) as exc_info:
+        get_forum_discussions(client, 1, forum_id=6666)
+    assert exc_info.value.forum_id == 6666
+    assert exc_info.value.course_id == 1
+
+
+def test_latest_updates_refuses_a_non_enrolled_course():
+    client = FakeForumClient()
+    client.get_forums_by_courses = Mock(side_effect=AssertionError("must not fetch"))
+    with pytest.raises(CourseNotFoundError):
+        get_latest_updates(client, course_id=999999)
 
 
 def test_get_latest_updates_filters_by_since_days():

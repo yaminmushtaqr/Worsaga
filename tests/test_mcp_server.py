@@ -37,7 +37,13 @@ class _FakeClient:
         messages_payload=None,
         calendar_payload=None,
     ):
-        self._courses = courses or []
+        # 1 and 42 are the ids the tool tests pass, so the fake is enrolled
+        # in both unless a test says otherwise: a course-scoped read is now
+        # refused for any course that is not on the enrolment list.
+        self._courses = courses if courses is not None else [
+            {"id": 1, "shortname": "ECON101"},
+            {"id": 42, "shortname": "CS210"},
+        ]
         self._contents = contents or []
         self._file_bytes = file_bytes
         self._grade_payload = grade_payload or {"usergrades": []}
@@ -937,9 +943,37 @@ class TestCourseNotFoundMcp:
         assert result["error_code"] == "assignment_not_found"
         assert str(self.BAD) in result["error"]
 
+    def test_get_assignments_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(mcp_server.get_assignments(self.BAD))
+
+    def test_get_course_forums_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(mcp_server.get_course_forums(self.BAD))
+
+    def test_get_forum_discussions_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(
+                mcp_server.get_forum_discussions(self.BAD)
+            )
+
+    def test_get_latest_updates_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(mcp_server.get_latest_updates(self.BAD))
+
+    def test_forum_outside_the_course_is_forum_not_found(self):
+        # A valid course with a forum id that is not one of its own: a
+        # distinct code, not a fabricated placeholder forum.
+        course_id = _econ_demo_course_id()
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            result = mcp_server.get_forum_discussions(course_id, forum_id=self.BAD)
+        assert result["error_code"] == "forum_not_found"
+        assert str(self.BAD) in result["error"]
+
     def test_error_codes_are_documented_vocabulary(self):
         assert "course_not_found" in mcp_server.ERROR_CODES
         assert "assignment_not_found" in mcp_server.ERROR_CODES
+        assert "forum_not_found" in mcp_server.ERROR_CODES
         assert "week_not_found" in mcp_server.ERROR_CODES
 
 
@@ -1123,7 +1157,7 @@ class TestGetConnectionInfo:
             base_url = "https://moodle.example.com"
             _token = _LEAK_TOKEN  # secret that must never surface
 
-            def call(self, wsfunction, **params):
+            def site_info(self):
                 return {
                     "sitename": "Example University", "userid": 5,
                     "fullname": "Jane Doe", "username": "jdoe",
@@ -1145,7 +1179,7 @@ class TestGetConnectionInfo:
         class _AuthFail:
             base_url = "https://moodle.example.com"
 
-            def call(self, wsfunction, **params):
+            def site_info(self):
                 raise MoodleRequestError(
                     "Moodle API error: Invalid token supplied",
                     errorcode="invalidtoken",
@@ -1163,7 +1197,7 @@ class TestGetConnectionInfo:
         class _NetFail:
             base_url = "https://moodle.example.com"
 
-            def call(self, wsfunction, **params):
+            def site_info(self):
                 raise urllib.error.URLError("connection timed out")
 
         with patch.object(mcp_server, "_get_client", return_value=_NetFail()):

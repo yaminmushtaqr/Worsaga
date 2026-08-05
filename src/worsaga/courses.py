@@ -62,6 +62,31 @@ def _prefix_base(shortname: str) -> str:
     return shortname
 
 
+def _require_enrolled(
+    client: Any,
+    course_id: int,
+    courses: list[dict[str, Any]] | None,
+) -> int:
+    """Return *course_id* only when it is one of the enrolled courses.
+
+    A numeric id used to be trusted verbatim, so any id a caller supplied
+    reached Moodle — including courses this account is not in. The enrolled
+    set is memoised on the client, so a flow that already listed courses
+    (or passed *courses* in) pays nothing for the check.
+    """
+    if courses is None:
+        courses = client.get_courses()
+    for course in courses:
+        try:
+            if int(course.get("id")) == course_id:
+                return course_id
+        except (TypeError, ValueError):
+            continue
+    raise CourseResolutionError(
+        f"Course {course_id} not found (not enrolled or does not exist)."
+    )
+
+
 def resolve_course_id(
     client: Any,
     raw: int | str,
@@ -72,8 +97,8 @@ def resolve_course_id(
 
     Resolution order, mirrored exactly by the CLI and the MCP tools:
 
-    1. An ``int`` (or all-digit string) is used directly — no course list
-       is fetched.
+    1. An ``int`` (or all-digit string) resolves to itself, but only after
+       it is confirmed to be one of the enrolled courses.
     2. A case-insensitive **exact** short-code match wins.
     3. Otherwise an **unambiguous prefix** match on the short-code stem
        (the part before the first ``_``/``-``): the query equals the stem,
@@ -88,12 +113,14 @@ def resolve_course_id(
     """
     # A real integer id (bool is an int subclass but never a course id).
     if isinstance(raw, int) and not isinstance(raw, bool):
-        return raw
+        return _require_enrolled(client, raw, courses)
     text = str(raw).strip()
     try:
-        return int(text)
+        numeric = int(text)
     except ValueError:
         pass
+    else:
+        return _require_enrolled(client, numeric, courses)
 
     if courses is None:
         courses = client.get_courses()

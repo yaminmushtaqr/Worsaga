@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from worsaga.client import CourseNotFoundError
 from worsaga.grades import (
     collect_grades,
     get_grade_summary,
@@ -129,6 +130,19 @@ class FakeGradeClient:
 
     def get_user_grade_items(self, course_id):
         return self.payloads[course_id]
+
+
+def test_non_enrolled_course_is_not_fabricated_into_a_target():
+    """An unknown id used to become a synthetic ``{"id", "shortname"}`` target.
+
+    That sent the unknown id to the gradebook endpoint and labelled whatever
+    came back with the bare number.
+    """
+    client = FakeGradeClient()
+    client.get_user_grade_items = Mock(side_effect=AssertionError("must not fetch"))
+    with pytest.raises(CourseNotFoundError) as exc_info:
+        collect_grades(client, course_id=999999)
+    assert exc_info.value.course_id == 999999
 
 
 def test_get_grades_across_courses_is_deterministic():

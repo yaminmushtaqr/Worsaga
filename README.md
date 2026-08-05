@@ -105,8 +105,14 @@ Credentials are resolved in this order:
    - Platform-native config directory (see below)
 
 The Moodle URL must use `https://` — the API token is sent with every
-request, so plain HTTP would expose it. `http://` is accepted only for
-localhost development servers.
+request, so plain HTTP would expose it. `http://` is accepted only for a
+Moodle running on this machine (`localhost` or a loopback IP address). It
+must also be a plain site address: no user name or password in the URL, and
+no query string or fragment.
+
+`userid` is only a hint. Worsaga reads the authenticated user's real id from
+the Moodle site itself and uses that for every request; if the configured
+value disagrees, it warns and uses the site's answer.
 
 The config directory follows each OS's conventions via `platformdirs`:
 `~/.config/worsaga/` on Linux, `~/Library/Application Support/worsaga/` on
@@ -384,8 +390,14 @@ are `build_search_index()`, `search_text()`, and `export_study_pack()`.
 Worsaga uses allowlisted read-only Moodle web-service calls. Every API call is
 checked against a hardcoded allowlist in the client; write-like operations —
 submitting assignments, posting replies, uploading files, creating events,
-deleting content — are blocked before any network request is made.
+deleting content — are blocked before any network request is made. Each
+allowlisted function also carries the exact set of request parameters Worsaga
+may send, so a call cannot be widened beyond what the feature needs.
 
+- Worsaga only ever reads the authenticated user's own data. The user id
+  comes from the Moodle site, not from configuration, and course-scoped
+  reads are confined to the courses that user is enrolled in — both checked
+  before any request goes out.
 - Credentials stay local. There is no hosted service and no telemetry.
 - Downloads go through Worsaga's authenticated download path.
 - Treat your API token like a password: never commit it, never share it, use

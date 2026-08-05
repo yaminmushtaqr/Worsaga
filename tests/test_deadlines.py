@@ -374,6 +374,8 @@ class TestGetAssignmentsByCoursesClient:
         captured = {}
 
         def fake_call(wsfunction, **params):
+            if wsfunction == "core_enrol_get_users_courses":
+                return [{"id": 7}, {"id": 8}, {"id": 9}]
             captured["wsfunction"] = wsfunction
             captured["params"] = params
             return {"courses": []}

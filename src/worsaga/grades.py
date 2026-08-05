@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from worsaga.client import MoodleClient, MoodleWriteAttemptError
+from worsaga.client import CourseNotFoundError, MoodleClient, MoodleWriteAttemptError
 from worsaga.concurrency import ProgressCallback, run_parallel
 from worsaga.models import as_bool, as_float, as_int, clean_text, grade_record
 
@@ -153,13 +153,19 @@ def normalize_grade_items(
 
 
 def _course_targets(client: MoodleClient, course_id: int | None) -> list[dict[str, Any]]:
+    """Return the enrolled course records this request covers.
+
+    An id outside the enrolment list is a not-found failure, never a
+    synthesised target: fabricating one used to send an unknown id to the
+    gradebook endpoint and label whatever came back with the bare id.
+    """
     courses = client.get_courses()
     if course_id is None:
         return courses
     for course in courses:
         if as_int(course.get("id")) == course_id:
             return [course]
-    return [{"id": course_id, "shortname": str(course_id), "fullname": ""}]
+    raise CourseNotFoundError(course_id)
 
 
 def collect_grades(

@@ -370,10 +370,14 @@ class TestResolveCourseId:
         client.get_courses.return_value = courses
         return client
 
-    def test_integer_id_returned_directly(self):
-        client = self._mock_client([])
+    def test_integer_id_resolves_when_enrolled(self):
+        client = self._mock_client([{"id": 42, "shortname": "ECON101"}])
         assert _resolve_course_id(client, "42") == 42
-        client.get_courses.assert_not_called()
+
+    def test_integer_id_outside_enrolment_is_refused(self):
+        client = self._mock_client([{"id": 10, "shortname": "ECON101"}])
+        with pytest.raises(CourseResolutionError, match="not enrolled"):
+            _resolve_course_id(client, "42")
 
     def test_shortcode_lookup(self):
         client = self._mock_client([
@@ -790,6 +794,9 @@ class TestCommandOutput:
     @patch("worsaga.cli._client")
     def test_calendar_week_json(self, mock_client_fn, mock_calendar, capsys):
         mock_calendar.return_value = [{"name": "Week 3 quiz"}]
+        mock_client_fn.return_value.get_courses.return_value = [
+            {"id": 1, "shortname": "ECON101"},
+        ]
         main(["--json", "calendar", "1", "--week", "3"])
         output = json.loads(capsys.readouterr().out)
         assert output[0]["name"] == "Week 3 quiz"

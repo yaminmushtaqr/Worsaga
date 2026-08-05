@@ -11,6 +11,7 @@ from worsaga.config import (
     _PLATFORM_CONFIG_DIR,
     _PLATFORM_CONFIG_PATH,
     _find_config_file,
+    canonical_moodle_url,
 )
 
 
@@ -306,3 +307,89 @@ class TestHttpsEnforcement:
                 token="tok",
                 path=tmp_path / "config.json",
             )
+
+
+class TestCanonicalMoodleUrl:
+    """The base URL must be a plain, canonical origin.
+
+    It is the origin every download is checked against and the key cache
+    rows and sync history are stored under, so it has to be exactly one
+    unambiguous string per site.
+    """
+
+    ACCEPTED = [
+        ("http://127.0.0.1", "http://127.0.0.1"),
+        ("http://localhost:8080", "http://localhost:8080"),
+        ("http://[::1]:8080", "http://[::1]:8080"),
+        ("https://moodle.example.ac.uk/site", "https://moodle.example.ac.uk/site"),
+    ]
+
+    REJECTED = [
+        # 127.example.com and 127.0.0.1.nip.io are ordinary DNS names that
+        # a "starts with 127." test would have waved through as local.
+        "http://127.example.com",
+        "http://127.0.0.1.nip.io",
+        "https:///missing-host",
+        "https://user:pass@example.com",
+        "https://example.com/path?x=1#frag",
+        # Empty delimiters are still not a plain site address: truthiness
+        # checks on username/query/fragment waved all three through.
+        "https://@example.com",
+        "https://example.com?",
+        "https://example.com#",
+    ]
+
+    FIXED_POINTS = [
+        "https://moodle.university.example/moodle",
+        "https://moodle.example.ac.uk",
+        "https://moodle.example.edu/vle/site",
+        "http://localhost:8080/moodle",
+    ]
+
+    @pytest.mark.parametrize("raw,expected", ACCEPTED)
+    def test_accepted_urls_normalise_as_expected(self, raw, expected):
+        assert canonical_moodle_url(raw) == expected
+
+    @pytest.mark.parametrize("raw", REJECTED)
+    def test_rejected_urls(self, raw):
+        with pytest.raises(ValueError):
+            canonical_moodle_url(raw)
+        with pytest.raises(ValueError):
+            MoodleConfig(url=raw, token="t")
+
+    @pytest.mark.parametrize("url", FIXED_POINTS)
+    def test_typical_configured_urls_are_fixed_points(self, url):
+        # Byte-for-byte stability matters: these strings key cache rows and
+        # sync history, and churn would orphan an existing user's cache.
+        assert canonical_moodle_url(url) == url
+        assert MoodleConfig(url=url, token="t").url == url
+
+    def test_scheme_and_host_are_lowercased(self):
+        assert canonical_moodle_url("HTTPS://Moodle.Example.EDU/Moodle") == (
+            "https://moodle.example.edu/Moodle"  # path case is preserved
+        )
+
+    def test_default_ports_are_dropped(self):
+        assert canonical_moodle_url("https://m.example.edu:443/x") == (
+            "https://m.example.edu/x"
+        )
+        assert canonical_moodle_url("http://localhost:80") == "http://localhost"
+
+    def test_non_default_port_is_kept(self):
+        assert canonical_moodle_url("https://m.example.edu:8443") == (
+            "https://m.example.edu:8443"
+        )
+
+    def test_non_http_scheme_rejected(self):
+        for url in ("ftp://m.example.edu", "file:///etc/passwd", "m.example.edu"):
+            with pytest.raises(ValueError):
+                canonical_moodle_url(url)
+
+    def test_write_config_stores_the_canonical_form(self, tmp_path):
+        dest = tmp_path / "config.json"
+        MoodleConfig.write_config(
+            url="HTTPS://Moodle.Example.EDU:443/moodle/", token="t", path=dest,
+        )
+        assert json.loads(dest.read_text())["url"] == (
+            "https://moodle.example.edu/moodle"
+        )

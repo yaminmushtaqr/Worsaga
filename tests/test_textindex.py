@@ -448,3 +448,31 @@ class TestMcpSurface:
             found = mcp_server.search_text("nothing indexed yet")
             assert found["hits"] == []
             assert found["index"]["documents"] == 0
+
+    def test_numeric_course_filter_keeps_search_text_offline(self, env_index):
+        """search_text documents "no network" -- a numeric filter must honour it.
+
+        The index is built enrolment-scoped, so filtering it by id cannot
+        widen what it holds; resolving the id against the course list would
+        turn a local query into a Moodle round-trip.
+        """
+        from unittest.mock import patch
+
+        from worsaga import mcp_server
+
+        course_id = _econ_course_id()
+        with patch.object(mcp_server, "_get_client", return_value=DemoMoodleClient()):
+            mcp_server.build_search_index()
+
+        class _OfflineClient(DemoMoodleClient):
+            base_url = DemoMoodleClient.base_url
+
+            def get_courses(self):
+                raise AssertionError("search_text must not contact Moodle")
+
+        with patch.object(mcp_server, "_get_client", return_value=_OfflineClient()):
+            found = mcp_server.search_text("elasticity", course_id=course_id)
+            assert found["hits"]
+            # An id that was never indexed is simply zero local hits.
+            missing = mcp_server.search_text("elasticity", course_id=999999)
+            assert missing["hits"] == []

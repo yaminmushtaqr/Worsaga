@@ -12,13 +12,16 @@ All notable changes to Worsaga are documented in this file.
   `download_material`, `extract_material`, `get_assignments`,
   `get_course_forums`, `get_calendar_events`, `build_search_index`, and
   the rest) resolves an `int | str` argument the same way the CLI does — an
-  int or digit-string is used directly, a name is matched case-insensitively
-  by exact short-code and then by unambiguous prefix — so an agent no longer
-  has to call `list_courses` and match ids itself. An unknown name returns a
-  structured `{"error", "error_code": "course_not_found"}` dict; an ambiguous
-  prefix returns the new `{"error", "error_code": "course_ambiguous",
+  int or digit-string is confirmed against your enrolled courses, a name is
+  matched case-insensitively by exact short-code and then by unambiguous
+  prefix — so an agent no longer has to call `list_courses` and match ids
+  itself. An unknown id or name returns a structured
+  `{"error", "error_code": "course_not_found"}` dict; an ambiguous prefix
+  returns the new `{"error", "error_code": "course_ambiguous",
   "candidates": [{id, shortname, fullname}, ...]}`. The CLI and MCP now share
-  one resolver in `worsaga.courses`.
+  one resolver in `worsaga.courses`. The one exception is `search_text`,
+  which queries only the local index and so filters by a numeric id directly,
+  keeping its no-network contract.
 - New read-only MCP tool `get_connection_info` — a cheap "am I connected?"
   check that reports `authenticated`, `demo_mode`, the Moodle `site_url`
   (base URL only), `site_name`, the authenticated `user_id` and
@@ -201,9 +204,80 @@ All notable changes to Worsaga are documented in this file.
   mcp 2.0 removed `mcp.server.fastmcp`, which the MCP server imports, so an
   unpinned `pip install worsaga[mcp]` could install a release that fails at
   import. CI now runs the suite against both ends of the supported range.
+- Stricter validation of the configured Moodle URL, and one canonical
+  spelling of it. The base URL is the origin every file download is checked
+  against, so it now has to be a plain site address: a URL with credentials
+  (`https://user:pass@moodle.example.edu`), a query string or fragment, no
+  host (`https:///moodle`), or a non-HTTP(S) scheme is rejected outright.
+  The local-development exemption from HTTPS is now decided by parsing the
+  host as an IP address rather than by how it is spelled, so
+  `http://127.example.com` and `http://127.0.0.1.nip.io` — ordinary DNS
+  names anyone can register and point anywhere — are no longer accepted as
+  local. A genuinely local instance still works over plain HTTP:
+  `http://localhost:8080`, `http://127.0.0.1`, `http://[::1]:8080`.
+  Normalisation stays deliberately minimal — the scheme and host are
+  lowercased, an explicit `:443`/`:80` is dropped, a trailing slash is
+  stripped, and the path is otherwise untouched — so an ordinary configured
+  value such as `https://moodle.university.example/moodle` is unchanged and
+  existing caches and sync history keep matching.
 
 ### Security
 
+- The authenticated user is now verified against the Moodle site instead of
+  taken on trust from configuration. `WORSAGA_USERID` (and the `userid` in a
+  credentials file or `--userid`) is treated as a hint: on first use the
+  client reads the real user id from `core_webservice_get_site_info`, uses
+  that for every self-scoped read, and — if the configured value disagrees —
+  prints one warning naming both and proceeds with the site's answer. The
+  configured value never reaches the wire. Previously a token with elevated
+  (teacher or admin) capabilities plus a foreign `userid` would have
+  collected that other person's courses, gradebook, and messages. If
+  site-info cannot be fetched the request fails; there is no fall back to
+  the unverified value. Cost: at most one extra `core_webservice_get_site_info`
+  call per client instance — one per command in practice, and the same cheap
+  call the official Moodle app makes at startup — memoised and shared with
+  `worsaga doctor` / `get_connection_info`, which already made it.
+- Every allowlisted web-service function now carries an enforced parameter
+  allowlist. The client's policy table records the complete set of request
+  parameters Worsaga sends for each function, derived from the wrapper that
+  calls it, and any other parameter raises the new `MoodleParameterError`
+  before a request is built (array arguments such as `courseids[0]` are
+  matched by base name). A caller reaching `MoodleClient.call` directly can
+  no longer widen a request with extra Moodle arguments the feature never
+  needed — including optional user-identity arguments such as the `userid`
+  that `mod_assign_get_submission_status` accepts. The `exposed` flag in the
+  same table is now enforced too: `core_webservice_get_site_info` is
+  internal to the client and is reachable only through its
+  `site_info()` wrapper, not through public `call()`.
+- Course-scoped reads are now confined to the courses the authenticated user
+  is enrolled in. Course contents, grades, assignments, forums, quizzes,
+  calendar-by-course, materials, downloads, summaries, and study packs all
+  check the course id against the enrolment list before the request, and a
+  numeric course id passed to the CLI or an MCP tool is checked too (it used
+  to be forwarded verbatim). The check lives in the client's own dispatcher,
+  keyed off the parameters each allowlisted function uses to name a course,
+  so raw `MoodleClient.call` is bound by it as well as the convenience
+  wrappers. The enrolment set is memoised per client and
+  refreshed whenever the course list is fetched, so flows that already list
+  courses make no extra request. An id outside the set produces the existing
+  structured failure — a friendly `Error:` line and exit 1 in the CLI,
+  `{"error", "error_code": "course_not_found"}` from the MCP tools.
+- Removed the fabricated fallback targets behind `assignments`, `grades`,
+  and `forums`. An unrecognised course id used to be turned into a synthetic
+  `{"id": <id>, "shortname": "<id>"}` record that was then sent to Moodle and,
+  if the server answered, presented as a course; an unrecognised forum id was
+  likewise fabricated into a placeholder forum whose id was handed straight to
+  `mod_forum_get_forum_discussions`. Both are gone: an unknown course is
+  `course_not_found` and a forum that is not one of the validated course's own
+  forums is the new `forum_not_found` (MCP) / `Error:` exit 1 (CLI). Neither
+  produces a record for something that was never fetched, and neither probes
+  the server with an id the account has no claim to.
+- `core_course_get_courses` is off the read-only allowlist. It reads course
+  metadata by arbitrary id, so it can describe courses this account is not
+  enrolled in; nothing called it. Enrolment-scoped discovery through
+  `core_enrol_get_users_courses` is the sanctioned path, and a test now
+  asserts every allowlisted function is actually reached by a client wrapper,
+  so an unused capability cannot sit on the list again.
 - Worsaga can no longer be pointed at another person's data, in two layers.
   The client's `get_user_grade_items` used to take an optional user id and a
   `get_course_grades` helper took a whole list of them — with a token

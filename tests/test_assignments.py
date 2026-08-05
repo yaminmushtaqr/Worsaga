@@ -10,6 +10,7 @@ from worsaga.assignments import (
     normalize_assignment,
     normalize_assignments,
 )
+from worsaga.client import AssignmentNotFoundError, CourseNotFoundError
 
 
 NOW = 1_700_000_000
@@ -140,6 +141,34 @@ def test_get_assignment_status_returns_one_record():
 def test_get_assignment_status_raises_for_missing_assignment():
     with pytest.raises(ValueError, match="No assignment"):
         get_assignment_status(FakeAssignmentClient(), course_id=1, assignment_id=99)
+
+
+def test_non_enrolled_course_is_not_fabricated_into_a_target():
+    """An unknown course id used to become a synthetic target.
+
+    ``_course_targets`` returned ``{"id": <id>, "shortname": str(<id>)}``,
+    which sent the unknown id to Moodle and, on a permissive server, showed
+    a record for a course this account is not in.
+    """
+    client = FakeAssignmentClient()
+    client.get_assignments_by_courses = Mock(
+        side_effect=AssertionError("must not reach Moodle"),
+    )
+    with pytest.raises(CourseNotFoundError) as exc_info:
+        get_assignments(client, course_id=999999, now=NOW)
+    assert exc_info.value.course_id == 999999
+
+
+def test_assignment_outside_the_course_never_reaches_submission_status():
+    """Child-object scope: only the course's own assignment ids are probed."""
+    client = FakeAssignmentClient()
+    seen = []
+    client.get_assignment_submission_status = lambda aid: (
+        seen.append(aid) or client.statuses.get(aid, {})
+    )
+    with pytest.raises(AssignmentNotFoundError):
+        get_assignment_status(client, course_id=1, assignment_id=7401)
+    assert seen == [10]  # the course's own assignment, and nothing else
 
 
 def test_include_feedback_is_a_noop_without_broad_grade_fetch():

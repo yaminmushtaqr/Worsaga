@@ -6,7 +6,12 @@ import logging
 import time
 from typing import Any
 
-from worsaga.client import MoodleClient, MoodleWriteAttemptError
+from worsaga.client import (
+    CourseNotFoundError,
+    ForumNotFoundError,
+    MoodleClient,
+    MoodleWriteAttemptError,
+)
 from worsaga.concurrency import ProgressCallback, run_parallel
 from worsaga.models import as_bool, as_int, clean_text, forum_discussion_record
 
@@ -111,17 +116,18 @@ def get_forum_discussions(
     course_id: int,
     forum_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Return forum discussions for one forum or all course forums."""
+    """Return forum discussions for one forum or all course forums.
+
+    A *forum_id* that is not one of the validated course's own forums
+    raises :class:`ForumNotFoundError`. The course's forum list is already
+    fetched here, so the check is free — and an unknown id is no longer
+    fabricated into a placeholder forum whose id was then handed to Moodle.
+    """
     forums = get_course_forums(client, course_id)
-    if forum_id is not None and all(forum["forum_id"] != forum_id for forum in forums):
-        forums.append({
-            "course_id": course_id,
-            "forum_id": forum_id,
-            "name": str(forum_id),
-            "is_announcement": False,
-        })
     if forum_id is not None:
         forums = [forum for forum in forums if forum["forum_id"] == forum_id]
+        if not forums:
+            raise ForumNotFoundError(forum_id, course_id=course_id)
 
     records: list[dict[str, Any]] = []
     for forum in forums:
@@ -168,9 +174,12 @@ def get_latest_updates(
     """
     courses = client.get_courses()
     if course_id is not None:
-        courses = [course for course in courses if as_int(course.get("id")) == course_id] or [
-            {"id": course_id, "shortname": str(course_id)}
+        courses = [
+            course for course in courses
+            if as_int(course.get("id")) == course_id
         ]
+        if not courses:
+            raise CourseNotFoundError(course_id)
     cutoff = int(time.time()) - since_days * 86400
     course_ids = [
         cid for cid in (as_int(course.get("id"), 0) or 0 for course in courses)

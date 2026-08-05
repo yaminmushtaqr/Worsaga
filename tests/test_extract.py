@@ -65,6 +65,8 @@ def _materials():
 def _mock_client(file_bytes=SAMPLE_TEXT.encode()):
     client = MagicMock()
     client.base_url = BASE_URL
+    # Course-scoped commands resolve the id against the enrolment list.
+    client.get_courses.return_value = [{"id": COURSE_ID, "shortname": "ECON101"}]
     client.get_course_contents.return_value = SAMPLE_SECTIONS
     client.download_file.return_value = file_bytes
     return client

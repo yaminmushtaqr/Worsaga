@@ -58,14 +58,16 @@ def fetch_site_info(client: Any) -> dict[str, Any]:
     """Return the raw ``core_webservice_get_site_info`` dict for *client*.
 
     Offline demo clients (``is_demo``) answer from their built-in stand-in;
-    a live client makes the single cheap web-service call. Expected auth and
+    a live client makes the single cheap web-service call. That call is
+    memoised on the client and shared with its identity verification, so a
+    process makes it once however many surfaces ask. Expected auth and
     network failures are re-raised as :class:`ConnectionCheckError` with a
     token-free message; a blocked-function safety error still propagates.
     """
     if getattr(client, "is_demo", False):
         return client.site_info()
     try:
-        return client.call("core_webservice_get_site_info")
+        return client.site_info()
     except MoodleWriteAttemptError:
         # A read-only safety violation is a bug, not a connection state.
         raise

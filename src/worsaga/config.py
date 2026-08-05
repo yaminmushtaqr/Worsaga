@@ -14,10 +14,12 @@ No secrets are hardcoded.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import platformdirs
 
@@ -60,32 +62,102 @@ def _load_config_file(path: Path) -> dict:
         return json.load(f)
 
 
-_LOCAL_DEV_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+def _is_loopback_host(host: str) -> bool:
+    """Return True only for a host that is genuinely this machine.
+
+    ``localhost``, plus anything the stdlib parses as a loopback IP literal
+    (127.0.0.0/8 and ``::1``). Name-shape tests are deliberately avoided: a
+    ``startswith("127.")`` check accepts ``127.example.com`` and
+    ``127.0.0.1.nip.io``, which are ordinary DNS names anyone can register
+    and point at a server of their choosing.
+    """
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def canonical_moodle_url(url: str) -> str:
+    """Validate a Moodle base URL and return its canonical origin form.
+
+    Accepts only a plain ``http(s)://host[:port][/path]`` site address:
+    user-info, a query string, and a fragment are all rejected, because the
+    base URL is the origin every request and download is checked against,
+    not a link.
+
+    HTTPS is required for every host that is not this machine. The token is
+    sent with every API call and download, so plain HTTP would expose it;
+    ``http://`` is permitted only for a genuinely local development
+    instance (see :func:`_is_loopback_host`).
+
+    Normalisation is deliberately minimal — the scheme and host are
+    lowercased, an explicit default port (``:443`` for https, ``:80`` for
+    http) is dropped, and a trailing slash is stripped. The path is
+    otherwise preserved byte-for-byte: cache rows and sync history are keyed
+    by this string, so an ordinary configured value such as
+    ``https://moodle.university.example/moodle`` has to normalise to itself.
+    """
+    raw = str(url or "").strip()
+    parsed = urlsplit(raw)
+    scheme = parsed.scheme.lower()
+
+    if scheme not in {"http", "https"}:
+        raise ValueError(
+            f"Moodle URL must start with https:// (got '{raw}'). Use the "
+            "address you open Moodle at in a browser, for example "
+            "https://moodle.example.edu."
+        )
+    # ``is not None`` and a raw ``?``/``#`` scan, not truthiness: an empty
+    # user-info, query, or fragment ('https://@example.com',
+    # 'https://example.com?') is still not a plain site address, and a base
+    # URL never legitimately carries either delimiter.
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            f"Moodle URL must not carry a user name or password (got "
+            f"'{raw}'). Worsaga authenticates with the web-service token "
+            "from your configuration, never with URL credentials."
+        )
+    if "?" in raw or "#" in raw:
+        raise ValueError(
+            f"Moodle URL must be a plain site address with no query string "
+            f"or fragment (got '{raw}'). Use just the site root, for "
+            "example https://moodle.example.edu."
+        )
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError(
+            f"Moodle URL has an invalid port (got '{raw}')."
+        ) from None
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError(
+            f"Moodle URL must include a host name (got '{raw}'). Use the "
+            "address you open Moodle at in a browser, for example "
+            "https://moodle.example.edu."
+        )
+    if scheme == "http" and not _is_loopback_host(host):
+        raise ValueError(
+            f"Moodle URL must use https:// (got '{raw}'). The API token is "
+            "sent with every request, so plain HTTP would expose it. "
+            "http:// is allowed only for a Moodle running on this machine "
+            "(localhost or a loopback IP address)."
+        )
+
+    # urlsplit strips the brackets from an IPv6 host; the netloc needs them
+    # back or the rebuilt URL is unparseable.
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and port != (443 if scheme == "https" else 80):
+        netloc = f"{netloc}:{port}"
+    return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
 def _validate_moodle_url(url: str) -> None:
-    """Require HTTPS for any non-local Moodle URL.
-
-    The token is sent with every API call and download, so plain HTTP
-    would expose it on the wire. ``http://`` is permitted only for
-    localhost development instances.
-    """
-    from urllib.parse import urlparse
-
-    parsed = urlparse(url)
-    scheme = parsed.scheme.lower()
-    host = (parsed.hostname or "").lower()
-    if scheme == "https":
-        return
-    if scheme == "http" and (
-        host in _LOCAL_DEV_HOSTS or host.startswith("127.")
-    ):
-        return
-    raise ValueError(
-        f"Moodle URL must use https:// (got '{url}'). The API token is "
-        "sent with every request, so plain HTTP would expose it. "
-        "http:// is allowed only for localhost development servers."
-    )
+    """Raise ``ValueError`` unless *url* is an acceptable Moodle base URL."""
+    canonical_moodle_url(url)
 
 
 @dataclass(frozen=True)
@@ -96,7 +168,10 @@ class MoodleConfig:
 
     def __post_init__(self):
         if self.url:
-            _validate_moodle_url(self.url)
+            # Frozen dataclass: normalise in place so every consumer keyed
+            # on this string (cache rows, sync history, the download-origin
+            # check) sees one canonical spelling of the site.
+            object.__setattr__(self, "url", canonical_moodle_url(self.url))
 
     @classmethod
     def load(
@@ -172,10 +247,10 @@ class MoodleConfig:
         path: Path | None = None,
     ) -> Path:
         """Write credentials to a JSON config file. Returns the path written."""
-        _validate_moodle_url(url.rstrip("/"))
+        canonical_url = canonical_moodle_url(url)
         dest = path or DEFAULT_CONFIG_PATH
         dest.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"url": url.rstrip("/"), "token": token, "userid": userid}
+        payload = {"url": canonical_url, "token": token, "userid": userid}
         with open(dest, "w") as f:
             json.dump(payload, f, indent=2)
             f.write("\n")
@@ -194,4 +269,4 @@ def test_connection(config: MoodleConfig | None = None) -> dict:
     from worsaga.client import MoodleClient
 
     client = MoodleClient(config=config or MoodleConfig.load())
-    return client.call("core_webservice_get_site_info")
+    return client.site_info()

@@ -8,6 +8,7 @@ from typing import Any
 
 from worsaga.client import (
     AssignmentNotFoundError,
+    CourseNotFoundError,
     MoodleClient,
     MoodleWriteAttemptError,
 )
@@ -22,13 +23,20 @@ SUBMITTED_STATUSES = {"submitted", "graded", "released"}
 
 
 def _course_targets(client: MoodleClient, course_id: int | None) -> list[dict[str, Any]]:
+    """Return the enrolled course records this request covers.
+
+    An id outside the enrolment list is a not-found failure, never a
+    synthesised ``{"id": course_id, "shortname": str(course_id)}`` target:
+    fabricating one used to send an unknown id to Moodle and, if it
+    answered, present a record for a course this account is not in.
+    """
     courses = client.get_courses()
     if course_id is None:
         return courses
     for course in courses:
         if as_int(course.get("id")) == course_id:
             return [course]
-    return [{"id": course_id, "shortname": str(course_id), "fullname": ""}]
+    raise CourseNotFoundError(course_id)
 
 
 def _submission_from_status(status_payload: dict[str, Any] | None) -> dict[str, Any]:

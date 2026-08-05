@@ -62,6 +62,7 @@ from worsaga.client import (
     AssignmentNotFoundError,
     CourseNotFoundError,
     DownloadError,
+    ForumNotFoundError,
     MoodleClient,
 )
 from worsaga.config import MoodleConfig, default_downloads_dir
@@ -143,6 +144,7 @@ ERROR_CODES = (
     "course_not_found",     # course id/name not enrolled or does not exist
     "course_ambiguous",     # course name/prefix matched more than one course
     "assignment_not_found",  # assignment id does not exist / not accessible
+    "forum_not_found",      # forum id is not one of the course's forums
     "week_not_found",       # week query matched no section
     "invalid_output_dir",   # output_dir escaped the downloads directory
     "index_unavailable",    # local search index could not be opened
@@ -166,6 +168,11 @@ def _course_not_found(exc: CourseNotFoundError) -> dict[str, Any]:
 def _assignment_not_found(exc: AssignmentNotFoundError) -> dict[str, Any]:
     """Return the structured error dict for a missing assignment."""
     return {"error": str(exc), "error_code": "assignment_not_found"}
+
+
+def _forum_not_found(exc: ForumNotFoundError) -> dict[str, Any]:
+    """Return the structured error dict for a forum outside the course."""
+    return {"error": str(exc), "error_code": "forum_not_found"}
 
 
 def _course_ambiguous(exc: CourseAmbiguousError) -> dict[str, Any]:
@@ -196,14 +203,16 @@ def _resolve_course_arg(
 
     Accepts what every course-taking tool now accepts: ``None`` (all
     enrolled courses, where the tool supports it), an ``int`` or digit
-    string (used directly, no lookup), or a course short-code — an exact
-    case-insensitive match or an unambiguous prefix, resolved against the
-    enrolled courses via :func:`worsaga.courses.resolve_course_id`.
+    string, or a course short-code — an exact case-insensitive match or an
+    unambiguous prefix. All of them go through
+    :func:`worsaga.courses.resolve_course_id`, so a numeric id is confirmed
+    against the enrolled-course list rather than used verbatim.
 
     Returns ``(resolved_id, None)`` on success, or ``(None, error_dict)``
     where the error dict carries ``error_code`` ``"course_not_found"`` (no
-    match) or ``"course_ambiguous"`` (a prefix matched several courses,
-    with a ``candidates`` list).
+    match, including an id outside the enrolment list) or
+    ``"course_ambiguous"`` (a prefix matched several courses, with a
+    ``candidates`` list).
     """
     if course_id is None:
         return None, None
@@ -213,6 +222,23 @@ def _resolve_course_arg(
         return None, _course_ambiguous(exc)
     except CourseResolutionError as exc:
         return None, {"error": str(exc), "error_code": "course_not_found"}
+
+
+def _numeric_course_id(course_id: int | str | None) -> int | None:
+    """Return *course_id* as an int when it is already numeric, else None.
+
+    ``0`` and ``""`` are the "all courses" sentinels and read as None. Used
+    only by the offline search tool, which must not turn a numeric filter
+    into a network round-trip.
+    """
+    if course_id is None or isinstance(course_id, bool):
+        return None
+    if isinstance(course_id, int):
+        return course_id or None
+    try:
+        return int(str(course_id).strip()) or None
+    except ValueError:
+        return None
 
 
 @mcp.tool()
@@ -303,7 +329,10 @@ def get_assignments(
     resolved, error = _resolve_course_arg(client, course_id)
     if error is not None:
         return error
-    return _get_assignments(client, course_id=resolved)
+    try:
+        return _get_assignments(client, course_id=resolved)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
 
 
 @mcp.tool()
@@ -349,7 +378,10 @@ def get_course_forums(
     resolved, error = _resolve_course_arg(client, course_id)
     if error is not None:
         return error
-    return _get_course_forums(client, course_id=resolved)
+    try:
+        return _get_course_forums(client, course_id=resolved)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
 
 
 @mcp.tool()
@@ -362,17 +394,24 @@ def get_forum_discussions(
     *course_id* accepts a numeric id or a course short-code (exact or an
     unambiguous prefix). An unknown name returns ``{"error", "error_code":
     "course_not_found"}``; an ambiguous prefix returns ``{"error",
-    "error_code": "course_ambiguous", "candidates"}``.
+    "error_code": "course_ambiguous", "candidates"}``. A *forum_id* that is
+    not one of that course's forums returns ``{"error", "error_code":
+    "forum_not_found"}``.
     """
     client = _get_client()
     resolved, error = _resolve_course_arg(client, course_id)
     if error is not None:
         return error
-    return _get_forum_discussions(
-        client,
-        course_id=resolved,
-        forum_id=forum_id,
-    )
+    try:
+        return _get_forum_discussions(
+            client,
+            course_id=resolved,
+            forum_id=forum_id,
+        )
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
+    except ForumNotFoundError as exc:
+        return _forum_not_found(exc)
 
 
 @mcp.tool()
@@ -391,11 +430,14 @@ def get_latest_updates(
     resolved, error = _resolve_course_arg(client, course_id)
     if error is not None:
         return error
-    return _get_latest_updates(
-        client,
-        course_id=resolved,
-        since_days=since_days,
-    )
+    try:
+        return _get_latest_updates(
+            client,
+            course_id=resolved,
+            since_days=since_days,
+        )
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
 
 
 @mcp.tool()
@@ -950,8 +992,10 @@ def build_search_index(
     course_id : int | str
         Limit indexing to one course — a numeric id or a course short-code
         (exact match or an unambiguous prefix); ``0`` = all enrolled
-        courses. An unknown name returns ``course_not_found``; an ambiguous
-        prefix returns ``course_ambiguous`` with a ``candidates`` list.
+        courses. This tool fetches from Moodle, so the id is confirmed
+        against your enrolled courses: an id or name that is not among them
+        returns ``course_not_found``, and an ambiguous prefix returns
+        ``course_ambiguous`` with a ``candidates`` list.
     week : str
         Only index sections matching this week number or name
         (empty = the whole course).
@@ -959,7 +1003,9 @@ def build_search_index(
         Cap on files fetched this run (default 100).
     """
     client = _get_client()
-    resolved, error = _resolve_course_arg(client, course_id)
+    # ``0`` is this tool's documented "all enrolled courses" sentinel, not a
+    # course id to resolve.
+    resolved, error = _resolve_course_arg(client, course_id or None)
     if error is not None:
         return error
     try:
@@ -996,16 +1042,25 @@ def search_text(
         Search terms; all terms must match (AND).
     course_id : int | str
         Limit hits to one course — a numeric id or a course short-code
-        (exact match or an unambiguous prefix); ``0`` = all courses. An
-        unknown name returns ``course_not_found``; an ambiguous prefix
-        returns ``course_ambiguous`` with a ``candidates`` list.
+        (exact match or an unambiguous prefix); ``0`` = all courses. A
+        numeric id filters the local index directly and keeps this tool
+        offline; an id that was never indexed simply yields no hits. A
+        short-code has to be matched against your enrolled courses, which
+        is the one case that contacts Moodle: an unknown name then returns
+        ``course_not_found`` and an ambiguous prefix ``course_ambiguous``
+        with a ``candidates`` list.
     limit : int
         Maximum hits to return (default 20).
     """
     client = _get_client()
-    resolved, error = _resolve_course_arg(client, course_id)
-    if error is not None:
-        return error
+    # A numeric id goes straight to the local index filter. The index is
+    # built enrolment-scoped, so filtering by id cannot widen what it holds,
+    # and resolving the id would break this tool's no-network contract.
+    resolved = _numeric_course_id(course_id)
+    if resolved is None:
+        resolved, error = _resolve_course_arg(client, course_id or None)
+        if error is not None:
+            return error
     try:
         return _search_text_index(
             client.base_url,

@@ -24,15 +24,30 @@ def _client(courses):
     return client
 
 
-def test_integer_argument_passes_through_without_fetch():
-    client = _client([])
+def test_integer_argument_resolves_when_enrolled():
+    client = _client([{"id": 42, "shortname": "ECON101"}])
     assert resolve_course_id(client, 42) == 42
-    client.get_courses.assert_not_called()
 
 
-def test_digit_string_passes_through_without_fetch():
-    client = _client([])
+def test_digit_string_resolves_when_enrolled():
+    client = _client([{"id": 42, "shortname": "ECON101"}])
     assert resolve_course_id(client, "42") == 42
+
+
+def test_numeric_id_outside_enrolment_is_refused():
+    # A numeric id used to be trusted verbatim and handed straight to
+    # Moodle; it is now checked against the enrolment list first.
+    client = _client([{"id": 10, "shortname": "ECON101"}])
+    with pytest.raises(CourseResolutionError, match="not enrolled"):
+        resolve_course_id(client, 999999)
+    with pytest.raises(CourseResolutionError, match="not enrolled"):
+        resolve_course_id(client, "999999")
+
+
+def test_numeric_id_checked_against_prefetched_courses_without_fetch():
+    client = _client([])
+    courses = [{"id": 42, "shortname": "ECON101"}]
+    assert resolve_course_id(client, 42, courses=courses) == 42
     client.get_courses.assert_not_called()
 
 

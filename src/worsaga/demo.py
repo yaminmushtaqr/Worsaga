@@ -697,19 +697,24 @@ class DemoMoodleClient:
     def get_courses(self) -> list[dict]:
         return copy.deepcopy(self._data["courses"])
 
-    def _require_known_course(self, course_id: int) -> None:
-        """Mirror Moodle: an unknown course id is a not-found failure.
+    def enrolled_course_ids(self) -> frozenset[int]:
+        """Mirror :meth:`MoodleClient.enrolled_course_ids` (no network)."""
+        return frozenset(int(c["id"]) for c in self._data["courses"])
 
-        Real Moodle raises "Can't find data record in database table
-        course." for a course the user is not enrolled in; the demo client
-        raises the same :class:`CourseNotFoundError` so error-path
-        behaviour (CLI friendly message, MCP structured error dict) is
-        exercised offline. A *known* course with no contents/grades stays a
-        valid empty state.
+    def _require_known_course(self, *course_ids: int) -> None:
+        """Mirror the live client: a non-enrolled course id is a failure.
+
+        The live client refuses the id before the request; real Moodle
+        would raise "Can't find data record in database table course."
+        anyway. The demo client raises the same
+        :class:`CourseNotFoundError` so error-path behaviour (CLI friendly
+        message, MCP structured error dict) is exercised offline. A *known*
+        course with no contents/grades stays a valid empty state.
         """
-        known = {int(c["id"]) for c in self._data["courses"]}
-        if int(course_id) not in known:
-            raise CourseNotFoundError(int(course_id))
+        known = self.enrolled_course_ids()
+        for course_id in course_ids:
+            if int(course_id) not in known:
+                raise CourseNotFoundError(int(course_id))
 
     def get_course_contents(self, course_id: int) -> list[dict]:
         self._require_known_course(course_id)
@@ -719,6 +724,7 @@ class DemoMoodleClient:
         return self.get_assignments_by_courses([course_id])
 
     def get_assignments_by_courses(self, course_ids: list[int]) -> dict:
+        self._require_known_course(*course_ids)
         wanted = {int(cid) for cid in course_ids}
         return {"courses": [
             copy.deepcopy(c)
@@ -740,6 +746,8 @@ class DemoMoodleClient:
     def get_quizzes(self, course_ids: list[int] | None = None) -> dict:
         if course_ids is None:
             course_ids = [c["id"] for c in self._data["courses"]]
+        else:
+            self._require_known_course(*course_ids)
         wanted = {int(cid) for cid in course_ids}
         return {"quizzes": [
             copy.deepcopy(q)
@@ -748,6 +756,7 @@ class DemoMoodleClient:
         ]}
 
     def get_forums_by_courses(self, course_ids: list[int]) -> dict:
+        self._require_known_course(*course_ids)
         wanted = {int(cid) for cid in course_ids}
         return {"forums": [
             copy.deepcopy(f)
@@ -774,6 +783,7 @@ class DemoMoodleClient:
     ) -> dict:
         events = self._data["events"]["events"]
         if course_ids is not None:
+            self._require_known_course(*course_ids)
             wanted = {int(cid) for cid in course_ids}
             events = [e for e in events if e["courseid"] in wanted]
         if timestart is not None:
