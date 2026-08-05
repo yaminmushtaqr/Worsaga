@@ -10,13 +10,32 @@ from worsaga.models import as_bool, as_int, notification_record
 
 
 def _sender(payload: dict[str, Any]) -> str:
-    return str(
+    """Return a display name for a message/notification sender.
+
+    Prefers the sender's full name. ``message_popup_get_popup_notifications``
+    on many Moodle instances returns only a numeric ``useridfrom`` and no
+    name field, which left the notifications "Sender" column blank; fall
+    back to a ``User <id>`` label from ``useridfrom`` (or ``userfromid``) in
+    that case, and finally to an empty string. A nested ``userfrom`` object
+    (``{"fullname": ...}``) is also honoured.
+    """
+    userfrom = payload.get("userfrom")
+    nested_name = userfrom.get("fullname") if isinstance(userfrom, dict) else None
+    name = str(
         payload.get("userfromfullname")
         or payload.get("fromfullname")
+        or nested_name
         or payload.get("sender")
-        or payload.get("userfrom")
+        or (userfrom if isinstance(userfrom, str) else "")
         or ""
-    )
+    ).strip()
+    if name:
+        return name
+    for id_key in ("useridfrom", "userfromid"):
+        uid = as_int(payload.get(id_key))
+        if uid and uid > 0:
+            return f"User {uid}"
+    return ""
 
 
 def normalize_notifications(payload: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:

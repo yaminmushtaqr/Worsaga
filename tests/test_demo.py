@@ -63,7 +63,18 @@ class TestAcceptanceCommands:
     def test_demo_materials_week3(self, capsys):
         main(["--demo", "materials", "ECON101", "--week", "3"])
         out = capsys.readouterr().out
-        assert "ECON101-week3-lecture-slides.p" in out
+        # Long file names are truncated with an ASCII '...' indicator so a
+        # cut name is never mistaken for the whole name (Issue 4).
+        assert "ECON101-week3-lecture-slide..." in out
+
+    def test_demo_notifications_sender_truncated_with_ellipsis(self, capsys):
+        # The notifications "Sender" column is 20 wide; the demo sender
+        # "Worsaga Demo University" (23 chars) must show an ASCII '...'
+        # indicator rather than a silent hard slice ("Worsaga Demo Univers").
+        main(["--demo", "notifications"])
+        out = capsys.readouterr().out
+        assert "Worsaga Demo Univ..." in out
+        assert "Worsaga Demo Univers " not in out
 
     def test_demo_summary_week3(self, capsys):
         main(["--demo", "summary", "ECON101", "--week", "3", "-q"])
@@ -189,6 +200,44 @@ class TestIsolation:
         # extracts four PDFs, so this proves the whole pipeline is offline.
         main(["--demo", "summary", "ECON101", "--week", "3", "-q"])
         assert "Study notes" in capsys.readouterr().out
+
+
+class TestDemoUnknownCourse:
+    """The demo client mirrors Moodle's not-found behaviour for course ids
+    that are not enrolled, so error paths are exercised offline."""
+
+    def test_get_course_contents_unknown_course_raises(self):
+        from worsaga.client import CourseNotFoundError
+
+        client = DemoMoodleClient()
+        with pytest.raises(CourseNotFoundError) as exc_info:
+            client.get_course_contents(999999)
+        assert exc_info.value.course_id == 999999
+
+    def test_get_user_grade_items_unknown_course_raises(self):
+        from worsaga.client import CourseNotFoundError
+
+        client = DemoMoodleClient()
+        with pytest.raises(CourseNotFoundError):
+            client.get_user_grade_items(999999)
+
+    def test_known_course_returns_grade_dict_never_raises(self):
+        # A known course id resolves to a grade payload (possibly empty),
+        # never a not-found error — the not-found guard keys off enrolment,
+        # not gradebook contents.
+        client = DemoMoodleClient()
+        for course in client.get_courses():
+            payload = client.get_user_grade_items(course["id"])
+            assert isinstance(payload, dict)
+            assert "usergrades" in payload
+
+    def test_cli_contents_unknown_course_friendly_error(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "contents", "999999"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "Course 999999 not found" in err
+        assert "data record" not in err  # raw Moodle wording never surfaces
 
 
 # ── Dataset hygiene ────────────────────────────────────────────────

@@ -6,8 +6,13 @@ import logging
 import time
 from typing import Any
 
-from worsaga.client import MoodleClient, MoodleWriteAttemptError
-from worsaga.models import as_bool, as_int, assignment_record
+from worsaga.client import (
+    AssignmentNotFoundError,
+    MoodleClient,
+    MoodleWriteAttemptError,
+)
+from worsaga.concurrency import ProgressCallback, run_parallel
+from worsaga.models import as_bool, as_int, assignment_record, clean_text
 from worsaga.time_utils import calculate_days_left, timestamp_to_display
 
 logger = logging.getLogger(__name__)
@@ -200,8 +205,18 @@ def get_assignments(
     *,
     include_feedback: bool = False,
     now: int | float | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
-    """Return normalized assignments for one course or all enrolled courses."""
+    """Return normalized assignments for one course or all enrolled courses.
+
+    Assignment definitions come from one batched call; each assignment's own
+    submission status is then fetched concurrently (see
+    :func:`worsaga.concurrency.run_parallel`), which is the slow part on a
+    real account. A per-assignment status failure stays a logged warning and
+    that assignment simply carries no submission detail — the record is still
+    returned. ``on_progress`` (default silent) reports one completed
+    assignment at a time.
+    """
     courses = _course_targets(client, course_id)
     course_ids = [as_int(course.get("id"), 0) or 0 for course in courses]
     course_map = {
@@ -220,13 +235,12 @@ def get_assignments(
     for course in payload.get("courses", []) if isinstance(payload, dict) else []:
         assignments.extend(course.get("assignments", []) if isinstance(course, dict) else [])
 
-    statuses: dict[int, dict[str, Any]] = {}
-    for assignment in assignments:
+    with_ids = [a for a in assignments if (as_int(a.get("id"), 0) or 0)]
+
+    def _fetch_status(assignment: dict[str, Any]) -> tuple[int, dict[str, Any] | None]:
         assignment_id = as_int(assignment.get("id"), 0) or 0
-        if not assignment_id:
-            continue
         try:
-            statuses[assignment_id] = client.get_assignment_submission_status(assignment_id)
+            return assignment_id, client.get_assignment_submission_status(assignment_id)
         except MoodleWriteAttemptError:
             raise
         except Exception as exc:
@@ -235,6 +249,20 @@ def get_assignments(
                 assignment_id,
                 exc,
             )
+            return assignment_id, None
+
+    statuses: dict[int, dict[str, Any]] = {
+        assignment_id: status
+        for assignment_id, status in run_parallel(
+            with_ids,
+            _fetch_status,
+            # clean_text so the live label matches the final record (Moodle
+            # names arrive HTML-escaped, e.g. "Group 1 &amp; 2 ...").
+            label_fn=lambda a: clean_text(a.get("name")) or str(a.get("id") or ""),
+            on_progress=on_progress,
+        )
+        if status is not None
+    }
 
     # ``include_feedback`` is accepted for compatibility but is a no-op:
     # grade and feedback fields always derive from the per-user
@@ -262,4 +290,7 @@ def get_assignment_status(
     for assignment in get_assignments(client, course_id=course_id, include_feedback=True):
         if assignment.get("id") == assignment_id:
             return assignment
-    raise ValueError(f"No assignment {assignment_id} found in course {course_id}.")
+    # AssignmentNotFoundError subclasses ValueError, so existing callers and
+    # the CLI's top-level handler are unaffected; MCP maps it to the
+    # structured ``assignment_not_found`` error dict.
+    raise AssignmentNotFoundError(assignment_id, course_id=course_id)

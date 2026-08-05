@@ -199,7 +199,11 @@ The server runs over stdio. Tools: `list_courses`, `get_deadlines`,
 changes, no network), `build_search_index` (local full-text index),
 `search_text` (offline full-text search), `export_study_pack` (Markdown
 study pack for a week), `get_autosync_status` (read-only scheduled-sync
-check).
+check), and `get_connection_info` (read-only auth/site/user check).
+
+Every tool that takes a `course_id` accepts either the numeric id or a
+course short-code — an exact match or an unambiguous prefix, e.g.
+`get_grades("ECON101")` — so an agent need not call `list_courses` first.
 
 Minimal MCP configuration:
 

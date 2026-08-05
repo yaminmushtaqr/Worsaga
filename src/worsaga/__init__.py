@@ -56,6 +56,7 @@ from worsaga.messages import (
     normalize_notifications,
 )
 from worsaga.sections import (
+    WeekNotFoundError,
     classify_section,
     find_best_section,
     get_downloadable_files,
@@ -110,6 +111,7 @@ __all__ = [
     "CacheStore",
     "TextIndexError",
     "TextIndexStore",
+    "WeekNotFoundError",
     "autosync_status",
     "install_autosync",
     "notification_backend",

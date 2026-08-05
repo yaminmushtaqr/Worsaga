@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from worsaga.client import MoodleWriteAttemptError
+from worsaga.concurrency import ProgressCallback
 from worsaga.notify import send_notification
 from worsaga.sync import SYNC_LOOKAHEAD_DAYS, run_sync
 
@@ -63,6 +64,8 @@ def run_watch(
     lookahead_days: int = SYNC_LOOKAHEAD_DAYS,
     cache_path: str | Path | None = None,
     on_cycle: Callable[[dict[str, Any]], None] | None = None,
+    on_cycle_start: Callable[[int], None] | None = None,
+    on_progress: ProgressCallback | None = None,
     notify_fn: Callable[[str, str], dict] = send_notification,
     sleep_fn: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
@@ -83,6 +86,13 @@ def run_watch(
         Invoked with each cycle's result dict as it completes — the
         sync result plus ``cycle`` (1-based), ``ok``, and
         ``notification`` (the send result, when one was attempted).
+    on_cycle_start : callable, optional
+        Invoked with the 1-based cycle number just before that cycle's
+        sync begins, so a caller can announce the cycle (a long sync
+        should never look hung before its first output).
+    on_progress : callable, optional
+        Forwarded to :func:`worsaga.sync.run_sync` for per-course progress
+        during each cycle's fetch phase.
     notify_fn, sleep_fn : callables
         Injection points for tests; defaults are the real ones.
 
@@ -107,10 +117,13 @@ def run_watch(
 
     while True:
         cycles += 1
+        if on_cycle_start is not None:
+            on_cycle_start(cycles)
         result: dict[str, Any]
         try:
             result = run_sync(
                 client, cache_path=cache_path, lookahead_days=lookahead_days,
+                on_progress=on_progress,
             )
             result["ok"] = True
         except MoodleWriteAttemptError:

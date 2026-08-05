@@ -4,6 +4,7 @@ deterministic bullet building, and the high-level summary builder."""
 import pytest
 
 from worsaga.sections import (
+    WeekNotFoundError,
     classify_section,
     find_best_section,
     get_downloadable_files,
@@ -274,6 +275,36 @@ class TestFindBestSection:
         assert section is None
         assert stype == "general"
         assert name == ""
+
+    def test_named_week_without_files_still_matches(self):
+        # A materials-free course: "Week 1" matches by name but has no
+        # files, and neither does any other section. It must return that
+        # empty section, not None — None is reserved for a genuine no-match
+        # so callers can treat it as an explicit week-not-found failure.
+        sections = [
+            _make_section("Week 1: Intro", 1, []),
+            _make_section("Week 2: Data", 2, []),
+        ]
+        section, stype, name = find_best_section(sections, 1)
+        assert section is not None
+        assert name == "Week 1: Intro"
+        assert stype == "normal"
+
+    def test_truly_unmatched_numeric_week_returns_none(self):
+        # Week 9 names no section and there are no files to fall back on.
+        sections = [
+            _make_section("Week 1: Intro", 1, []),
+            _make_section("Week 2: Data", 2, []),
+        ]
+        section, stype, name = find_best_section(sections, 9)
+        assert section is None
+
+    def test_unmatched_string_week_returns_none(self):
+        section, stype, name = find_best_section(
+            self._sections_with_files(), "zzz_nonsense",
+        )
+        assert section is None
+        assert stype == "general"
 
     def test_prefers_sections_with_files(self):
         sections = [
@@ -1211,13 +1242,27 @@ def _text_pdf_bytes(text: str) -> bytes:
 
 
 class TestBuildWeeklySummary:
-    def test_no_section_falls_back(self):
+    def test_no_section_raises(self):
+        # An empty course (no section matches the week) is an explicit
+        # week-not-found failure, not a fabricated fallback summary.
         client = _StubClient(sections=[])
-        result = build_weekly_summary(client, 42, 1)
-        assert result["method"] == "fallback"
-        assert result["course_id"] == 42
-        assert result["week"] == 1
-        assert result["section_name"] == ""
+        with pytest.raises(WeekNotFoundError) as exc_info:
+            build_weekly_summary(client, 42, 1)
+        assert exc_info.value.week == 1
+        assert "no section matching week '1'" in str(exc_info.value)
+        assert "in course 42" in str(exc_info.value)
+        assert exc_info.value.available_sections == []
+
+    def test_unmatched_named_week_raises(self):
+        # A nonsense week query against a real section must not fabricate.
+        sections = [_make_section("Week 3: Markets", 3, [
+            _make_module(30, "Slides", contents=[_make_file_content("w3.pdf")]),
+        ])]
+        client = _StubClient(sections=sections)
+        with pytest.raises(WeekNotFoundError) as exc_info:
+            build_weekly_summary(client, 42, "zzz_nonsense")
+        assert exc_info.value.week == "zzz_nonsense"
+        assert exc_info.value.available_sections == ["Week 3: Markets"]
 
     def test_section_without_modules_falls_back(self):
         sections = [
@@ -1239,7 +1284,10 @@ class TestBuildWeeklySummary:
                 return super().get_course_contents(course_id)
 
         client = _Client(sections=[])
-        build_weekly_summary(client, 42, 1, sections=[])
+        # Pre-supplied sections that match the week: no fetch, no raise.
+        build_weekly_summary(
+            client, 42, 1, sections=[_make_section("Week 1: Intro", 1, [])],
+        )
         assert called["n"] == 0
 
     def test_on_extract_invoked_per_file(self):

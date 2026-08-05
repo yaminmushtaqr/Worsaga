@@ -2,6 +2,194 @@
 
 All notable changes to Worsaga are documented in this file.
 
+## 0.8.2 (unreleased)
+
+### Added
+
+- MCP tools now accept a course short-code anywhere they take a
+  `course_id`, not just a numeric id. Every course-taking tool
+  (`get_grades`, `get_course_contents`, `get_week_materials`,
+  `download_material`, `extract_material`, `get_assignments`,
+  `get_course_forums`, `get_calendar_events`, `build_search_index`, and
+  the rest) resolves an `int | str` argument the same way the CLI does — an
+  int or digit-string is used directly, a name is matched case-insensitively
+  by exact short-code and then by unambiguous prefix — so an agent no longer
+  has to call `list_courses` and match ids itself. An unknown name returns a
+  structured `{"error", "error_code": "course_not_found"}` dict; an ambiguous
+  prefix returns the new `{"error", "error_code": "course_ambiguous",
+  "candidates": [{id, shortname, fullname}, ...]}`. The CLI and MCP now share
+  one resolver in `worsaga.courses`.
+- New read-only MCP tool `get_connection_info` — a cheap "am I connected?"
+  check that reports `authenticated`, `demo_mode`, the Moodle `site_url`
+  (base URL only), `site_name`, the authenticated `user_id` and
+  `user_display_name`, the `worsaga_version`, and a `config_source` hint
+  (`env` / `file` / `demo` / `unset`, with the file *path* only, never its
+  contents). It makes at most one `core_webservice_get_site_info` call and
+  returns a structured `{"error", "error_code": "auth" | "network"}` dict on
+  failure. The token never appears in any field. This brings the MCP tool
+  count to 26.
+- Forum-discussion, notification, message, and grade records now carry
+  derived timestamp fields alongside their raw Unix epochs, matching the
+  `due_iso` / `due_str` and `start_iso` / `start_str` fields already on
+  deadlines and calendar events. Forum discussions gain
+  `created_iso` / `created_str` and `modified_iso` / `modified_str`;
+  notifications and messages gain `created_iso` / `created_str`; grade
+  records gain a `graded_at` epoch (from Moodle's `gradedategraded`) plus
+  `graded_iso` / `graded_str`. `*_iso` is UTC ISO-8601; `*_str` is a local
+  display string; both are empty when no timestamp is present. The epoch
+  ints are unchanged.
+- Live progress for the all-course commands. `digest`, `sync`,
+  `assignments`, `updates`, `grades`, and each `watch` cycle now print a
+  one-line `[k/N] label` progress indicator to **stderr** as each course
+  (or forum, assignment, or digest source) completes, so a full-account run
+  no longer looks hung for minutes with no output. `watch` additionally
+  announces `Sync cycle started (N courses)...` at the start of every cycle.
+  Progress is stderr-only (stdout stays a clean data channel), and is
+  suppressed by `-q/--quiet` and in `--json`/`--yaml` machine modes. It is
+  wired through an optional callback on the shared orchestrators, so the MCP
+  server (which shares them over stdio) passes nothing and stays silent.
+
+### Fixed
+
+- CLI `--json`/`--yaml` modes now emit the same structured error dict the
+  MCP tools return when a course argument cannot be resolved, instead of
+  leaving stdout empty. An unknown id or short-code produces
+  `{"error", "error_code": "course_not_found"}` and an ambiguous prefix
+  produces `{"error", "error_code": "course_ambiguous", "candidates":
+  [{id, shortname, fullname}, ...]}` on stdout (exit 1), so machine
+  callers can branch instead of hitting a JSON parse error on empty
+  output. Human mode is unchanged.
+- The `courses` table pads short codes with spaces instead of the old
+  dotted leader (`ECON101_2526........`), which had become misleading now
+  that `...` elsewhere marks a genuinely truncated value; over-long short
+  codes get the same `...` indicator as every other table.
+- Live progress labels are cleaned before display: assignment names are
+  HTML-unescaped (`Group 1 &amp; 2 ...` now shows as `Group 1 & 2 ...`,
+  matching the final table), and `updates` progress lines are prefixed
+  with the course short-code (`STAT120_2526: Announcements`) since most
+  Moodle forums share the default name "Announcements".
+- The remaining hand-rolled human tables now mark a truncated cell with an
+  ASCII `...` indicator instead of a silent hard slice, via the shared
+  `truncate_cell` helper. The `grades`, `assignments`, `forums`,
+  `forum latest`, `updates`, `notifications`, and `inbox` tables were
+  cutting long values with no sign they had been cut (for example the
+  notifications "Sender" column showed `Worsaga Demo Univers`); a cut value
+  now reads `Worsaga Demo Univ...`. Column widths are unchanged.
+- `worsaga setup` no longer crashes with a raw `EOFError` traceback when
+  stdin is not an interactive terminal. It now detects a non-TTY stdin up
+  front and exits cleanly (exit 1) with guidance toward the
+  non-interactive alternatives (`--url`/`--token`, the `WORSAGA_URL` /
+  `WORSAGA_TOKEN` / `WORSAGA_USERID` environment variables, or a
+  `WORSAGA_CREDS_PATH` JSON file). A mid-prompt end-of-input or `Ctrl-C`
+  is likewise caught and reported on one line (`Ctrl-C` exits 130). The
+  existing config file is never written on any abort path.
+- A week query that matches no section is now an explicit failure instead
+  of silently fabricating output. Previously `study-pack` / `summary` (and
+  the MCP `get_weekly_summary` / `export_study_pack`) would invent a
+  plausible pack or summary — a titled document with fallback boilerplate —
+  for a nonsense week such as `zzz_nonsense`. They now report
+  `no section matching week '<week>' in course <id/shortname>` on stderr
+  (exit 1) with the available section names, and the MCP tools return a
+  structured `{"error", "error_code": "week_not_found", "available_sections"}`
+  dict. `get_week_materials` returns the same structured error for an
+  unmatched week rather than an empty list. A week that *does* match a
+  section but has no downloadable materials remains a valid empty state and
+  is unchanged.
+- `find_best_section` no longer loses a name/number match in a
+  materials-free course: a section that matches the week by name but holds
+  no files (and where no other section has files either) is returned as the
+  matched empty section instead of `None`, so `None` now reliably means
+  "no section matched at all".
+- Consistent exit codes for empty weeks between `materials` and `download`.
+  Listing an empty-but-valid week with `materials --week` stays exit 0 (an
+  empty listing is a valid answer) and now states that a section was found
+  but has no downloadable files; `download` on the same week stays exit 1
+  (it could not fetch anything); and a week that matches no section at all
+  is exit 1 for both, with the clear week-not-found message.
+- Domain failures in the MCP server now return an agent-branchable
+  `{"error", "error_code"}` dict instead of raising a bare `isError` string
+  built from raw Moodle DB wording. A bad course id (in
+  `get_course_contents`, `get_grades`, `get_grade_summary`,
+  `get_week_materials`, `search_course_content`, `get_weekly_summary`,
+  `get_calendar_events`, `export_study_pack`, `download_material`,
+  `extract_material`) returns `error_code: "course_not_found"`; an
+  assignment id that is not in the course (`get_assignment_status`) returns
+  `error_code: "assignment_not_found"`. The client raises the new
+  `CourseNotFoundError` / `AssignmentNotFoundError` in place of the raw
+  "Can't find data record in database table course." message, so the CLI
+  also reports a friendly `Course <id> not found (not enrolled or does not
+  exist).` (exit 1). The full `error_code` vocabulary is documented on the
+  MCP server (`ERROR_CODES`).
+- The `extract_material` MCP tool's response is now deterministically
+  bounded to about 130,000 characters. Previously the per-page `text` cap
+  applied to `text` alone while each page also carried a same-size
+  `markdown` field, so a large PDF could return roughly twice the intended
+  size. `markdown` is now omitted by default (the `text` field carries the
+  content; pass `include_markdown=True` for the Markdown view, with the
+  text budget reduced so the combined response stays within the bound). A
+  file too large to fit is truncated with an explicit warning that says how
+  to get the rest. The CLI `extract` command is unchanged.
+- A below-minimum `--interval` is no longer silently overridden. `worsaga
+  watch` (floor 60s) and `worsaga auto-sync install` (floor 5 min)
+  previously clamped a too-small interval up with no indication — a
+  `--interval 30s` watch quietly ran every 60s, and `auto-sync install
+  --interval 30s|45|2m|90s` quietly became every 5 min. Both now print a
+  one-line stderr warning stating the requested and applied values (e.g.
+  `Warning: interval 30s is below the minimum for watch; using 60s.`), and
+  each floor is documented in the command's `--interval` help text. The
+  clamping behaviour itself is unchanged.
+- The `notifications` "Sender" column is no longer always blank.
+  `message_popup_get_popup_notifications` on many Moodle instances returns
+  only a numeric `useridfrom` and no `userfromfullname`, which the sender
+  mapping did not read. It now prefers the sender's full name (including a
+  nested `userfrom` object) and falls back to a `User <id>` label from
+  `useridfrom`/`userfromid` before omitting the sender entirely.
+- Table columns that truncate a long section, module, or file name in the
+  `materials` listing (and any table rendered through the shared
+  `format_table` helper) now show an ASCII `...` indicator on the cut cell,
+  so a truncated name is never mistaken for the whole name. The column
+  widths are unchanged and the indicator is ASCII (never the Unicode
+  ellipsis) so cosmetic output stays cp1252-safe on legacy consoles.
+- `--yaml` output now emits non-ASCII characters literally
+  (`allow_unicode=True`) instead of escaping them as `\uXXXX`, so an en-dash
+  stays an en-dash. This is safe on legacy consoles because stdout/stderr
+  are reconfigured with `errors="replace"`, degrading an unencodable
+  character to a replacement rather than crashing the command.
+
+### Changed
+
+- The per-course / per-forum metadata fan-outs behind `digest`, `sync`,
+  `assignments`, `updates`, and `grades` now run on a small bounded thread
+  pool (default 6 workers, `WORSAGA_CONCURRENCY` to override) instead of one
+  blocking request at a time. On a real multi-course account this turns
+  multi-minute waits into seconds. Results are always reassembled in the
+  original course order and the diff/write phase of `sync` stays
+  single-threaded, so change detection is byte-for-byte identical to the
+  sequential path; per-course permission warnings stay attributed to their
+  own course. The shared read-only client is safe to use across threads (it
+  holds only immutable config and opens a fresh connection per request).
+- The MCP `list_courses` and `get_course_contents` tools now return
+  compact, normalized records through Worsaga's own model layer instead of
+  the raw Moodle payloads. `list_courses` returns `id`, `shortname`,
+  `fullname`, `category`, `start_at`, `end_at` and drops the HTML course
+  `summary`, `enrolledusercount`, and course image. `get_course_contents`
+  returns one record per section (`section_id`, `section_num`,
+  `section_name`, a plain-text `summary` with the section HTML stripped)
+  holding compact module records (`module_id`, `module_name`,
+  `module_type`, `view_url`, and a `files` list of token-free metadata
+  matching `get_week_materials`, including its `dedupe_key`). Both routes
+  pass the token/`file_url` sanitisation boundary.
+
+### Security
+
+- Closed a latent token-leak path in the MCP `get_course_contents` tool. It
+  previously returned the verbatim `core_course_get_contents` payload,
+  which on mobile-service-enabled Moodle instances embeds the webservice
+  token in per-file `fileurl` values. The tool now strips all raw
+  `file_url` values and routes the result through the sanitisation boundary
+  used by the other discovery tools, so no token or authenticated URL can
+  appear in its output.
+
 ## 0.8.1
 
 ### Changed

@@ -126,6 +126,94 @@ class MoodleWriteAttemptError(PermissionError):
     """Raised when code tries to call a non-read-only Moodle function."""
 
 
+class MoodleRequestError(RuntimeError):
+    """A Moodle web-service call returned an ``exception`` payload.
+
+    Carries Moodle's stable ``errorcode`` (localisation-independent)
+    alongside the human message so callers can classify failures without
+    string-matching a translated message. The ``str()`` form keeps the
+    historical ``"Moodle API error: ..."`` wording. Messages never contain
+    tokens (Moodle does not echo the ``wstoken`` in exception payloads).
+    """
+
+    def __init__(self, message: str, *, errorcode: str = ""):
+        super().__init__(message)
+        self.errorcode = errorcode
+
+
+class CourseNotFoundError(RuntimeError):
+    """Raised when a course id is not enrolled or does not exist.
+
+    Subclasses :class:`RuntimeError` so the CLI's top-level handler turns
+    it into a clean ``Error: ...`` exit rather than a traceback, replacing
+    the raw Moodle DB wording ("Can't find data record in database table
+    course."). MCP tools catch it and return a structured
+    ``{"error", "error_code": "course_not_found"}`` dict.
+    """
+
+    def __init__(self, course_id: int | str, message: str | None = None):
+        self.course_id = course_id
+        super().__init__(
+            message
+            or f"Course {course_id} not found (not enrolled or does not exist)."
+        )
+
+
+class AssignmentNotFoundError(ValueError):
+    """Raised when an assignment id does not exist or is not accessible.
+
+    Subclasses :class:`ValueError` (as the historical
+    ``get_assignment_status`` failure did) so existing callers and the
+    CLI's top-level handler are unaffected. MCP tools catch it and return
+    a structured ``{"error", "error_code": "assignment_not_found"}`` dict.
+    """
+
+    def __init__(
+        self,
+        assignment_id: int | str,
+        *,
+        course_id: int | str | None = None,
+        message: str | None = None,
+    ):
+        self.assignment_id = assignment_id
+        self.course_id = course_id
+        if message is None:
+            if course_id is not None:
+                message = (
+                    f"No assignment {assignment_id} found in course {course_id}."
+                )
+            else:
+                message = (
+                    f"Assignment {assignment_id} not found "
+                    "(does not exist or not accessible)."
+                )
+        super().__init__(message)
+
+
+# Moodle "missing record" / invalid-id error signatures. Moodle localises
+# the human message but keeps the errorcode stable, so match on both. These
+# indicate the requested course/assignment/module simply does not exist for
+# this user — distinct from auth failures, which must keep raising.
+_NOT_FOUND_ERRORCODES = frozenset({
+    "invalidrecord", "invalidrecordunknown", "invalidcourseid",
+    "coursedoesnotexist", "invalidcourse", "invalidcoursemodule",
+    "invalidassignment", "notenrolled",
+})
+
+
+def _is_missing_record_error(exc: BaseException) -> bool:
+    """Return True when *exc* is a Moodle "record not found" style failure."""
+    code = str(getattr(exc, "errorcode", "") or "").lower()
+    if code in _NOT_FOUND_ERRORCODES:
+        return True
+    message = str(exc).lower()
+    return (
+        "can't find data record" in message
+        or "cannot find data record" in message
+        or "invalid course id" in message
+    )
+
+
 # Conservative cap on any single file download. Files above this size are
 # skipped with a structured error — never silently truncated.
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -227,7 +315,10 @@ class MoodleClient:
             result = json.load(r)
 
         if isinstance(result, dict) and "exception" in result:
-            raise RuntimeError(f"Moodle API error: {result.get('message', result)}")
+            raise MoodleRequestError(
+                f"Moodle API error: {result.get('message', result)}",
+                errorcode=str(result.get("errorcode") or ""),
+            )
 
         return result
 
@@ -253,16 +344,37 @@ class MoodleClient:
         return self.call("mod_assign_get_assignments", **params)
 
     def get_assignment_submission_status(self, assignment_id: int) -> dict:
-        """Return submission status for one assignment."""
-        return self.call("mod_assign_get_submission_status", assignid=assignment_id)
+        """Return submission status for one assignment.
+
+        Raises :class:`AssignmentNotFoundError` when Moodle reports the
+        assignment id does not exist, so callers get a friendly,
+        classifiable failure instead of raw DB wording.
+        """
+        try:
+            return self.call(
+                "mod_assign_get_submission_status", assignid=assignment_id,
+            )
+        except MoodleRequestError as exc:
+            if _is_missing_record_error(exc):
+                raise AssignmentNotFoundError(assignment_id) from None
+            raise
 
     def get_user_grade_items(self, course_id: int, user_id: int | None = None) -> dict:
-        """Return gradebook items for a course and user."""
-        return self.call(
-            "gradereport_user_get_grade_items",
-            courseid=course_id,
-            userid=self.userid if user_id is None else user_id,
-        )
+        """Return gradebook items for a course and user.
+
+        Raises :class:`CourseNotFoundError` when Moodle reports the course
+        id does not exist for this user.
+        """
+        try:
+            return self.call(
+                "gradereport_user_get_grade_items",
+                courseid=course_id,
+                userid=self.userid if user_id is None else user_id,
+            )
+        except MoodleRequestError as exc:
+            if _is_missing_record_error(exc):
+                raise CourseNotFoundError(course_id) from None
+            raise
 
     def get_course_grades(
         self,
@@ -284,8 +396,18 @@ class MoodleClient:
         return self.call("mod_quiz_get_quizzes_by_courses", **params)
 
     def get_course_contents(self, course_id: int) -> list[dict]:
-        """Return all sections (with modules) for a course."""
-        return self.call("core_course_get_contents", courseid=course_id)
+        """Return all sections (with modules) for a course.
+
+        Raises :class:`CourseNotFoundError` when Moodle reports the course
+        id does not exist or the user is not enrolled, so callers get a
+        friendly, classifiable failure instead of raw DB wording.
+        """
+        try:
+            return self.call("core_course_get_contents", courseid=course_id)
+        except MoodleRequestError as exc:
+            if _is_missing_record_error(exc):
+                raise CourseNotFoundError(course_id) from None
+            raise
 
     def get_forums_by_courses(self, course_ids: list[int]) -> dict:
         """Return forums for the given courses."""

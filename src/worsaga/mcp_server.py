@@ -29,28 +29,50 @@ Exposes tools:
     - search_text
     - export_study_pack
     - get_autosync_status
+    - get_connection_info
 
 Requires the ``mcp`` extra: pip install worsaga[mcp]
 
 Demo mode: run with ``WORSAGA_DEMO=1`` to serve built-in fake course
 data without Moodle credentials or network access.
+
+Structured domain errors
+-------------------------
+Tools return an agent-branchable ``{"error", "error_code", ...}`` dict for
+expected domain failures rather than raising (which FastMCP would surface
+as an ``isError`` string built from raw Moodle DB wording). The
+``error_code`` values form a small, stable vocabulary — see
+:data:`ERROR_CODES`. Genuinely unexpected failures still raise.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from worsaga.assignments import get_assignment_status as _get_assignment_status
 from worsaga.assignments import get_assignments as _get_assignments
+from worsaga.cache import sanitize_payload
 from worsaga.calendar import get_calendar_events as _get_calendar_events
 from pathlib import Path
 
-from worsaga.client import DownloadError, MoodleClient
+from worsaga.client import (
+    AssignmentNotFoundError,
+    CourseNotFoundError,
+    DownloadError,
+    MoodleClient,
+)
 from worsaga.config import MoodleConfig, default_downloads_dir
+from worsaga.courses import (
+    CourseAmbiguousError,
+    CourseResolutionError,
+    resolve_course_id,
+)
 from worsaga.deadlines import get_upcoming_deadlines
 from worsaga.demo import DemoMoodleClient, demo_mode_enabled
+from worsaga.doctor import ConnectionCheckError, build_connection_info
 from worsaga.digest import get_digest as _get_digest
 from worsaga.forums import get_course_forums as _get_course_forums
 from worsaga.forums import get_forum_discussions as _get_forum_discussions
@@ -60,13 +82,21 @@ from worsaga.grades import get_grades as _get_grades
 from worsaga.extraction import MAX_TEXT_PER_FILE
 from worsaga.materials import (
     MaterialSelectionError,
+    build_course_contents,
     candidate_summary,
     download_material as _download_material,
     extract_material_content as _extract_material_content,
     get_section_materials,
     search_course_content as _search_content,
+    sections_matching_week,
     select_material as _select_material,
     strip_file_urls,
+)
+from worsaga.models import as_int, course_record
+from worsaga.sections import (
+    WeekNotFoundError,
+    section_names,
+    week_not_found_message,
 )
 from worsaga.autosync import autosync_status as _autosync_status
 from worsaga.studypack import build_study_pack as _build_study_pack
@@ -105,10 +135,98 @@ def _get_client() -> MoodleClient:
     return _client
 
 
+# The complete, stable vocabulary of ``error_code`` values a tool may return
+# in a structured ``{"error", "error_code"}`` dict. Documented here so agents
+# can branch on a small closed set. The download/extraction codes come from
+# :class:`worsaga.client.DownloadError` and are surfaced verbatim.
+ERROR_CODES = (
+    "course_not_found",     # course id/name not enrolled or does not exist
+    "course_ambiguous",     # course name/prefix matched more than one course
+    "assignment_not_found",  # assignment id does not exist / not accessible
+    "week_not_found",       # week query matched no section
+    "invalid_output_dir",   # output_dir escaped the downloads directory
+    "index_unavailable",    # local search index could not be opened
+    # DownloadError.code values (download_material / extract_material) and
+    # get_connection_info auth/network failures:
+    "auth", "not_found", "network", "oversize", "invalid_url", "empty",
+)
+
+# Deterministic upper bound on the serialized ``extract_material`` response.
+# The per-page ``text`` cap alone did not bound the response, because each
+# page also carries a same-size ``markdown`` field — a 150-page PDF could
+# reach ~240k chars. This caps the whole payload.
+MAX_EXTRACT_RESPONSE_CHARS = 130_000
+
+
+def _course_not_found(exc: CourseNotFoundError) -> dict[str, Any]:
+    """Return the structured error dict for a missing course."""
+    return {"error": str(exc), "error_code": "course_not_found"}
+
+
+def _assignment_not_found(exc: AssignmentNotFoundError) -> dict[str, Any]:
+    """Return the structured error dict for a missing assignment."""
+    return {"error": str(exc), "error_code": "assignment_not_found"}
+
+
+def _course_ambiguous(exc: CourseAmbiguousError) -> dict[str, Any]:
+    """Return the structured error dict for an ambiguous course-name prefix.
+
+    Mirrors ``download_material``'s candidate precedent: the ``candidates``
+    list lets the agent pick the intended course by ``id`` or exact
+    ``shortname`` without a separate ``list_courses`` round-trip.
+    """
+    return {
+        "error": str(exc),
+        "error_code": "course_ambiguous",
+        "candidates": [
+            {
+                "id": as_int(course.get("id"), 0),
+                "shortname": str(course.get("shortname") or ""),
+                "fullname": str(course.get("fullname") or ""),
+            }
+            for course in exc.candidates
+        ],
+    }
+
+
+def _resolve_course_arg(
+    client: MoodleClient, course_id: int | str | None,
+) -> tuple[int | None, dict[str, Any] | None]:
+    """Resolve an MCP ``course_id`` argument to an int id or a structured error.
+
+    Accepts what every course-taking tool now accepts: ``None`` (all
+    enrolled courses, where the tool supports it), an ``int`` or digit
+    string (used directly, no lookup), or a course short-code — an exact
+    case-insensitive match or an unambiguous prefix, resolved against the
+    enrolled courses via :func:`worsaga.courses.resolve_course_id`.
+
+    Returns ``(resolved_id, None)`` on success, or ``(None, error_dict)``
+    where the error dict carries ``error_code`` ``"course_not_found"`` (no
+    match) or ``"course_ambiguous"`` (a prefix matched several courses,
+    with a ``candidates`` list).
+    """
+    if course_id is None:
+        return None, None
+    try:
+        return resolve_course_id(client, course_id), None
+    except CourseAmbiguousError as exc:
+        return None, _course_ambiguous(exc)
+    except CourseResolutionError as exc:
+        return None, {"error": str(exc), "error_code": "course_not_found"}
+
+
 @mcp.tool()
 def list_courses() -> list[dict[str, Any]]:
-    """List all Moodle courses the authenticated user is enrolled in."""
-    return _get_client().get_courses()
+    """List all Moodle courses the authenticated user is enrolled in.
+
+    Returns one compact record per course — ``id``, ``shortname``,
+    ``fullname``, ``category``, ``start_at``, ``end_at`` — normalized
+    through Worsaga's record layer. The bulky, agent-irrelevant fields the
+    raw Moodle payload carries (HTML course ``summary``, the course image,
+    ``enrolledusercount``, progress) are dropped; no HTML and no
+    token-bearing URLs appear in the response.
+    """
+    return [course_record(course) for course in _get_client().get_courses()]
 
 
 @mcp.tool()
@@ -124,61 +242,158 @@ def get_deadlines(lookahead_days: int = 14) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def get_grades(course_id: int | None = None) -> list[dict[str, Any]]:
-    """Return normalized grade items for one course or all enrolled courses."""
-    return _get_grades(_get_client(), course_id=course_id)
+def get_grades(
+    course_id: int | str | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Return normalized grade items for one course or all enrolled courses.
+
+    *course_id* accepts a numeric id **or** a course short-code such as
+    ``"ECON101"`` (case-insensitive; an unambiguous prefix like ``"ECON"``
+    also resolves) — omit it for all courses. An unknown name returns a
+    structured ``{"error", "error_code": "course_not_found"}`` dict; an
+    ambiguous prefix returns ``{"error", "error_code": "course_ambiguous",
+    "candidates"}`` so you can pick the intended course.
+
+    An empty list can mean either "no grade items" or "gradebook access
+    denied" for some enrollments (common for non-academic containers) —
+    per-course access warnings are not part of this list; call
+    ``get_grade_summary()`` to see them alongside the status counts.
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    try:
+        return _get_grades(client, course_id=resolved)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
 
 
 @mcp.tool()
-def get_grade_summary(course_id: int | None = None) -> dict[str, Any]:
-    """Return aggregate grade status counts for one course or all courses."""
-    return _get_grade_summary(_get_client(), course_id=course_id)
+def get_grade_summary(course_id: int | str | None = None) -> dict[str, Any]:
+    """Return aggregate grade status counts for one course or all courses.
+
+    *course_id* accepts a numeric id or a course short-code (exact or an
+    unambiguous prefix); omit it for all courses. An unknown name returns
+    ``{"error", "error_code": "course_not_found"}``; an ambiguous prefix
+    returns ``{"error", "error_code": "course_ambiguous", "candidates"}``.
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    try:
+        return _get_grade_summary(client, course_id=resolved)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
 
 
 @mcp.tool()
-def get_assignments(course_id: int | None = None) -> list[dict[str, Any]]:
-    """Return normalized assignment statuses for one course or all courses."""
-    return _get_assignments(_get_client(), course_id=course_id)
+def get_assignments(
+    course_id: int | str | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Return normalized assignment statuses for one course or all courses.
+
+    *course_id* accepts a numeric id or a course short-code (exact or an
+    unambiguous prefix); omit it for all courses. An unknown name returns
+    ``{"error", "error_code": "course_not_found"}``; an ambiguous prefix
+    returns ``{"error", "error_code": "course_ambiguous", "candidates"}``.
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    return _get_assignments(client, course_id=resolved)
 
 
 @mcp.tool()
-def get_assignment_status(course_id: int, assignment_id: int) -> dict[str, Any]:
-    """Return one normalized assignment status record."""
-    return _get_assignment_status(
-        _get_client(),
-        course_id=course_id,
-        assignment_id=assignment_id,
-    )
+def get_assignment_status(
+    course_id: int | str, assignment_id: int,
+) -> dict[str, Any]:
+    """Return one normalized assignment status record.
+
+    *course_id* accepts a numeric id or a course short-code (exact or an
+    unambiguous prefix). Returns a structured ``{"error", "error_code"}``
+    dict when the course name is ambiguous (``course_ambiguous``), the
+    course is not found (``course_not_found``), or the assignment id is not
+    in the course (``assignment_not_found``).
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    try:
+        return _get_assignment_status(
+            client,
+            course_id=resolved,
+            assignment_id=assignment_id,
+        )
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
+    except AssignmentNotFoundError as exc:
+        return _assignment_not_found(exc)
 
 
 @mcp.tool()
-def get_course_forums(course_id: int) -> list[dict[str, Any]]:
-    """Return forum containers for a course."""
-    return _get_course_forums(_get_client(), course_id=course_id)
+def get_course_forums(
+    course_id: int | str,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Return forum containers for a course.
+
+    *course_id* accepts a numeric id or a course short-code (exact or an
+    unambiguous prefix). An unknown name returns ``{"error", "error_code":
+    "course_not_found"}``; an ambiguous prefix returns ``{"error",
+    "error_code": "course_ambiguous", "candidates"}``.
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    return _get_course_forums(client, course_id=resolved)
 
 
 @mcp.tool()
 def get_forum_discussions(
-    course_id: int,
+    course_id: int | str,
     forum_id: int | None = None,
-) -> list[dict[str, Any]]:
-    """Return forum discussions for one forum or all forums in a course."""
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Return forum discussions for one forum or all forums in a course.
+
+    *course_id* accepts a numeric id or a course short-code (exact or an
+    unambiguous prefix). An unknown name returns ``{"error", "error_code":
+    "course_not_found"}``; an ambiguous prefix returns ``{"error",
+    "error_code": "course_ambiguous", "candidates"}``.
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
     return _get_forum_discussions(
-        _get_client(),
-        course_id=course_id,
+        client,
+        course_id=resolved,
         forum_id=forum_id,
     )
 
 
 @mcp.tool()
 def get_latest_updates(
-    course_id: int | None = None,
+    course_id: int | str | None = None,
     since_days: int = 7,
-) -> list[dict[str, Any]]:
-    """Return recent forum updates."""
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Return recent forum updates.
+
+    *course_id* accepts a numeric id or a course short-code (exact or an
+    unambiguous prefix); omit it for all courses. An unknown name returns
+    ``{"error", "error_code": "course_not_found"}``; an ambiguous prefix
+    returns ``{"error", "error_code": "course_ambiguous", "candidates"}``.
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
     return _get_latest_updates(
-        _get_client(),
-        course_id=course_id,
+        client,
+        course_id=resolved,
         since_days=since_days,
     )
 
@@ -203,33 +418,79 @@ def get_digest(since_days: int = 1) -> dict[str, Any]:
 
 @mcp.tool()
 def get_calendar_events(
-    course_id: int | None = None,
+    course_id: int | str | None = None,
     days: int = 30,
     week: str | None = None,
-) -> list[dict[str, Any]]:
-    """Return calendar events for one course or all courses, optionally by week."""
-    return _get_calendar_events(
-        _get_client(),
-        course_id=course_id,
-        days=days,
-        week=week,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Return calendar events for one course or all courses, optionally by week.
+
+    *course_id* accepts a numeric id or a course short-code (exact or an
+    unambiguous prefix); omit it for all courses. An unknown name returns
+    ``{"error", "error_code": "course_not_found"}``; an ambiguous prefix
+    returns ``{"error", "error_code": "course_ambiguous", "candidates"}``.
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    try:
+        return _get_calendar_events(
+            client,
+            course_id=resolved,
+            days=days,
+            week=week,
+        )
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
+
+
+@mcp.tool()
+def get_course_contents(
+    course_id: int | str,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Return a compact, sanitized map of a course's sections and modules.
+
+    One record per section — ``section_id``, ``section_num``,
+    ``section_name``, a plain-text ``summary`` (section HTML stripped), and
+    ``modules`` — where each module carries ``module_id``, ``module_name``,
+    ``module_type``, a human ``view_url``, and (for file resources) a
+    ``files`` list of token-free metadata (``file_name``, ``file_size``,
+    ``mime_type``, ``time_modified``, ``dedupe_key``). This replaces the
+    verbatim Moodle payload, which is far larger (inline-styled HTML
+    summaries and per-file authenticated URLs).
+
+    Raw ``file_url`` values are never included — to fetch a file, pass the
+    course and week to ``download_material()`` (the ``dedupe_key`` here
+    matches ``get_week_materials``). An unknown course name returns
+    ``{"error", "error_code": "course_not_found"}``; an ambiguous prefix
+    returns ``{"error", "error_code": "course_ambiguous", "candidates"}``.
+
+    Parameters
+    ----------
+    course_id : int | str
+        The Moodle course ID, or a course short-code (exact match or an
+        unambiguous prefix, e.g. ``"ECON101"``).
+    """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    try:
+        sections = client.get_course_contents(resolved)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
+    # sanitize_payload is a belt-and-braces pass over the compact shape:
+    # even though build_course_contents omits file_url, this guarantees no
+    # token-bearing key or value can survive to the response.
+    return sanitize_payload(
+        build_course_contents(sections, resolved, base_url=client.base_url)
     )
 
 
 @mcp.tool()
-def get_course_contents(course_id: int) -> list[dict[str, Any]]:
-    """Return all sections and modules for a specific course.
-
-    Parameters
-    ----------
-    course_id : int
-        The Moodle course ID.
-    """
-    return _get_client().get_course_contents(course_id)
-
-
-@mcp.tool()
-def get_week_materials(course_id: int, week: str) -> list[dict[str, Any]]:
+def get_week_materials(
+    course_id: int | str, week: str,
+) -> list[dict[str, Any]] | dict[str, Any]:
     """List downloadable materials for a specific teaching week (discovery only).
 
     Returns metadata about available files — file names, sizes, types, and
@@ -240,41 +501,76 @@ def get_week_materials(course_id: int, week: str) -> list[dict[str, Any]]:
     Raw Moodle ``file_url`` values are not included; downloads always go
     through ``download_material()``, which authenticates internally.
 
+    If *week* matches no section at all, returns a structured error dict
+    (``error``, ``error_code="week_not_found"``, ``available_sections``)
+    instead of a silently empty list. A section that matches but has no
+    downloadable files is a valid empty state and returns ``[]``.
+
     Parameters
     ----------
-    course_id : int
-        The Moodle course ID.
+    course_id : int | str
+        The Moodle course ID, or a course short-code (exact match or an
+        unambiguous prefix, e.g. ``"ECON101"``).
     week : str
         Week number (e.g. "1") or a substring to match against section names
         (e.g. "Revision"). Numeric matching is based on explicit week-like
         labels in section names, not Moodle's raw section slot number.
+
+    An unknown course name returns ``{"error", "error_code":
+    "course_not_found"}``; an ambiguous prefix returns ``{"error",
+    "error_code": "course_ambiguous", "candidates"}``.
     """
     client = _get_client()
-    sections = client.get_course_contents(course_id)
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    try:
+        sections = client.get_course_contents(resolved)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
+    if not sections_matching_week(sections, week):
+        return {
+            "error": week_not_found_message(week, resolved),
+            "error_code": "week_not_found",
+            "available_sections": section_names(sections),
+        }
     return strip_file_urls(
-        get_section_materials(sections, course_id, week, base_url=client.base_url)
+        get_section_materials(sections, resolved, week, base_url=client.base_url)
     )
 
 
 @mcp.tool()
-def search_course_content(course_id: int, query: str) -> list[dict[str, Any]]:
+def search_course_content(
+    course_id: int | str, query: str,
+) -> list[dict[str, Any]] | dict[str, Any]:
     """Search section and module names within a course.
 
     Useful for finding where a topic lives without knowing the week number.
+    An unknown course name returns ``{"error", "error_code":
+    "course_not_found"}``; an ambiguous prefix returns ``{"error",
+    "error_code": "course_ambiguous", "candidates"}``.
 
     Parameters
     ----------
-    course_id : int
-        The Moodle course ID.
+    course_id : int | str
+        The Moodle course ID, or a course short-code (exact match or an
+        unambiguous prefix, e.g. ``"ECON101"``).
     query : str
         Case-insensitive search term to match against section and module names.
     """
-    sections = _get_client().get_course_contents(course_id)
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    try:
+        sections = client.get_course_contents(resolved)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
     return _search_content(sections, query)
 
 
 @mcp.tool()
-def get_weekly_summary(course_id: int, week: str) -> dict[str, Any]:
+def get_weekly_summary(course_id: int | str, week: str) -> dict[str, Any]:
     """Generate a study summary for a specific teaching week of a course.
 
     Finds the best matching section, extracts text from downloadable
@@ -284,20 +580,42 @@ def get_weekly_summary(course_id: int, week: str) -> dict[str, Any]:
 
     Parameters
     ----------
-    course_id : int
-        The Moodle course ID.
+    course_id : int | str
+        The Moodle course ID, or a course short-code (exact match or an
+        unambiguous prefix, e.g. ``"ECON101"``).
     week : str
         Teaching week number or name query, such as "3", "revision", or
         "reading".
+
+    An unknown course name returns ``{"error", "error_code":
+    "course_not_found"}`` and an ambiguous prefix returns ``{"error",
+    "error_code": "course_ambiguous", "candidates"}``. If *week* matches no
+    section at all, returns a structured error dict (``error``,
+    ``error_code="week_not_found"``, ``available_sections``) instead of
+    fabricating fallback notes. A section that matches but has no materials
+    is a valid empty state and returns normal fallback notes.
     """
-    result = build_weekly_summary(_get_client(), course_id, week)
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    try:
+        result = build_weekly_summary(client, resolved, week)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
+    except WeekNotFoundError as exc:
+        return {
+            "error": str(exc),
+            "error_code": "week_not_found",
+            "available_sections": exc.available_sections,
+        }
     result["formatted"] = format_bullets(result["bullets"])
     return result
 
 
 @mcp.tool()
 def download_material(
-    course_id: int,
+    course_id: int | str,
     week: str,
     match: str = "",
     index: int = -1,
@@ -319,8 +637,11 @@ def download_material(
 
     Parameters
     ----------
-    course_id : int
-        The Moodle course ID.
+    course_id : int | str
+        The Moodle course ID, or a course short-code (exact match or an
+        unambiguous prefix, e.g. ``"ECON101"``). An unknown name returns
+        ``course_not_found``; an ambiguous prefix returns
+        ``course_ambiguous`` with a ``candidates`` list.
     week : str
         Week number (e.g. "3") or section name substring.
     match : str
@@ -348,7 +669,10 @@ def download_material(
         dest_dir = downloads_root
 
     client = _get_client()
-    chosen = _select_week_material(client, course_id, week, match, index)
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    chosen = _select_week_material(client, resolved, week, match, index)
     if "error" in chosen:
         return chosen
 
@@ -372,10 +696,14 @@ def _select_week_material(
     """Discover materials for *week* and select exactly one.
 
     Returns the chosen material record, or a structured error dict
-    (with a ``candidates`` list where applicable) that the calling tool
-    passes straight back to the agent.
+    (``course_not_found``, or a selection error with a ``candidates`` list
+    where applicable) that the calling tool passes straight back to the
+    agent.
     """
-    sections = client.get_course_contents(course_id)
+    try:
+        sections = client.get_course_contents(course_id)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
     materials = get_section_materials(
         sections, course_id, week, base_url=client.base_url,
     )
@@ -405,32 +733,47 @@ def _select_week_material(
 
 @mcp.tool()
 def extract_material(
-    course_id: int,
+    course_id: int | str,
     week: str,
     match: str = "",
     index: int = -1,
     max_chars: int = 0,
     clean: bool = True,
+    include_markdown: bool = False,
 ) -> dict[str, Any]:
     """Extract per-page structured text from a material (in memory).
 
     Fetches the file with authenticated credentials and returns its
     text page by page (slide by slide for PPTX) — each page carries
-    ``text``, ``markdown``, ``image_count``, ``has_low_text_density``,
-    and ``warnings``. Nothing is written to disk; use
-    ``download_material()`` when you need the file itself.
+    ``text``, ``image_count``, ``has_low_text_density``, and
+    ``warnings``. Nothing is written to disk; use ``download_material()``
+    when you need the file itself.
+
+    The whole response is deterministically bounded to about
+    130,000 characters. To achieve that without discarding content, the
+    per-page ``markdown`` rendering (which duplicates ``text``) is omitted
+    by default — the ``text`` field carries the full content. Pass
+    ``include_markdown=True`` for the light Markdown view; the text budget
+    is reduced accordingly so the combined response stays within the
+    bound. If a file is too large to fit, trailing pages are truncated and
+    an explicit ``warnings`` entry says so and how to get the rest
+    (re-extract a specific page, or narrow with ``match``/``index``).
 
     Light cleaning is applied by default and preserves educational
     content — figure captions, learning objectives, references. Pages
     dominated by images are flagged rather than silently empty.
 
     If multiple materials match, returns a structured error with a
-    candidate list so the caller can refine with *match* or *index*.
+    candidate list so the caller can refine with *match* or *index*. An
+    unknown course name returns ``{"error", "error_code":
+    "course_not_found"}``; an ambiguous prefix returns ``{"error",
+    "error_code": "course_ambiguous", "candidates"}``.
 
     Parameters
     ----------
-    course_id : int
-        The Moodle course ID.
+    course_id : int | str
+        The Moodle course ID, or a course short-code (exact match or an
+        unambiguous prefix, e.g. ``"ECON101"``).
     week : str
         Week number (e.g. "3") or section name substring.
     match : str
@@ -438,26 +781,96 @@ def extract_material(
     index : int
         Zero-based index to pick from matching materials (-1 = auto).
     max_chars : int
-        Cap on total extracted text across pages (0 = default cap).
+        Cap on total extracted text across pages (0 = default cap). Values
+        above the default per-file cap are clamped to keep the response
+        bounded.
     clean : bool
         Strip boilerplate lines (page numbers, copyright footers,
         repeated headers). Set False for the raw extractor output.
+    include_markdown : bool
+        Also return the per-page ``markdown`` rendering (default False).
     """
     client = _get_client()
-    chosen = _select_week_material(client, course_id, week, match, index)
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
+    chosen = _select_week_material(client, resolved, week, match, index)
     if "error" in chosen:
         return chosen
 
+    requested = max_chars if max_chars > 0 else MAX_TEXT_PER_FILE
+    # The MCP response is bounded, so never extract more text than the
+    # per-file cap regardless of the requested value. When markdown is
+    # also returned it roughly doubles the size, so halve the text budget.
+    budget = min(requested, MAX_TEXT_PER_FILE)
+    if include_markdown:
+        budget = min(budget, MAX_EXTRACT_RESPONSE_CHARS // 2)
+
     try:
-        return _extract_material_content(
-            client, chosen,
-            max_chars=max_chars if max_chars > 0 else MAX_TEXT_PER_FILE,
-            clean=clean,
+        result = _extract_material_content(
+            client, chosen, max_chars=budget, clean=clean,
         )
     except DownloadError as exc:
         return {"error": str(exc), "error_code": exc.code}
     except RuntimeError as exc:
         return {"error": str(exc)}
+
+    return _bound_extract_response(result, include_markdown=include_markdown)
+
+
+def _bound_extract_response(
+    result: dict[str, Any], *, include_markdown: bool,
+) -> dict[str, Any]:
+    """Shape and hard-cap an ``extract_material`` result for MCP.
+
+    Drops the per-page ``markdown`` field unless the caller opted in, then
+    enforces :data:`MAX_EXTRACT_RESPONSE_CHARS` on the serialized payload:
+    markdown on trailing pages is dropped first, then trailing page text is
+    truncated, and an explicit truncation warning is appended. The result
+    is deterministic — the same input always yields the same bounded
+    output.
+    """
+    pages = result.get("pages", [])
+    if not include_markdown:
+        for page in pages:
+            page.pop("markdown", None)
+
+    def _size() -> int:
+        return len(json.dumps(result, default=str))
+
+    if _size() <= MAX_EXTRACT_RESPONSE_CHARS:
+        return result
+
+    truncated = False
+    # Markdown duplicates text; shed it from the tail first.
+    for page in reversed(pages):
+        if _size() <= MAX_EXTRACT_RESPONSE_CHARS:
+            break
+        if page.get("markdown"):
+            page["markdown"] = ""
+            truncated = True
+    # Still over budget: truncate trailing page text.
+    idx = len(pages) - 1
+    while idx >= 0 and _size() > MAX_EXTRACT_RESPONSE_CHARS:
+        page = pages[idx]
+        text = page.get("text", "")
+        if len(text) > 200:
+            page["text"] = text[: len(text) // 2]
+            truncated = True
+        else:
+            page["text"] = ""
+            if "markdown" in page:
+                page["markdown"] = ""
+            idx -= 1
+            truncated = True
+
+    if truncated:
+        result.setdefault("warnings", []).append(
+            "Response truncated to stay within the "
+            f"~{MAX_EXTRACT_RESPONSE_CHARS}-character MCP limit; re-extract a "
+            "specific page, or narrow with match/index, for the full text."
+        )
+    return result
 
 
 @mcp.tool()
@@ -516,7 +929,7 @@ def get_changes(
 
 @mcp.tool()
 def build_search_index(
-    course_id: int = 0,
+    course_id: int | str = 0,
     week: str = "",
     max_files: int = INDEX_MAX_FILES_PER_RUN,
 ) -> dict[str, Any]:
@@ -534,18 +947,25 @@ def build_search_index(
 
     Parameters
     ----------
-    course_id : int
-        Limit indexing to one course (0 = all enrolled courses).
+    course_id : int | str
+        Limit indexing to one course — a numeric id or a course short-code
+        (exact match or an unambiguous prefix); ``0`` = all enrolled
+        courses. An unknown name returns ``course_not_found``; an ambiguous
+        prefix returns ``course_ambiguous`` with a ``candidates`` list.
     week : str
         Only index sections matching this week number or name
         (empty = the whole course).
     max_files : int
         Cap on files fetched this run (default 100).
     """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
     try:
         return _build_text_index(
-            _get_client(),
-            course_id=course_id or None,
+            client,
+            course_id=resolved or None,
             week=week or None,
             max_files=max_files,
         )
@@ -558,7 +978,7 @@ def build_search_index(
 @mcp.tool()
 def search_text(
     query: str,
-    course_id: int = 0,
+    course_id: int | str = 0,
     limit: int = 20,
 ) -> dict[str, Any]:
     """Full-text search over indexed material text (no network).
@@ -574,16 +994,23 @@ def search_text(
     ----------
     query : str
         Search terms; all terms must match (AND).
-    course_id : int
-        Limit hits to one course (0 = all courses).
+    course_id : int | str
+        Limit hits to one course — a numeric id or a course short-code
+        (exact match or an unambiguous prefix); ``0`` = all courses. An
+        unknown name returns ``course_not_found``; an ambiguous prefix
+        returns ``course_ambiguous`` with a ``candidates`` list.
     limit : int
         Maximum hits to return (default 20).
     """
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
     try:
         return _search_text_index(
-            _get_client().base_url,
+            client.base_url,
             query,
-            course_id=course_id or None,
+            course_id=resolved or None,
             limit=limit,
         )
     except TextIndexError as exc:
@@ -592,7 +1019,7 @@ def search_text(
 
 @mcp.tool()
 def export_study_pack(
-    course_id: int,
+    course_id: int | str,
     week: str,
     output_dir: str = "",
     include_markdown: bool = False,
@@ -610,8 +1037,11 @@ def export_study_pack(
 
     Parameters
     ----------
-    course_id : int
-        The Moodle course ID.
+    course_id : int | str
+        The Moodle course ID, or a course short-code (exact match or an
+        unambiguous prefix, e.g. ``"ECON101"``). An unknown name returns
+        ``course_not_found``; an ambiguous prefix returns
+        ``course_ambiguous`` with a ``candidates`` list.
     week : str
         Week number (e.g. "3") or section name query.
     output_dir : str
@@ -620,6 +1050,11 @@ def export_study_pack(
         rejected.
     include_markdown : bool
         Also return the full Markdown content inline (default False).
+
+    If *week* matches no section at all, returns a structured error dict
+    (``error``, ``error_code="week_not_found"``, ``available_sections``)
+    instead of writing a fabricated pack. A section that matches but has
+    no materials is a valid empty state and produces a coherent pack.
     """
     downloads_root = default_downloads_dir()
     if output_dir:
@@ -636,8 +1071,20 @@ def export_study_pack(
     else:
         dest_dir = downloads_root
 
+    client = _get_client()
+    resolved, error = _resolve_course_arg(client, course_id)
+    if error is not None:
+        return error
     try:
-        result = _build_study_pack(_get_client(), course_id, week)
+        result = _build_study_pack(client, resolved, week)
+    except CourseNotFoundError as exc:
+        return _course_not_found(exc)
+    except WeekNotFoundError as exc:
+        return {
+            "error": str(exc),
+            "error_code": "week_not_found",
+            "available_sections": exc.available_sections,
+        }
     except DownloadError as exc:
         return {"error": str(exc), "error_code": exc.code}
     except RuntimeError as exc:
@@ -669,6 +1116,45 @@ def get_autosync_status() -> dict[str, Any]:
     (both support ``--dry-run``).
     """
     return _autosync_status()
+
+
+@mcp.tool()
+def get_connection_info() -> dict[str, Any]:
+    """Report authentication and site identity without fetching any data.
+
+    A cheap, read-only "am I connected?" check: it makes at most one Moodle
+    web-service call (``core_webservice_get_site_info``) and returns
+
+    - ``authenticated`` — ``True`` when the site answered;
+    - ``demo_mode`` — ``True`` when serving the offline demo dataset;
+    - ``site_url`` — the Moodle **base** URL only (never the token or any
+      ``/webservice`` path);
+    - ``site_name`` — the site's display name;
+    - ``user_id`` and ``user_display_name`` — the authenticated user;
+    - ``worsaga_version`` — the running Worsaga version;
+    - ``config_source`` — where credentials came from: ``"env"``,
+      ``"file"``, ``"demo"``, or ``"unset"``;
+    - ``config_path`` — for a file-backed config, the file *path* only
+      (never its contents); ``None`` otherwise.
+
+    Use this before other tools to confirm the server is pointed at the
+    right Moodle and account. On an authentication or network failure it
+    returns a structured ``{"error", "error_code"}`` dict with
+    ``error_code`` ``"auth"`` (credentials missing or rejected) or
+    ``"network"`` (the site was unreachable). The token never appears in
+    any field.
+    """
+    demo = demo_mode_enabled()
+    try:
+        client = _get_client()
+        return build_connection_info(client, demo_mode=demo)
+    except ConnectionCheckError as exc:
+        return {"error": str(exc), "error_code": exc.code}
+    except ValueError as exc:
+        # Credentials are not configured (MoodleConfig.load); the server is
+        # importable but cannot authenticate — an auth-state answer, not a
+        # crash. _get_client() does not cache a client on this path.
+        return {"error": str(exc), "error_code": "auth"}
 
 
 def main() -> None:

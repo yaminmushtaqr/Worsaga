@@ -116,9 +116,13 @@ Cache invariants:
 - optional `view_url`
 
 `extract` / `extract_material` return `filename`, `file_type`, `page_count`,
-`pages` (each with `page`, `text`, `markdown`, `image_count`,
-`has_low_text_density`, `warnings`), top-level `warnings`, and the same
-section/module context fields.
+`pages` (each with `page`, `text`, `image_count`, `has_low_text_density`,
+`warnings`), top-level `warnings`, and the same section/module context
+fields. The CLI `extract` also renders a per-page `markdown` field; the MCP
+`extract_material` omits `markdown` by default to keep its response
+deterministically bounded (about 130k chars) and adds it only when called
+with `include_markdown=True`. An oversize file is truncated with an
+explicit warning rather than returning an unbounded payload.
 
 None of these should expose tokens or authenticated URLs.
 

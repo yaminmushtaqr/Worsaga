@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -457,7 +458,9 @@ class TestCommandOutput:
         main(["--json", "grades"])
         output = json.loads(capsys.readouterr().out)
         assert output[0]["item_name"] == "Essay"
-        mock_collect_grades.assert_called_once_with(mock_client_fn.return_value, course_id=None)
+        mock_collect_grades.assert_called_once_with(
+            mock_client_fn.return_value, course_id=None, on_progress=None,
+        )
 
     @patch("worsaga.cli.collect_grades_data")
     @patch("worsaga.cli._client")
@@ -584,6 +587,7 @@ class TestCommandOutput:
             mock_client_fn.return_value,
             course_id=None,
             include_feedback=False,
+            on_progress=None,
         )
 
     @patch("worsaga.cli.get_assignments_data")
@@ -952,11 +956,12 @@ class TestNonInteractiveSetup:
         _, kwargs = mock_write.call_args
         assert kwargs.get("userid", mock_write.call_args[0][2] if len(mock_write.call_args[0]) > 2 else None) == 7
 
+    @patch("worsaga.cli._stdin_is_interactive", return_value=True)
     @patch("getpass.getpass", return_value="tok123")
     @patch("builtins.input", side_effect=["https://m.example.com", ""])
     @patch("worsaga.cli.test_connection")
     @patch("worsaga.cli.MoodleConfig.write_config")
-    def test_setup_interactive_fallback(self, mock_write, mock_test_conn, mock_input, mock_getpass, capsys, tmp_path):
+    def test_setup_interactive_fallback(self, mock_write, mock_test_conn, mock_input, mock_getpass, mock_tty, capsys, tmp_path):
         """setup without --url/--token should still prompt interactively."""
         mock_test_conn.return_value = {"userid": 42}
         mock_write.return_value = tmp_path / "config.json"
@@ -965,6 +970,157 @@ class TestNonInteractiveSetup:
         assert "worsaga setup" in out
         assert mock_input.call_count == 2
         mock_getpass.assert_called_once()
+
+
+class TestSetupNonInteractiveGuard:
+    """Setup must never crash with a raw traceback on a non-TTY stdin."""
+
+    @patch("worsaga.cli.MoodleConfig.write_config")
+    @patch("worsaga.cli._stdin_is_interactive", return_value=False)
+    def test_non_tty_exits_cleanly_with_guidance(
+        self, mock_tty, mock_write, capsys,
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main(["setup"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "not a TTY" in err
+        # Points at every non-interactive alternative the command supports.
+        assert "--url" in err and "--token" in err
+        assert "WORSAGA_URL" in err and "WORSAGA_TOKEN" in err
+        assert "WORSAGA_CREDS_PATH" in err
+        # The existing config file must never be written on this abort path.
+        mock_write.assert_not_called()
+
+    @patch("worsaga.cli.MoodleConfig.write_config")
+    @patch("worsaga.cli.test_connection")
+    @patch("builtins.input", side_effect=EOFError())
+    @patch("worsaga.cli._stdin_is_interactive", return_value=True)
+    def test_eof_mid_prompt_is_clean(
+        self, mock_tty, mock_input, mock_test_conn, mock_write, capsys,
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main(["setup"])
+        assert exc.value.code == 1
+        assert "aborted" in capsys.readouterr().err.lower()
+        mock_test_conn.assert_not_called()
+        mock_write.assert_not_called()
+
+    @patch("worsaga.cli.MoodleConfig.write_config")
+    @patch("worsaga.cli.test_connection")
+    @patch("builtins.input", side_effect=KeyboardInterrupt())
+    @patch("worsaga.cli._stdin_is_interactive", return_value=True)
+    def test_keyboard_interrupt_mid_prompt_is_clean(
+        self, mock_tty, mock_input, mock_test_conn, mock_write, capsys,
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main(["setup"])
+        # Ctrl-C uses the codebase's 130 convention, with a one-line message.
+        assert exc.value.code == 130
+        assert "aborted" in capsys.readouterr().err.lower()
+        mock_write.assert_not_called()
+
+    def test_subprocess_stdin_devnull_no_traceback(self):
+        """End-to-end: `worsaga setup` with closed stdin never traces back."""
+        repo_root = Path(__file__).resolve().parents[1]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(repo_root / "src")
+        # Ensure no ambient credentials divert the interactive fallback.
+        for var in (
+            "WORSAGA_URL", "WORSAGA_TOKEN", "WORSAGA_USERID",
+            "WORSAGA_CREDS_PATH", "WORSAGA_DEMO",
+        ):
+            env.pop(var, None)
+        proc = subprocess.run(
+            [sys.executable, "-m", "worsaga.cli", "setup"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root),
+            env=env,
+            timeout=60,
+        )
+        assert proc.returncode == 1
+        # The essential guarantee: no raw traceback escapes, on any platform.
+        assert "Traceback" not in proc.stderr
+        assert "EOFError" not in proc.stderr
+        # Either the up-front TTY guard fires (POSIX /dev/null) or the
+        # EOF handler catches it (Windows NUL reports isatty() True); both
+        # are clean, and both name the non-interactive alternative.
+        assert "not a TTY" in proc.stderr or "aborted" in proc.stderr.lower()
+        assert "--url" in proc.stderr and "--token" in proc.stderr
+
+
+class TestWeekNotFoundCli:
+    """A week matching no section must fail (exit 1); an empty-but-valid
+    week stays a valid answer. Exercised end-to-end through demo mode."""
+
+    NONSENSE = "zzz_nonsense"
+
+    def test_study_pack_unmatched_week_human(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "study-pack", "ECON101", "--week", self.NONSENSE,
+                  "--stdout"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert f"no section matching week '{self.NONSENSE}'" in err
+        assert "Available sections:" in err
+        assert "Week 3" in err
+
+    def test_study_pack_unmatched_week_json(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "--json", "study-pack", "ECON101",
+                  "--week", self.NONSENSE, "--stdout"])
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error_code"] == "week_not_found"
+        assert self.NONSENSE in payload["error"]
+        assert any("Week 3" in n for n in payload["available_sections"])
+
+    def test_summary_unmatched_week_human(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "summary", "ECON101", "--week", self.NONSENSE])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert f"no section matching week '{self.NONSENSE}'" in err
+
+    def test_summary_unmatched_week_json(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "--json", "summary", "ECON101",
+                  "--week", self.NONSENSE])
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error_code"] == "week_not_found"
+
+    def test_summary_empty_but_valid_week_succeeds(self, capsys):
+        # "revision" matches the empty Revision/Exam section: valid, exit 0.
+        main(["--demo", "summary", "ECON101", "--week", "revision"])
+        out = capsys.readouterr().out
+        assert "Study notes" in out
+
+    def test_materials_unmatched_week_exits_1(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "materials", "ECON101", "--week", self.NONSENSE])
+        assert exc.value.code == 1
+        assert f"no section matching week '{self.NONSENSE}'" in capsys.readouterr().err
+
+    def test_materials_empty_but_valid_week_exits_0(self, capsys):
+        # A matched section with no downloadable files is a valid empty
+        # listing (exit 0), distinguished from week-not-found.
+        main(["--demo", "materials", "ECON101", "--week", "revision"])
+        out = capsys.readouterr().out
+        assert "No materials found" in out
+        assert "section found" in out
+
+    def test_materials_valid_week_lists_files(self, capsys):
+        main(["--demo", "materials", "ECON101", "--week", "3"])
+        assert ".pdf" in capsys.readouterr().out
+
+    def test_download_unmatched_week_exits_1(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "download", "ECON101", "--week", self.NONSENSE])
+        assert exc.value.code == 1
+        assert f"no section matching week '{self.NONSENSE}'" in capsys.readouterr().err
 
 
 class TestErrorHandling:
@@ -1052,22 +1208,24 @@ class TestSetupMessaging:
         out = capsys.readouterr().out
         assert "Permissions set to owner-only (600)." in out
 
+    @patch("worsaga.cli._stdin_is_interactive", return_value=True)
     @patch("getpass.getpass", return_value="tok123")
     @patch("builtins.input", side_effect=["https://m.example.com", ""])
     @patch("worsaga.cli.test_connection")
     @patch("worsaga.cli.MoodleConfig.write_config")
-    def test_interactive_uses_getpass(self, mock_write, mock_test_conn, mock_input, mock_getpass, capsys, tmp_path):
+    def test_interactive_uses_getpass(self, mock_write, mock_test_conn, mock_input, mock_getpass, mock_tty, capsys, tmp_path):
         mock_test_conn.return_value = {"userid": 42}
         mock_write.return_value = tmp_path / "config.json"
         main(["setup"])
         mock_getpass.assert_called_once()
         assert mock_input.call_count == 2
 
+    @patch("worsaga.cli._stdin_is_interactive", return_value=True)
     @patch("getpass.getpass", return_value="tok123")
     @patch("builtins.input", side_effect=["https://m.example.com", "abc"])
     @patch("worsaga.cli.test_connection")
     def test_interactive_rejects_non_numeric_userid(
-        self, mock_test_conn, mock_input, mock_getpass, capsys,
+        self, mock_test_conn, mock_input, mock_getpass, mock_tty, capsys,
     ):
         with pytest.raises(SystemExit) as exc:
             main(["setup"])
@@ -1474,6 +1632,56 @@ class TestQuietFlag:
         assert "Extracting slides.pdf" in err
 
 
+class TestProgressFeedback:
+    """All-course fan-outs report progress on stderr, never on stdout.
+
+    The shared orchestrators are also used by the MCP server over stdio,
+    where stdout is the protocol channel, so progress must be stderr-only
+    and suppressed in machine (--json/--yaml) and --quiet modes (Issue 2).
+    """
+
+    def test_digest_progress_on_stderr_not_stdout(self, capsys):
+        main(["--demo", "digest"])
+        captured = capsys.readouterr()
+        assert "[1/5]" in captured.err
+        assert "[5/5]" in captured.err
+        assert "[1/5]" not in captured.out
+        assert "[5/5]" not in captured.out
+
+    def test_digest_quiet_suppresses_progress(self, capsys):
+        main(["--demo", "-q", "digest"])
+        assert "[1/5]" not in capsys.readouterr().err
+
+    def test_digest_json_has_clean_stdout_and_no_progress(self, capsys):
+        main(["--demo", "--json", "digest"])
+        captured = capsys.readouterr()
+        assert "[1/5]" not in captured.err
+        # stdout is exactly the JSON payload — nothing else leaked in.
+        payload = json.loads(captured.out)
+        assert "deadlines" in payload
+
+    def test_sync_per_course_progress_on_stderr_not_stdout(
+        self, capsys, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("WORSAGA_CACHE_PATH", str(tmp_path / "cache.db"))
+        main(["--demo", "sync"])
+        captured = capsys.readouterr()
+        # Phase-prefixed per-course/per-forum labels on stderr.
+        assert "grades:" in captured.err
+        assert "files:" in captured.err
+        assert "forums:" in captured.err
+        # The human summary is on stdout; progress never leaks there.
+        assert "Synced" in captured.out
+        assert "files:" not in captured.out
+
+    def test_sync_quiet_suppresses_progress(
+        self, capsys, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("WORSAGA_CACHE_PATH", str(tmp_path / "cache.db"))
+        main(["--demo", "-q", "sync"])
+        assert "files:" not in capsys.readouterr().err
+
+
 class TestRawFlag:
     """--raw should output the unprocessed Moodle API payload with --json."""
 
@@ -1675,3 +1883,115 @@ class TestCp1252ConsoleSafety:
         assert "MATH101" in out
         assert "Analysis" in out  # row still printed
         assert "?" in out  # Greek letters replaced, not fatal
+
+
+class TestStructuredCourseErrors:
+    """--json/--yaml emit the MCP-style error dict for course-resolution
+    failures instead of leaving stdout empty (exit stays 1)."""
+
+    def test_json_unknown_course_id_emits_course_not_found(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "--json", "contents", "999999"])
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error_code"] == "course_not_found"
+        assert "999999" in payload["error"]
+
+    def test_json_unknown_shortname_emits_course_not_found(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "--json", "grades", "NOTACOURSE"])
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error_code"] == "course_not_found"
+
+    def test_json_ambiguous_prefix_emits_candidates(self, capsys):
+        client = MagicMock()
+        client.get_courses.return_value = [
+            {"id": 1, "shortname": "PSY110_2526", "fullname": "Intro Psychology"},
+            {"id": 2, "shortname": "PSY115_2526", "fullname": "Cognitive Psychology"},
+        ]
+        with patch("worsaga.cli._client", return_value=client):
+            with pytest.raises(SystemExit) as exc:
+                main(["--json", "contents", "PSY1"])
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error_code"] == "course_ambiguous"
+        shortnames = {c["shortname"] for c in payload["candidates"]}
+        assert shortnames == {"PSY110_2526", "PSY115_2526"}
+        assert all({"id", "shortname", "fullname"} <= set(c) for c in payload["candidates"])
+
+    def test_human_mode_unchanged_stderr_only(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--demo", "contents", "999999"])
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Course 999999 not found" in captured.err
+
+
+class TestCoursesTableTruncation:
+    """The courses table pads with spaces and marks real cuts with '...'
+    (the old dotted leader made uncut short codes look truncated)."""
+
+    def test_short_code_padded_with_spaces_not_dots(self, capsys):
+        client = MagicMock()
+        client.get_courses.return_value = [
+            {"id": 1, "shortname": "ECON101", "fullname": "Intro"},
+        ]
+        with patch("worsaga.cli._client", return_value=client):
+            main(["courses"])
+        out = capsys.readouterr().out
+        assert "ECON101      " in out
+        assert "ECON101....." not in out
+
+    def test_overlong_short_code_gets_ellipsis(self, capsys):
+        client = MagicMock()
+        client.get_courses.return_value = [
+            {"id": 1, "shortname": "VERYLONGSHORTCODE_EXCEEDING", "fullname": "X"},
+        ]
+        with patch("worsaga.cli._client", return_value=client):
+            main(["courses"])
+        assert "VERYLONGSHORTCODE..." in capsys.readouterr().out
+
+
+class TestProgressLabelHygiene:
+    """Progress labels are decoded/contextualized before display."""
+
+    def test_assignment_labels_are_html_unescaped(self):
+        from worsaga.assignments import get_assignments
+
+        client = MagicMock()
+        client.get_courses.return_value = [
+            {"id": 1, "shortname": "STAT120", "fullname": "Statistics"},
+        ]
+        client.get_assignments_by_courses.return_value = {
+            "courses": [{"id": 1, "assignments": [
+                {"id": 11, "course": 1, "name": "Group 1 &amp; 2 Blog", "duedate": 0},
+            ]}],
+        }
+        client.get_assignment_submission_status.return_value = {}
+        labels = []
+        get_assignments(
+            client,
+            on_progress=lambda done, total, label: labels.append(label),
+        )
+        assert labels == ["Group 1 & 2 Blog"]
+
+    def test_updates_labels_carry_course_shortname(self):
+        from worsaga.forums import get_latest_updates
+
+        client = MagicMock()
+        client.base_url = "https://moodle.example.com"
+        client.get_courses.return_value = [
+            {"id": 1, "shortname": "STAT120", "fullname": "Statistics"},
+        ]
+        client.get_forums_by_courses.return_value = [
+            {"id": 7, "course": 1, "name": "Announcements"},
+        ]
+        client.get_forum_discussions.return_value = {"discussions": []}
+        labels = []
+        get_latest_updates(
+            client,
+            on_progress=lambda done, total, label: labels.append(label),
+        )
+        assert labels == ["STAT120: Announcements"]

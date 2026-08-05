@@ -47,7 +47,13 @@ import urllib.error
 from worsaga.banner import print_banner, should_show_banner
 from worsaga.assignments import get_assignments as get_assignments_data
 from worsaga.calendar import get_calendar_events as get_calendar_events_data
-from worsaga.client import MoodleClient
+from worsaga.client import CourseNotFoundError, MoodleClient
+from worsaga.courses import (
+    CourseAmbiguousError,
+    CourseResolutionError,  # noqa: F401  re-exported for backward compat / tests
+    resolve_course_id as _resolve_course_id,
+)
+from worsaga.models import as_int
 from worsaga.config import (
     DEFAULT_CONFIG_PATH,
     MoodleConfig,
@@ -74,17 +80,25 @@ from worsaga.materials import (
     get_section_materials,
     match_section,
     search_course_content,
+    sections_matching_week,
     select_material,
     strip_file_urls,
 )
 from worsaga.autosync import (
     DEFAULT_INTERVAL_MINUTES,
+    MIN_INTERVAL_MINUTES,
     autosync_status,
     install_autosync,
     remove_autosync,
 )
-from worsaga.output import render_structured, wants_structured
-from worsaga.sections import find_best_section, summarize_modules
+from worsaga.output import render_structured, truncate_cell, wants_structured
+from worsaga.sections import (
+    WeekNotFoundError,
+    find_best_section,
+    section_names,
+    summarize_modules,
+    week_not_found_message,
+)
 from worsaga.watch import DEFAULT_WATCH_INTERVAL, MIN_WATCH_INTERVAL, run_watch
 from worsaga.studypack import build_study_pack, write_study_pack
 from worsaga.summaries import build_weekly_summary, format_bullets
@@ -106,9 +120,10 @@ from worsaga.time_utils import parse_interval, parse_since, timestamp_to_display
 
 PUBLIC_INSTALL_SPEC = "worsaga[mcp]"
 
-
-class CourseResolutionError(ValueError):
-    """Raised when a course identifier cannot be resolved."""
+# ``CourseResolutionError`` and ``_resolve_course_id`` are re-exported from
+# :mod:`worsaga.courses` (imported above) so the CLI and the MCP tools share
+# one course-identifier resolver. They remain importable from this module for
+# backward compatibility.
 
 
 def _non_negative_int(value: str) -> int:
@@ -598,7 +613,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     wt.add_argument(
         "--interval", default=None, metavar="SPAN",
-        help="Time between syncs like 15m, 900, or 1h (default: 15m)",
+        help=(
+            "Time between syncs like 15m, 900, or 1h "
+            f"(default: 15m; minimum {MIN_WATCH_INTERVAL}s - lower values are "
+            "clamped up with a warning)"
+        ),
     )
     wt.add_argument(
         "--cycles", type=_non_negative_int, default=None,
@@ -632,7 +651,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--interval", default=None, metavar="SPAN",
         help=(
             "Time between background syncs like 30m or 2h "
-            f"(install only; default: {DEFAULT_INTERVAL_MINUTES}m)"
+            f"(install only; default: {DEFAULT_INTERVAL_MINUTES}m; minimum "
+            f"{MIN_INTERVAL_MINUTES}m - lower values are clamped up with a "
+            "warning)"
         ),
     )
     au.add_argument(
@@ -699,6 +720,68 @@ def _emit_data(args: argparse.Namespace, payload) -> bool:
     return True
 
 
+def _progress_reporter(args: argparse.Namespace):
+    """Return a stderr per-item progress callback, or None.
+
+    All-course fan-outs (digest, sync, assignments, updates, grades, watch)
+    can take minutes on a real account; this prints one ``[k/N] label`` line
+    per completed item to **stderr** so stdout stays a clean data channel.
+    Suppressed in machine modes (``--json``/``--yaml``) and under
+    ``-q/--quiet``, so the shared orchestrators (also used by the MCP server
+    over stdio) never emit progress on a protocol stream.
+    """
+    if wants_structured(args) or getattr(args, "quiet", False):
+        return None
+
+    def _report(done: int, total: int, label: str) -> None:
+        print(f"[{done}/{total}] {label}", file=sys.stderr, flush=True)
+
+    return _report
+
+
+def _fail_course_error(args: argparse.Namespace, payload: dict) -> None:
+    """Emit a course-resolution/not-found failure and exit 1.
+
+    Human mode keeps the existing one-line ``Error:`` on stderr. In
+    ``--json``/``--yaml`` mode the same agent-branchable dict the MCP tools
+    return (``error_code`` ``course_not_found``/``course_ambiguous``, with
+    ``candidates`` where applicable) goes to stdout, so machine callers get
+    parseable output instead of an empty stream.
+    """
+    if wants_structured(args):
+        _emit_data(args, payload)
+    else:
+        print(f"Error: {payload['error']}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _fail_week_not_found(
+    args: argparse.Namespace,
+    message: str,
+    available_sections: list[str],
+) -> None:
+    """Emit a week-not-found error (structured or human) and exit 1.
+
+    Shared by the week-scoped commands so a nonsense or unmatched week
+    fails loudly and identically instead of fabricating output. In
+    structured mode it emits an agent-branchable error dict; in human
+    mode an ``Error:`` line plus the available section names.
+    """
+    if wants_structured(args):
+        _emit_data(args, {
+            "error": message,
+            "error_code": "week_not_found",
+            "available_sections": available_sections,
+        })
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+        if available_sections:
+            print("\nAvailable sections:", file=sys.stderr)
+            for name in available_sections:
+                print(f"  - {name}", file=sys.stderr)
+    sys.exit(1)
+
+
 def _since_to_days(value: str | None, *, default_days: int) -> int:
     """Convert a --since expression into at least one whole day."""
     if value is None:
@@ -711,59 +794,6 @@ def _since_to_days(value: str | None, *, default_days: int) -> int:
     if since_ts is None:
         return default_days
     return max(1, int(math.ceil((now - since_ts) / 86400)))
-
-
-def _resolve_course_id(client: MoodleClient, raw: str) -> int:
-    try:
-        return int(raw)
-    except ValueError:
-        pass
-
-    courses = client.get_courses()
-    needle = raw.strip().lower()
-
-    for c in courses:
-        if c.get("shortname", "").lower() == needle:
-            return c["id"]
-
-    prefix_matches = []
-    for c in courses:
-        sn = c.get("shortname", "").lower()
-        base = sn
-        for sep in ("_", "-"):
-            if sep in sn:
-                base = sn.split(sep, 1)[0]
-                break
-
-        if needle == base:
-            prefix_matches.append(c)
-        elif needle in base.split("/"):
-            prefix_matches.append(c)
-        elif base.startswith(needle) and len(base) - len(needle) <= 2:
-            prefix_matches.append(c)
-
-    seen = set()
-    unique_matches = []
-    for c in prefix_matches:
-        if c["id"] not in seen:
-            seen.add(c["id"])
-            unique_matches.append(c)
-    prefix_matches = unique_matches
-
-    if len(prefix_matches) == 1:
-        return prefix_matches[0]["id"]
-
-    if len(prefix_matches) > 1:
-        ambiguous = ", ".join(sorted(c.get("shortname", "?") for c in prefix_matches))
-        raise CourseResolutionError(
-            f"'{raw}' is ambiguous — matches: {ambiguous}"
-        )
-
-    available = ", ".join(sorted(c.get("shortname", "?") for c in courses))
-    raise CourseResolutionError(
-        f"no enrolled course matching '{raw}'.\n"
-        f"Available short-codes: {available}"
-    )
 
 
 def _invocation_hint() -> str:
@@ -854,7 +884,13 @@ def cmd_courses(args: argparse.Namespace) -> None:
     print(f"{'ID':>8}  {'Short code':<20}  {'Full name'}")
     print(f"{'-' * 8}  {'-' * 20}  {'-' * 40}")
     for c in courses:
-        print(f"{c['id']:>8}  {c.get('shortname', ''):.<20}  {c.get('fullname', '')}")
+        # Space padding + the shared "..." truncation marker: the old dotted
+        # leader (":.<20") made an uncut short code look exactly like a
+        # truncated one now that "..." elsewhere really means "cut".
+        print(
+            f"{c['id']:>8}  {truncate_cell(c.get('shortname', ''), 20):<20}  "
+            f"{c.get('fullname', '')}"
+        )
 
 
 def cmd_deadlines(args: argparse.Namespace) -> None:
@@ -879,7 +915,9 @@ def cmd_grades(args: argparse.Namespace) -> None:
     course_id = _resolve_course_id(client, args.course) if args.course else None
 
     if getattr(args, "summary", False):
-        summary = build_grade_summary(client, course_id=course_id)
+        summary = build_grade_summary(
+            client, course_id=course_id, on_progress=_progress_reporter(args),
+        )
         if _emit_data(args, summary):
             return
         print(f"Grade items: {summary['total_items']}")
@@ -887,7 +925,9 @@ def cmd_grades(args: argparse.Namespace) -> None:
             print(f"  {status}: {count}")
         return
 
-    grade_result = collect_grades_data(client, course_id=course_id)
+    grade_result = collect_grades_data(
+        client, course_id=course_id, on_progress=_progress_reporter(args),
+    )
     grades = grade_result["grades"]
     if getattr(args, "missing", False):
         grades = [
@@ -921,9 +961,9 @@ def cmd_grades(args: argparse.Namespace) -> None:
         weight_text = "" if weight is None else f"{weight:g}"
         feedback = "yes" if grade.get("feedback") else ""
         print(
-            f"{grade['course_shortname'][:15]:<15}  "
-            f"{grade['item_name'][:30]:<30}  "
-            f"{grade['grade_display'][:14]:<14}  "
+            f"{truncate_cell(grade['course_shortname'], 15):<15}  "
+            f"{truncate_cell(grade['item_name'], 30):<30}  "
+            f"{truncate_cell(grade['grade_display'], 14):<14}  "
             f"{percent_text:>8}  {weight_text:>8}  "
             f"{grade['status']:<10}  {feedback}"
         )
@@ -942,6 +982,7 @@ def cmd_assignments(args: argparse.Namespace) -> None:
         client,
         course_id=course_id,
         include_feedback=getattr(args, "include_feedback", False),
+        on_progress=_progress_reporter(args),
     )
 
     if getattr(args, "due_soon", False):
@@ -981,7 +1022,7 @@ def cmd_assignments(args: argparse.Namespace) -> None:
         print(
             f"{assignment.get('due_str', ''):<22}  "
             f"{days_text:>4}  "
-            f"{assignment['course_shortname'][:15]:<15}  "
+            f"{truncate_cell(assignment['course_shortname'], 15):<15}  "
             f"{assignment['status']:<13}  "
             f"{submitted_text:<9}  "
             f"{assignment['name']}"
@@ -1004,7 +1045,8 @@ def cmd_forums(args: argparse.Namespace) -> None:
         count_text = "" if count is None else str(count)
         ann = "yes" if forum.get("is_announcement") else ""
         print(
-            f"{forum['name'][:35]:<35}  {forum['type'][:12]:<12}  "
+            f"{truncate_cell(forum['name'], 35):<35}  "
+            f"{truncate_cell(forum['type'], 12):<12}  "
             f"{count_text:>11}  {ann}"
         )
 
@@ -1030,7 +1072,7 @@ def cmd_forum(args: argparse.Namespace) -> None:
         )
         print(
             f"{modified:<22}  "
-            f"{discussion['forum_name'][:25]:<25}  "
+            f"{truncate_cell(discussion['forum_name'], 25):<25}  "
             f"{unread_text:>6}  {discussion['name']}"
         )
 
@@ -1039,7 +1081,10 @@ def cmd_updates(args: argparse.Namespace) -> None:
     client = _client(args)
     course_id = _resolve_course_id(client, args.course) if args.course else None
     since_days = _since_to_days(args.since, default_days=7)
-    updates = get_latest_updates_data(client, course_id=course_id, since_days=since_days)
+    updates = get_latest_updates_data(
+        client, course_id=course_id, since_days=since_days,
+        on_progress=_progress_reporter(args),
+    )
     if _emit_data(args, updates):
         return
     if not updates:
@@ -1052,8 +1097,8 @@ def cmd_updates(args: argparse.Namespace) -> None:
             update.get("modified_at") or update.get("created_at")
         )
         print(
-            f"{str(update.get('course_shortname', ''))[:15]:<15}  "
-            f"{update['forum_name'][:25]:<25}  "
+            f"{truncate_cell(update.get('course_shortname', ''), 15):<15}  "
+            f"{truncate_cell(update['forum_name'], 25):<25}  "
             f"{updated:<22}  "
             f"{update['name']}"
         )
@@ -1078,7 +1123,7 @@ def cmd_notifications(args: argparse.Namespace) -> None:
         created = _display_timestamp(notification.get("created_at"))
         print(
             f"{created:<22}  "
-            f"{read_text:<5}  {notification['sender'][:20]:<20}  "
+            f"{read_text:<5}  {truncate_cell(notification['sender'], 20):<20}  "
             f"{notification['subject']}"
         )
 
@@ -1100,7 +1145,7 @@ def cmd_inbox(args: argparse.Namespace) -> None:
         created = _display_timestamp(message.get("created_at"))
         print(
             f"{created:<22}  "
-            f"{read_text:<5}  {message['sender'][:20]:<20}  "
+            f"{read_text:<5}  {truncate_cell(message['sender'], 20):<20}  "
             f"{message['subject']}"
         )
 
@@ -1108,7 +1153,9 @@ def cmd_inbox(args: argparse.Namespace) -> None:
 def cmd_digest(args: argparse.Namespace) -> None:
     client = _client(args)
     since_days = _since_to_days(args.since, default_days=1)
-    digest = get_digest_data(client, since_days=since_days)
+    digest = get_digest_data(
+        client, since_days=since_days, on_progress=_progress_reporter(args),
+    )
     if _emit_data(args, digest):
         return
     print(f"Digest: last {since_days} day(s)")
@@ -1182,8 +1229,17 @@ def cmd_materials(args: argparse.Namespace) -> None:
     sections = client.get_course_contents(course_id)
 
     if args.week is not None:
-        materials = get_section_materials(
-            sections, course_id, args.week, base_url=client.base_url,
+        matched_sections = sections_matching_week(sections, args.week)
+        if not matched_sections:
+            # No section matches this week at all: an explicit failure,
+            # not an empty listing (unmatched weeks used to be silent).
+            _fail_week_not_found(
+                args,
+                week_not_found_message(args.week, course_id),
+                section_names(sections),
+            )
+        materials = extract_materials(
+            matched_sections, course_id, base_url=client.base_url,
         )
     else:
         materials = extract_materials(sections, course_id, base_url=client.base_url)
@@ -1196,8 +1252,16 @@ def cmd_materials(args: argparse.Namespace) -> None:
         return
 
     if not materials:
-        label = f" for week {args.week}" if args.week else ""
-        print(f"No materials found{label}.")
+        # Reaching here with a week means a section matched but has no
+        # files: a valid empty listing (exit 0), distinct from the
+        # week-not-found failure handled above.
+        if args.week is not None:
+            print(
+                f"No materials found for week {args.week} "
+                "(section found, but it has no downloadable files)."
+            )
+        else:
+            print("No materials found.")
         return
 
     print(
@@ -1217,8 +1281,9 @@ def cmd_materials(args: argparse.Namespace) -> None:
         )
         file_display = m["file_name"] or "(link)"
         print(
-            f"{m['section_name'][:30]:<30}  {m['module_name'][:25]:<25}  "
-            f"{m['module_type']:<10}  {file_display[:30]:<30}  "
+            f"{truncate_cell(m['section_name'], 30):<30}  "
+            f"{truncate_cell(m['module_name'], 25):<25}  "
+            f"{m['module_type']:<10}  {truncate_cell(file_display, 30):<30}  "
             f"{size_str:>10}"
         )
 
@@ -1237,11 +1302,23 @@ def _select_week_material(
     from worsaga.materials import candidate_summary
 
     sections = client.get_course_contents(course_id)
+
+    if not sections_matching_week(sections, args.week):
+        # No section matches this week: fail with the clear week-not-found
+        # message (exit 1), the same signal both surfaces now use.
+        _fail_week_not_found(
+            args,
+            week_not_found_message(args.week, course_id),
+            section_names(sections),
+        )
+
     materials = get_section_materials(
         sections, course_id, args.week, base_url=client.base_url,
     )
 
     if not materials:
+        # Section matched but holds no downloadable files. Download/extract
+        # could not do their job, so this stays an exit-1 failure.
         msg = f"No materials found for week {args.week}."
         if wants_structured(args):
             _emit_data(args, {"error": msg, "candidates": []})
@@ -1358,8 +1435,18 @@ def cmd_summary(args: argparse.Namespace) -> None:
     sections = client.get_course_contents(course_id)
     week_query = args.week
 
+    # Fail fast on a week that matches no section, before printing any
+    # preamble or extracting anything, so a nonsense week errors instead
+    # of fabricating a summary.
+    section, _, section_name = find_best_section(sections, week_query)
+    if section is None:
+        _fail_week_not_found(
+            args,
+            week_not_found_message(week_query, course_id),
+            section_names(sections),
+        )
+
     if not wants_structured(args):
-        section, _, section_name = find_best_section(sections, week_query)
         print(f"Week {week_query} — {section_name or '(no section found)'}")
         if section and section.get("modules"):
             overview = summarize_modules(section["modules"])
@@ -1509,9 +1596,12 @@ def cmd_study_pack(args: argparse.Namespace) -> None:
         if not wants_structured(args) and not args.quiet:
             print(f"  Extracting {filename}...", file=sys.stderr)
 
-    result = build_study_pack(
-        client, course_id, args.week, on_file=_on_file,
-    )
+    try:
+        result = build_study_pack(
+            client, course_id, args.week, on_file=_on_file,
+        )
+    except WeekNotFoundError as exc:
+        _fail_week_not_found(args, str(exc), exc.available_sections)
 
     if args.stdout:
         if _emit_data(args, result):
@@ -1562,7 +1652,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
     client = _client(args)
     if not args.quiet and not wants_structured(args):
         print("Syncing metadata (nothing is downloaded)...", file=sys.stderr)
-    result = run_sync(client, lookahead_days=args.days)
+    result = run_sync(
+        client, lookahead_days=args.days, on_progress=_progress_reporter(args),
+    )
 
     if _emit_data(args, result):
         return
@@ -1625,11 +1717,18 @@ def cmd_changes(args: argparse.Namespace) -> None:
 def cmd_watch(args: argparse.Namespace) -> None:
     client = _client(args)
     # Clamp before announcing so the message matches actual behaviour.
-    interval = max(
-        MIN_WATCH_INTERVAL,
-        parse_interval(args.interval, default=DEFAULT_WATCH_INTERVAL),
-    )
+    requested = parse_interval(args.interval, default=DEFAULT_WATCH_INTERVAL)
+    interval = max(MIN_WATCH_INTERVAL, requested)
     structured = wants_structured(args)
+
+    if requested < MIN_WATCH_INTERVAL and not structured and not args.quiet:
+        # A below-floor request is honoured but clamped; say so rather than
+        # silently running at a different interval than was asked for.
+        print(
+            f"Warning: interval {args.interval} is below the minimum for "
+            f"watch; using {MIN_WATCH_INTERVAL}s.",
+            file=sys.stderr,
+        )
 
     if not structured and not args.quiet:
         print(
@@ -1637,6 +1736,21 @@ def cmd_watch(args: argparse.Namespace) -> None:
             "(Ctrl+C to stop)...",
             file=sys.stderr,
         )
+
+    def _on_cycle_start(cycle: int) -> None:
+        # A full-account sync can take minutes; announce cycle start (with
+        # the course count) so watch never looks hung before its first
+        # output. Best-effort: a failed course count still yields a line.
+        if structured or args.quiet:
+            return
+        try:
+            count = len(client.get_courses())
+            print(
+                f"Sync cycle started ({count} courses)...",
+                file=sys.stderr, flush=True,
+            )
+        except Exception:
+            print("Sync cycle started...", file=sys.stderr, flush=True)
 
     def _on_cycle(result: dict) -> None:
         if structured:
@@ -1679,6 +1793,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
             notify=not args.no_notify,
             lookahead_days=args.days,
             on_cycle=_on_cycle,
+            on_cycle_start=_on_cycle_start,
+            on_progress=_progress_reporter(args),
         )
     except KeyboardInterrupt:
         if not structured and not args.quiet:
@@ -1727,6 +1843,18 @@ def cmd_autosync(args: argparse.Namespace) -> None:
         seconds = parse_interval(
             args.interval, default=DEFAULT_INTERVAL_MINUTES * 60,
         )
+        if (
+            seconds < MIN_INTERVAL_MINUTES * 60
+            and not wants_structured(args)
+            and not args.quiet
+        ):
+            # Honoured but clamped up to the politeness floor; say so
+            # instead of silently scheduling a slower sync than requested.
+            print(
+                f"Warning: interval {args.interval} is below the minimum "
+                f"for auto-sync; using {MIN_INTERVAL_MINUTES} min.",
+                file=sys.stderr,
+            )
         result = install_autosync(
             max(1, seconds // 60), dry_run=args.dry_run,
         )
@@ -1891,6 +2019,20 @@ def cmd_update(args: argparse.Namespace) -> None:
     print("\nThis command is a guide only. worsaga does not self-update in place.")
 
 
+def _stdin_is_interactive() -> bool:
+    """Return True only when stdin is a real interactive terminal.
+
+    Guards the setup command's prompts: a non-TTY stdin (a pipe, a closed
+    handle, ``/dev/null``, or CI) must produce clear guidance instead of
+    an ``EOFError`` traceback. Any failure to inspect stdin is treated as
+    non-interactive.
+    """
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (ValueError, OSError, AttributeError):
+        return False
+
+
 def cmd_setup(args: argparse.Namespace) -> None:
     # Non-interactive mode: all required args provided on CLI
     setup_url = getattr(args, "url", None) or getattr(args, "setup_url", None)
@@ -1930,7 +2072,33 @@ def cmd_setup(args: argparse.Namespace) -> None:
         _print_setup_success(dest)
         return
 
-    # Interactive fallback
+    # Interactive fallback. Guard it: the guided prompts need a terminal,
+    # so a non-TTY stdin (piped, redirected, closed, or CI) must exit with
+    # guidance toward the non-interactive paths rather than crashing on an
+    # EOFError. The existing config file is never touched on this path.
+    if not _stdin_is_interactive():
+        print(
+            "Error: 'worsaga setup' needs an interactive terminal for its "
+            "guided prompts, but stdin is not a TTY.",
+            file=sys.stderr,
+        )
+        print("Configure non-interactively instead:", file=sys.stderr)
+        print(
+            "  worsaga setup --url <MOODLE_URL> --token <TOKEN> "
+            "[--userid <ID>]",
+            file=sys.stderr,
+        )
+        print(
+            "  or set WORSAGA_URL and WORSAGA_TOKEN "
+            "(optionally WORSAGA_USERID),",
+            file=sys.stderr,
+        )
+        print(
+            "  or point WORSAGA_CREDS_PATH at a JSON credentials file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if should_show_banner(json_mode=getattr(args, "json", False), quiet=getattr(args, "quiet", False)):
         print_banner()
     print("worsaga setup")
@@ -1944,17 +2112,35 @@ def cmd_setup(args: argparse.Namespace) -> None:
     print("  2. A web-service token (see README for how to get one)")
     print()
 
-    url = input("Moodle URL: ").strip()
+    # Wrap the whole prompt sequence: a mid-prompt EOF (stdin closes) or
+    # Ctrl-C must produce a clean one-line message, never a traceback.
+    try:
+        url = input("Moodle URL: ").strip()
+        token = getpass.getpass("API token: ").strip()
+        userid_raw = input("User ID (press Enter to auto-detect): ").strip()
+    except EOFError:
+        # stdin reached EOF mid-prompt (piped, closed, or the Windows NUL
+        # device, whose isatty() lies). Fail cleanly with a pointer to the
+        # non-interactive path instead of a raw traceback.
+        print(
+            "Error: setup aborted (no input received). Provide credentials "
+            "non-interactively with "
+            "'worsaga setup --url <URL> --token <TOKEN>'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("Setup aborted.", file=sys.stderr)
+        sys.exit(130)
+
     if not url:
         print("Error: URL is required.", file=sys.stderr)
         sys.exit(1)
 
-    token = getpass.getpass("API token: ").strip()
     if not token:
         print("Error: token is required.", file=sys.stderr)
         sys.exit(1)
 
-    userid_raw = input("User ID (press Enter to auto-detect): ").strip()
     userid_override: int | None = None
     if userid_raw:
         try:
@@ -2052,6 +2238,23 @@ def main(argv: list[str] | None = None) -> None:
     }
     try:
         dispatch[args.command](args)
+    except CourseAmbiguousError as e:
+        _fail_course_error(args, {
+            "error": str(e),
+            "error_code": "course_ambiguous",
+            "candidates": [
+                {
+                    "id": as_int(c.get("id"), 0),
+                    "shortname": str(c.get("shortname") or ""),
+                    "fullname": str(c.get("fullname") or ""),
+                }
+                for c in e.candidates
+            ],
+        })
+    except CourseResolutionError as e:
+        _fail_course_error(args, {"error": str(e), "error_code": "course_not_found"})
+    except CourseNotFoundError as e:
+        _fail_course_error(args, {"error": str(e), "error_code": "course_not_found"})
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

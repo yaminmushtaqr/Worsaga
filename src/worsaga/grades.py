@@ -6,6 +6,7 @@ from collections import Counter
 from typing import Any
 
 from worsaga.client import MoodleClient, MoodleWriteAttemptError
+from worsaga.concurrency import ProgressCallback, run_parallel
 from worsaga.models import as_bool, as_float, as_int, clean_text, grade_record
 
 
@@ -46,6 +47,22 @@ def _grade_display(item: dict[str, Any]) -> str:
 
 def _grade_raw(item: dict[str, Any]) -> str:
     return clean_text(item.get("graderaw", item.get("grade", "")))
+
+
+def _graded_at(item: dict[str, Any]) -> int | None:
+    """Return the Unix epoch a grade was given, or None.
+
+    Moodle's ``gradereport_user_get_grade_items`` reports this as
+    ``gradedategraded`` on graded items; a couple of instances use
+    ``gradedate`` / ``dategraded`` instead. A zero/absent value means "no
+    grade date" and yields None so the derived ISO/display fields stay
+    empty.
+    """
+    for key in ("gradedategraded", "gradedate", "dategraded"):
+        ts = as_int(item.get(key))
+        if ts:
+            return ts
+    return None
 
 
 def _derive_status(
@@ -126,6 +143,7 @@ def normalize_grade_items(
                     range_text=_range_text(item),
                     feedback=item.get("feedback") or item.get("feedbackformatted") or "",
                     graded=graded,
+                    graded_at=_graded_at(item),
                     hidden=hidden,
                     contributes_to_total=contributes,
                     status=status,
@@ -147,11 +165,24 @@ def _course_targets(client: MoodleClient, course_id: int | None) -> list[dict[st
 def collect_grades(
     client: MoodleClient,
     course_id: int | None = None,
+    *,
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Return normalized grade records plus non-fatal warnings."""
+    """Return normalized grade records plus non-fatal warnings.
+
+    The per-course gradebook fetch fans out concurrently (see
+    :func:`worsaga.concurrency.run_parallel`); results are reassembled in
+    course order, then sorted, so output is deterministic. Per-course
+    permission failures stay non-fatal warnings attributed to their own
+    course when *course_id* is not given; for a single named course the
+    fetch error still propagates. ``on_progress`` (default silent) reports
+    one completed course at a time.
+    """
     records: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    for course in _course_targets(client, course_id):
+    targets = _course_targets(client, course_id)
+
+    def _fetch_course(course: dict[str, Any]) -> dict[str, Any]:
         cid = as_int(course.get("id"), 0) or 0
         shortname = str(course.get("shortname") or cid)
         try:
@@ -161,19 +192,27 @@ def collect_grades(
         except Exception as exc:
             if course_id is not None:
                 raise
-            warnings.append({
+            return {"warning": {
                 "course_id": cid,
                 "course_shortname": shortname,
                 "message": str(exc),
-            })
-            continue
-        records.extend(
-            normalize_grade_items(
-                payload if isinstance(payload, dict) else {},
-                course_id=cid,
-                course_shortname=shortname,
-            )
-        )
+            }}
+        return {"records": normalize_grade_items(
+            payload if isinstance(payload, dict) else {},
+            course_id=cid,
+            course_shortname=shortname,
+        )}
+
+    for outcome in run_parallel(
+        targets,
+        _fetch_course,
+        label_fn=lambda c: str(c.get("shortname") or c.get("id") or ""),
+        on_progress=on_progress,
+    ):
+        if "records" in outcome:
+            records.extend(outcome["records"])
+        elif "warning" in outcome:
+            warnings.append(outcome["warning"])
     records.sort(key=lambda r: (r["course_shortname"], r["item_name"], r["item_id"] or 0))
     return {"grades": records, "warnings": warnings}
 
@@ -183,9 +222,14 @@ def get_grades(client: MoodleClient, course_id: int | None = None) -> list[dict[
     return collect_grades(client, course_id=course_id)["grades"]
 
 
-def get_grade_summary(client: MoodleClient, course_id: int | None = None) -> dict[str, Any]:
+def get_grade_summary(
+    client: MoodleClient,
+    course_id: int | None = None,
+    *,
+    on_progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
     """Return aggregate grade status counts and course total entries."""
-    result = collect_grades(client, course_id=course_id)
+    result = collect_grades(client, course_id=course_id, on_progress=on_progress)
     records = result["grades"]
     counts = Counter(record.get("status", "unknown") for record in records)
     totals = [

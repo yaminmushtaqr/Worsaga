@@ -19,6 +19,11 @@ from typing import TYPE_CHECKING
 
 from worsaga.client import DownloadError
 from worsaga.extraction import MAX_TEXT_PER_FILE, extract_file_structured
+from worsaga.models import (
+    course_module_file_record,
+    course_module_record,
+    course_section_record,
+)
 
 if TYPE_CHECKING:
     from worsaga.client import MoodleClient
@@ -249,6 +254,95 @@ def extract_materials(
     return materials
 
 
+def build_course_contents(
+    sections: list[dict],
+    course_id: int,
+    *,
+    base_url: str = "",
+) -> list[dict]:
+    """Build a compact, sanitized course-contents map from raw sections.
+
+    Replaces the verbatim ``core_course_get_contents`` payload (full
+    inline-styled HTML section summaries, per-file token-bearing
+    ``fileurl`` values, and many unused Moodle fields) with a small
+    agent-friendly shape: one record per section (id, number, name,
+    HTML-stripped plain-text summary) holding one record per module (id,
+    name, type, ``view_url``) with a ``files`` list of token-free file
+    metadata. File ``dedupe_key`` values match those from
+    :func:`extract_materials` / ``get_week_materials`` so the two surfaces
+    cross-reference. Raw ``file_url`` values are never included.
+
+    Parameters
+    ----------
+    sections : list[dict]
+        Raw sections from ``core_course_get_contents``.
+    course_id : int
+        The course the sections belong to (accepted for symmetry with the
+        other builders; not embedded per record).
+    base_url : str
+        Moodle site root. When provided, each module gets a ``view_url``
+        pointing to its human-readable page.
+    """
+    del course_id  # accepted for a stable signature; not embedded per record
+    result: list[dict] = []
+    for section in sections:
+        modules: list[dict] = []
+        for module in section.get("modules", []):
+            module_id = module.get("id", 0)
+            files: list[dict] = []
+            for file_info in module.get("contents", []):
+                if file_info.get("type", "") != "file":
+                    continue
+                file_name = file_info.get("filename", "")
+                files.append(
+                    course_module_file_record(
+                        file_name=file_name,
+                        file_size=file_info.get("filesize", 0),
+                        mime_type=file_info.get("mimetype", ""),
+                        time_modified=file_info.get("timemodified", 0),
+                        dedupe_key=(
+                            f"{module_id}:{file_name}:"
+                            f"{_dedupe_location_key(file_info)}"
+                        ),
+                    )
+                )
+            modname = module.get("modname", "")
+            view_url = (
+                f"{base_url}/mod/{modname}/view.php?id={module_id}"
+                if base_url else ""
+            )
+            modules.append(
+                course_module_record(
+                    module_id=module_id,
+                    module_name=module.get("name", ""),
+                    module_type=modname,
+                    view_url=view_url,
+                    files=files,
+                )
+            )
+        result.append(
+            course_section_record(
+                section_id=section.get("id", 0),
+                section_num=section.get("section", 0),
+                section_name=section.get("name", ""),
+                summary=section.get("summary", ""),
+                modules=modules,
+            )
+        )
+    return result
+
+
+def sections_matching_week(sections: list[dict], week: int | str) -> list[dict]:
+    """Return the sections whose name matches the *week* query.
+
+    A week is considered "found" when at least one section matches. An
+    empty result means the query matched no section at all, which callers
+    treat as an explicit week-not-found failure — distinct from a matched
+    section that merely has no downloadable files (a valid empty state).
+    """
+    return [s for s in sections if match_section(s, week)]
+
+
 def get_section_materials(
     sections: list[dict],
     course_id: int,
@@ -259,9 +353,10 @@ def get_section_materials(
 ) -> list[dict]:
     """Get materials for sections matching *week*.
 
-    Combines :func:`match_section` filtering with :func:`extract_materials`.
+    Combines :func:`sections_matching_week` filtering with
+    :func:`extract_materials`.
     """
-    matching = [s for s in sections if match_section(s, week)]
+    matching = sections_matching_week(sections, week)
     return extract_materials(matching, course_id, base_url=base_url, dedupe=dedupe)
 
 

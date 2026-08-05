@@ -13,6 +13,7 @@ from worsaga.materials import (
     download_material,
     extract_materials,
     get_section_materials,
+    sections_matching_week,
     select_material,
 )
 
@@ -77,6 +78,26 @@ def _materials():
     return get_section_materials(
         SAMPLE_SECTIONS, COURSE_ID, 3, base_url=BASE_URL,
     )
+
+
+# ── sections_matching_week ──────────────────────────────────────
+
+
+class TestSectionsMatchingWeek:
+    def test_numeric_match(self):
+        assert sections_matching_week(SAMPLE_SECTIONS, 3) == SAMPLE_SECTIONS
+
+    def test_unmatched_numeric_is_empty(self):
+        assert sections_matching_week(SAMPLE_SECTIONS, 99) == []
+
+    def test_unmatched_string_is_empty(self):
+        # An empty result is the week-not-found signal callers key on.
+        assert sections_matching_week(SAMPLE_SECTIONS, "zzz_nonsense") == []
+
+    def test_matched_but_no_files_still_matches(self):
+        # Section matches by name even though it holds no downloadable files.
+        empty = [{"id": 9, "name": "Week 5: Reading", "section": 5, "modules": []}]
+        assert sections_matching_week(empty, 5) == empty
 
 
 # ── select_material ─────────────────────────────────────────────

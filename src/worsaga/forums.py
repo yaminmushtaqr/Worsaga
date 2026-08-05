@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from worsaga.client import MoodleClient, MoodleWriteAttemptError
+from worsaga.concurrency import ProgressCallback, run_parallel
 from worsaga.models import as_bool, as_int, clean_text, forum_discussion_record
 
 logger = logging.getLogger(__name__)
@@ -153,8 +154,18 @@ def get_latest_updates(
     course_id: int | None = None,
     *,
     since_days: int = 7,
+    on_progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
-    """Return recent forum discussions across one or all courses."""
+    """Return recent forum discussions across one or all courses.
+
+    Forum containers are discovered in one batched call; each forum's
+    discussions are then fetched concurrently (see
+    :func:`worsaga.concurrency.run_parallel`), which is the slow part across
+    many courses. Per-forum failures stay logged warnings and are skipped,
+    and the final list is sorted newest-first, so output is deterministic
+    regardless of completion order. ``on_progress`` (default silent) reports
+    one completed forum at a time.
+    """
     courses = client.get_courses()
     if course_id is not None:
         courses = [course for course in courses if as_int(course.get("id")) == course_id] or [
@@ -192,8 +203,7 @@ def get_latest_updates(
                     course_exc,
                 )
 
-    updates: list[dict[str, Any]] = []
-    for forum in forums:
+    def _fetch_forum(forum: dict[str, Any]) -> list[dict[str, Any]]:
         cid = as_int(forum.get("course_id"), 0) or 0
         try:
             payload = client.get_forum_discussions(forum["forum_id"])
@@ -205,7 +215,7 @@ def get_latest_updates(
                 forum.get("forum_id"),
                 exc,
             )
-            continue
+            return []
         discussions = normalize_forum_discussions(
             payload if isinstance(payload, dict) else {},
             course_id=cid,
@@ -213,11 +223,28 @@ def get_latest_updates(
             forum_name=forum.get("name", ""),
             base_url=client.base_url,
         )
+        recent: list[dict[str, Any]] = []
         for discussion in discussions:
             modified = discussion.get("modified_at") or discussion.get("created_at") or 0
             if modified >= cutoff:
                 discussion = dict(discussion)
                 discussion["course_shortname"] = course_names.get(cid, str(cid))
-                updates.append(discussion)
+                recent.append(discussion)
+        return recent
+
+    updates: list[dict[str, Any]] = []
+    for per_forum in run_parallel(
+        forums,
+        _fetch_forum,
+        # Prefix the course short-code: most Moodle forums are all named
+        # "Announcements", so the forum name alone tells the user nothing
+        # about which course is being processed.
+        label_fn=lambda f: (
+            f"{course_names.get(as_int(f.get('course_id'), 0) or 0, '')}: "
+            f"{clean_text(f.get('name')) or f.get('forum_id') or ''}"
+        ).lstrip(": "),
+        on_progress=on_progress,
+    ):
+        updates.extend(per_forum)
     updates.sort(key=lambda r: r["modified_at"] or r["created_at"] or 0, reverse=True)
     return updates

@@ -905,6 +905,31 @@ class TestCliSurface:
         assert "run:    schtasks /Create" in out
         assert install.call_args == ((30,), {"dry_run": True})
 
+    def test_install_below_floor_interval_warns(self, capsys):
+        # Issue 1: a sub-floor interval is honoured but clamped to the
+        # politeness floor (5 min), and the CLI says so on stderr instead
+        # of silently scheduling a slower sync than requested.
+        fake = {"installed": False, "dry_run": True, "platform": "windows",
+                "method": "schtasks", "interval_minutes": MIN_INTERVAL_MINUTES,
+                "command": ["worsaga", "sync", "--quiet"], "actions": []}
+        with patch("worsaga.cli.install_autosync", return_value=fake) as install:
+            main(["auto-sync", "install", "--dry-run", "--interval", "30s"])
+        err = capsys.readouterr().err
+        assert (
+            "Warning: interval 30s is below the minimum for auto-sync; "
+            f"using {MIN_INTERVAL_MINUTES} min."
+        ) in err
+        # 30s rounds down to sub-minute; install still receives >= 1 minute.
+        assert install.call_args == ((1,), {"dry_run": True})
+
+    def test_install_at_or_above_floor_does_not_warn(self, capsys):
+        fake = {"installed": False, "dry_run": True, "platform": "windows",
+                "method": "schtasks", "interval_minutes": 30,
+                "command": ["worsaga", "sync", "--quiet"], "actions": []}
+        with patch("worsaga.cli.install_autosync", return_value=fake):
+            main(["auto-sync", "install", "--dry-run", "--interval", "30m"])
+        assert "below the minimum" not in capsys.readouterr().err
+
     def test_install_error_exits_nonzero(self, capsys):
         fake = {"installed": False, "dry_run": False, "platform": "windows",
                 "method": "schtasks", "interval_minutes": 30,

@@ -5,12 +5,17 @@ import urllib.error
 import pytest
 from unittest.mock import patch
 
+import json
+
 from worsaga.client import (
     ALLOWED_FUNCTION_POLICIES,
     ALLOWED_FUNCTIONS,
     BLOCKED_PATTERNS,
+    AssignmentNotFoundError,
+    CourseNotFoundError,
     DownloadError,
     MoodleClient,
+    MoodleRequestError,
     MoodleWriteAttemptError,
 )
 from worsaga.config import MoodleConfig
@@ -389,3 +394,79 @@ class TestDownloadFile:
                     "https://moodle.example.com/pluginfile.php/123/file.txt",
                 )
         assert exc_info.value.code == "empty"
+
+
+def _exception_response(*, errorcode: str, message: str) -> "_FakeResponse":
+    """A _FakeResponse carrying a Moodle web-service exception payload."""
+    payload = json.dumps({
+        "exception": "dml_missing_record_exception",
+        "errorcode": errorcode,
+        "message": message,
+    }).encode()
+    return _FakeResponse(payload)
+
+
+class TestDomainNotFoundErrors:
+    """Moodle "record not found" failures become friendly, classifiable
+    domain exceptions instead of raw DB wording."""
+
+    def test_course_contents_missing_record_raises_course_not_found(self, client):
+        response = _exception_response(
+            errorcode="invalidrecord",
+            message="Can't find data record in database table course.",
+        )
+        with patch("urllib.request.urlopen", return_value=response):
+            with pytest.raises(CourseNotFoundError) as exc_info:
+                client.get_course_contents(999999)
+        assert exc_info.value.course_id == 999999
+        assert "999999" in str(exc_info.value)
+        assert "not enrolled or does not exist" in str(exc_info.value)
+        # The raw Moodle DB wording is replaced, not surfaced.
+        assert "data record" not in str(exc_info.value)
+
+    def test_course_not_found_detected_by_errorcode_only(self, client):
+        # A localised (non-English) message must still be classified via
+        # the stable errorcode.
+        response = _exception_response(
+            errorcode="invalidcourseid",
+            message="No se puede encontrar el registro",
+        )
+        with patch("urllib.request.urlopen", return_value=response):
+            with pytest.raises(CourseNotFoundError):
+                client.get_course_contents(42)
+
+    def test_grade_items_missing_record_raises_course_not_found(self, client):
+        response = _exception_response(
+            errorcode="invalidrecord",
+            message="Can't find data record in database table course.",
+        )
+        with patch("urllib.request.urlopen", return_value=response):
+            with pytest.raises(CourseNotFoundError) as exc_info:
+                client.get_user_grade_items(555)
+        assert exc_info.value.course_id == 555
+
+    def test_submission_status_missing_record_raises_assignment_not_found(self, client):
+        response = _exception_response(
+            errorcode="invalidrecord",
+            message="Can't find data record in database table assign.",
+        )
+        with patch("urllib.request.urlopen", return_value=response):
+            with pytest.raises(AssignmentNotFoundError) as exc_info:
+                client.get_assignment_submission_status(777)
+        assert exc_info.value.assignment_id == 777
+        # AssignmentNotFoundError stays a ValueError for backward compat.
+        assert isinstance(exc_info.value, ValueError)
+
+    def test_non_missing_record_moodle_error_stays_request_error(self, client):
+        # An auth/permission failure must keep raising, not be swallowed as
+        # a not-found domain error.
+        response = _exception_response(
+            errorcode="accessexception",
+            message="Access control exception",
+        )
+        with patch("urllib.request.urlopen", return_value=response):
+            with pytest.raises(MoodleRequestError) as exc_info:
+                client.get_course_contents(1)
+        assert not isinstance(exc_info.value, CourseNotFoundError)
+        assert "Moodle API error" in str(exc_info.value)
+        assert exc_info.value.errorcode == "accessexception"

@@ -25,6 +25,8 @@ import os
 import time
 import urllib.parse
 
+from worsaga.client import CourseNotFoundError
+
 DEMO_BASE_URL = "https://moodle.demo.invalid"
 DEMO_USERID = 7
 
@@ -240,11 +242,40 @@ def demo_pdf_bytes(filename: str) -> bytes:
 # Demo dataset (raw Moodle-shaped payloads)
 # ─────────────────────────────────────────────────────────────────
 
+# Fields mirror ``core_enrol_get_users_courses``: alongside the useful
+# id/shortname/fullname, Moodle returns bulky context an agent rarely needs
+# (HTML ``summary`` with inline styles, ``enrolledusercount``, a course
+# image, progress). Keeping them here lets demo mode exercise the
+# ``course_record`` normalisation boundary that strips them.
 DEMO_COURSES = [
-    {"id": 101, "shortname": "ECON101", "fullname": "Introduction to Economics"},
-    {"id": 102, "shortname": "CS210", "fullname": "Building With AI"},
-    {"id": 103, "shortname": "PSY110", "fullname": "Foundations of Psychology"},
-    {"id": 104, "shortname": "STAT120", "fullname": "Data For Decisions"},
+    {"id": 101, "shortname": "ECON101", "fullname": "Introduction to Economics",
+     "category": 2, "startdate": 1_725_148_800, "enddate": 1_744_675_200,
+     "enrolledusercount": 214, "visible": 1, "format": "topics",
+     "summaryformat": 1, "progress": 42,
+     "summary": ("<div class=\"no-overflow\"><p style=\"font-size:1.05em;"
+                 "line-height:1.5\">A first course in <strong>microeconomics"
+                 "</strong>: scarcity, incentives, and how markets set prices."
+                 "</p></div>")},
+    {"id": 102, "shortname": "CS210", "fullname": "Building With AI",
+     "category": 3, "startdate": 1_725_148_800, "enddate": 1_744_675_200,
+     "enrolledusercount": 96, "visible": 1, "format": "topics",
+     "summaryformat": 1, "progress": 30,
+     "summary": ("<div class=\"no-overflow\"><p style=\"margin:0 0 8px\">"
+                 "Design and evaluate practical applications built on "
+                 "<em>language models</em>.</p></div>")},
+    {"id": 103, "shortname": "PSY110", "fullname": "Foundations of Psychology",
+     "category": 4, "startdate": 1_725_148_800, "enddate": 1_744_675_200,
+     "enrolledusercount": 301, "visible": 1, "format": "topics",
+     "summaryformat": 1, "progress": 55,
+     "summary": ("<div class=\"no-overflow\"><p>Core ideas across cognitive, "
+                 "developmental, and social psychology.</p></div>")},
+    {"id": 104, "shortname": "STAT120", "fullname": "Data For Decisions",
+     "category": 2, "startdate": 1_725_148_800, "enddate": 1_744_675_200,
+     "enrolledusercount": 158, "visible": 1, "format": "topics",
+     "summaryformat": 1, "progress": 18,
+     "summary": ("<div class=\"no-overflow\"><p style=\"color:#333\">Turning "
+                 "messy data into defensible decisions with basic statistics."
+                 "</p></div>")},
 ]
 
 
@@ -309,13 +340,21 @@ def build_demo_dataset(now: int | None = None) -> dict:
 
     contents = {
         101: [
-            {"id": 1100, "section": 0, "name": "Course Information", "modules": [
+            {"id": 1100, "section": 0, "name": "Course Information",
+             "summary": ("<div class=\"no-overflow\"><p style=\"font-size:"
+                         "1.1em\">Welcome to <strong>ECON101</strong>. Start "
+                         "with the syllabus, then work through one week at a "
+                         "time.</p></div>"),
+             "summaryformat": 1, "modules": [
                 _file_module(5100, "Course syllabus", "ECON101-syllabus.pdf",
                              modified=at(-30)),
                 _plain_module(5199, "Announcements", "forum"),
             ]},
             {"id": 1101, "section": 1,
-             "name": "Week 1 - Foundations of Economic Thinking", "modules": [
+             "name": "Week 1 - Foundations of Economic Thinking",
+             "summary": ("<div class=\"no-overflow\"><p>Opportunity cost, "
+                         "incentives, and thinking at the margin.</p></div>"),
+             "summaryformat": 1, "modules": [
                 _file_module(5101, "Week 1 lecture slides",
                              "ECON101-week1-lecture-slides.pdf", modified=at(-21)),
              ]},
@@ -325,7 +364,30 @@ def build_demo_dataset(now: int | None = None) -> dict:
                              "ECON101-week2-lecture-slides.pdf", modified=at(-14)),
              ]},
             {"id": 1103, "section": 3,
-             "name": "Week 3 - Elasticity and Market Responses", "modules": [
+             "name": "Week 3 - Elasticity and Market Responses",
+             # A realistically verbose, inline-styled section summary of the
+             # kind real Moodle courses carry — it strips to a couple of
+             # plain-text sentences in get_course_contents.
+             "summary": (
+                 "<div class=\"no-overflow\">"
+                 "<h4 style=\"margin:0 0 6px;font-family:Arial,sans-serif;"
+                 "color:#1a1a1a\">Week 3: Elasticity and Market Responses</h4>"
+                 "<p style=\"line-height:1.6;color:#222;font-size:1.02em\">"
+                 "This week examines <strong>price elasticity</strong> of "
+                 "demand and supply and how total <em>revenue</em> responds "
+                 "when prices change.</p>"
+                 "<ul style=\"margin:8px 0 8px 18px;padding:0;color:#333\">"
+                 "<li style=\"margin-bottom:4px\">Define and compute the "
+                 "price elasticity of demand.</li>"
+                 "<li style=\"margin-bottom:4px\">Distinguish elastic, "
+                 "inelastic, and unit-elastic ranges.</li>"
+                 "<li style=\"margin-bottom:4px\">Relate elasticity to a "
+                 "firm's pricing decisions.</li></ul>"
+                 "<p style=\"line-height:1.6;color:#222\">Read the reading "
+                 "pack and attempt the problem set <span style=\"font-weight:"
+                 "600\">before</span> the workshop.</p></div>"
+             ),
+             "summaryformat": 1, "modules": [
                 _file_module(5103, "Week 3 lecture slides",
                              "ECON101-week3-lecture-slides.pdf", modified=at(-5)),
                 _file_module(5104, "Problem Set 3 brief",
@@ -445,11 +507,14 @@ def build_demo_dataset(now: int | None = None) -> dict:
 
     grades = {
         101: {"usergrades": [{"courseid": 101, "gradeitems": [
-            grade_item(9101, "Problem Set 1", "68.00", "68.00 %"),
-            grade_item(9102, "Problem Set 2", "72.00", "72.00 %"),
+            grade_item(9101, "Problem Set 1", "68.00", "68.00 %",
+                       gradedategraded=at(-10, 14)),
+            grade_item(9102, "Problem Set 2", "72.00", "72.00 %",
+                       gradedategraded=at(-5, 16)),
             grade_item(9103, "Problem Set 3", "-", None),
             grade_item(9104, "Course total", "70.00", "70.00 %",
-                       itemtype="course", itemmodule=None),
+                       itemtype="course", itemmodule=None,
+                       gradedategraded=at(-5, 16)),
         ]}]},
         102: {"usergrades": [{"courseid": 102, "gradeitems": [
             grade_item(9201, "Project Milestone 1", "-", None),
@@ -462,9 +527,11 @@ def build_demo_dataset(now: int | None = None) -> dict:
                        itemtype="course", itemmodule=None),
         ]}]},
         104: {"usergrades": [{"courseid": 104, "gradeitems": [
-            grade_item(9401, "Weekly Exercises", "81.00", "81.00 %"),
+            grade_item(9401, "Weekly Exercises", "81.00", "81.00 %",
+                       gradedategraded=at(-7, 11)),
             grade_item(9402, "Course total", "81.00", "81.00 %",
-                       itemtype="course", itemmodule=None),
+                       itemtype="course", itemmodule=None,
+                       gradedategraded=at(-7, 11)),
         ]}]},
     }
 
@@ -630,7 +697,22 @@ class DemoMoodleClient:
     def get_courses(self) -> list[dict]:
         return copy.deepcopy(self._data["courses"])
 
+    def _require_known_course(self, course_id: int) -> None:
+        """Mirror Moodle: an unknown course id is a not-found failure.
+
+        Real Moodle raises "Can't find data record in database table
+        course." for a course the user is not enrolled in; the demo client
+        raises the same :class:`CourseNotFoundError` so error-path
+        behaviour (CLI friendly message, MCP structured error dict) is
+        exercised offline. A *known* course with no contents/grades stays a
+        valid empty state.
+        """
+        known = {int(c["id"]) for c in self._data["courses"]}
+        if int(course_id) not in known:
+            raise CourseNotFoundError(int(course_id))
+
     def get_course_contents(self, course_id: int) -> list[dict]:
+        self._require_known_course(course_id)
         return copy.deepcopy(self._data["contents"].get(int(course_id), []))
 
     def get_assignments(self, course_id: int) -> dict:
@@ -650,6 +732,7 @@ class DemoMoodleClient:
         )
 
     def get_user_grade_items(self, course_id: int, user_id: int | None = None) -> dict:
+        self._require_known_course(course_id)
         return copy.deepcopy(
             self._data["grades"].get(int(course_id), {"usergrades": []})
         )

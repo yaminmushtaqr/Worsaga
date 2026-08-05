@@ -252,12 +252,13 @@ class TestBannerInCLI:
         # No Rich panel or ANSI box drawing from banner
         assert "┌" not in out
 
+    @patch("worsaga.cli._stdin_is_interactive", return_value=True)
     @patch("getpass.getpass", return_value="tok123")
     @patch("builtins.input", side_effect=["https://m.example.com", ""])
     @patch("worsaga.cli.test_connection")
     @patch("worsaga.cli.MoodleConfig.write_config")
     def test_interactive_setup_no_banner_when_quiet(
-        self, mock_write, mock_test_conn, mock_input, mock_getpass, capsys, tmp_path
+        self, mock_write, mock_test_conn, mock_input, mock_getpass, mock_tty, capsys, tmp_path
     ):
         """Interactive setup with -q should not show banner."""
         from worsaga.cli import main

@@ -25,7 +25,12 @@ from typing import Callable
 
 from worsaga.client import DownloadError
 from worsaga.extraction import clean_text, extract_file_text
-from worsaga.sections import find_best_section, get_downloadable_files
+from worsaga.sections import (
+    WeekNotFoundError,
+    find_best_section,
+    get_downloadable_files,
+    section_names,
+)
 from worsaga.summary_text import (
     _condense_line,
     _deduplicate_lines,
@@ -248,10 +253,23 @@ def build_weekly_summary(
     dict
         The result of :func:`build_summary` with ``section_name``,
         ``week`` and ``course_id`` fields added.
+
+    Raises
+    ------
+    WeekNotFoundError
+        When *week* matches no section in the course. A section that
+        matches but has no downloadable materials is a valid empty state
+        and does not raise.
     """
     if sections is None:
         sections = client.get_course_contents(course_id)
     section, section_type, section_name = find_best_section(sections, week)
+    if section is None:
+        raise WeekNotFoundError(
+            week,
+            available_sections=section_names(sections),
+            course_label=course_id,
+        )
 
     file_texts: list[tuple[str, str]] = []
     warnings: list[str] = []

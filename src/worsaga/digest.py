@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from worsaga.assignments import get_assignments
 from worsaga.client import MoodleClient, MoodleWriteAttemptError
+from worsaga.concurrency import ProgressCallback
 from worsaga.deadlines import get_upcoming_deadlines
 from worsaga.forums import get_latest_updates
 from worsaga.messages import get_messages, get_notifications
@@ -26,45 +27,40 @@ def _safe_source(
         return default
 
 
-def get_digest(client: MoodleClient, *, since_days: int = 1) -> dict[str, Any]:
-    """Return a live digest; partial source failures become warnings."""
+def get_digest(
+    client: MoodleClient,
+    *,
+    since_days: int = 1,
+    on_progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Return a live digest; partial source failures become warnings.
+
+    The five sources run in turn (each with its own internal per-course /
+    per-forum concurrency, which is where the time goes). ``on_progress``
+    (default silent) reports one completed source at a time so a caller can
+    show liveness instead of a multi-second hang.
+    """
     warnings: list[str] = []
-    deadlines = _safe_source(
-        "deadlines",
-        warnings,
-        lambda: get_upcoming_deadlines(client, lookahead_days=max(1, since_days)),
-        [],
-    )
-    assignments = _safe_source(
-        "assignments",
-        warnings,
-        lambda: get_assignments(client),
-        [],
-    )
-    updates = _safe_source(
-        "updates",
-        warnings,
-        lambda: get_latest_updates(client, since_days=since_days),
-        [],
-    )
-    notifications = _safe_source(
-        "notifications",
-        warnings,
-        lambda: get_notifications(client),
-        [],
-    )
-    messages = _safe_source(
-        "messages",
-        warnings,
-        lambda: get_messages(client, since_days=since_days),
-        [],
-    )
+    sources: list[tuple[str, Callable[[], Any]]] = [
+        ("deadlines",
+         lambda: get_upcoming_deadlines(client, lookahead_days=max(1, since_days))),
+        ("assignments", lambda: get_assignments(client)),
+        ("updates", lambda: get_latest_updates(client, since_days=since_days)),
+        ("notifications", lambda: get_notifications(client)),
+        ("messages", lambda: get_messages(client, since_days=since_days)),
+    ]
+    collected: dict[str, Any] = {}
+    total = len(sources)
+    for index, (name, fn) in enumerate(sources, start=1):
+        collected[name] = _safe_source(name, warnings, fn, [])
+        if on_progress is not None:
+            on_progress(index, total, name)
     return {
         "since_days": since_days,
-        "deadlines": deadlines,
-        "assignments": assignments,
-        "updates": updates,
-        "notifications": notifications,
-        "messages": messages,
+        "deadlines": collected["deadlines"],
+        "assignments": collected["assignments"],
+        "updates": collected["updates"],
+        "notifications": collected["notifications"],
+        "messages": collected["messages"],
         "warnings": warnings,
     }

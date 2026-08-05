@@ -5,6 +5,8 @@ JSON-encoded strings, and that error shapes for ``download_material`` are
 preserved as structured dicts.
 """
 
+import json
+
 import pytest
 from unittest.mock import patch
 
@@ -92,15 +94,28 @@ def _reset_client_cache():
 
 
 class TestNativeReturns:
-    def test_list_courses_returns_list(self):
+    def test_list_courses_returns_compact_records(self):
         client = _FakeClient(courses=[
-            {"id": 1, "shortname": "ECON101", "fullname": "Econ"},
+            {
+                "id": 1, "shortname": "ECON101", "fullname": "Econ",
+                "category": 2, "startdate": 1_725_148_800,
+                "enddate": 1_744_675_200,
+                # Bulky raw fields that must not survive normalization.
+                "summary": "<p style='x'>HTML summary</p>",
+                "enrolledusercount": 214,
+            },
         ])
         with patch.object(mcp_server, "_get_client", return_value=client):
             result = mcp_server.list_courses()
 
         assert isinstance(result, list)
-        assert result == [{"id": 1, "shortname": "ECON101", "fullname": "Econ"}]
+        assert result == [{
+            "id": 1, "shortname": "ECON101", "fullname": "Econ",
+            "category": 2, "start_at": 1_725_148_800, "end_at": 1_744_675_200,
+        }]
+        # HTML summary and enrolment counts are dropped.
+        assert "summary" not in result[0]
+        assert "enrolledusercount" not in result[0]
 
     def test_get_deadlines_returns_list(self):
         client = _FakeClient()
@@ -248,14 +263,42 @@ class TestNativeReturns:
             result = mcp_server.get_calendar_events(course_id=42, week="3")
         assert [row["id"] for row in result] == [1]
 
-    def test_get_course_contents_returns_list(self):
-        sections = [{"id": 1, "name": "Week 1", "modules": []}]
+    def test_get_course_contents_returns_compact_sections(self):
+        sections = [{
+            "id": 1, "section": 1, "name": "Week 1",
+            "summary": "<div><p style='x'>Intro &amp; setup.</p></div>",
+            "modules": [{
+                "id": 10, "name": "Lecture 1", "modname": "resource",
+                "contents": [{
+                    "type": "file", "filename": "w1.pdf",
+                    "fileurl": "https://moodle.example.com/pluginfile.php/1/w1.pdf",
+                    "filesize": 2048, "mimetype": "application/pdf",
+                    "timemodified": 1700000000,
+                }],
+            }],
+        }]
         client = _FakeClient(contents=sections)
         with patch.object(mcp_server, "_get_client", return_value=client):
             result = mcp_server.get_course_contents(42)
 
         assert isinstance(result, list)
-        assert result == sections
+        section = result[0]
+        assert section["section_id"] == 1
+        assert section["section_num"] == 1
+        assert section["section_name"] == "Week 1"
+        # Section summary is HTML-stripped plain text.
+        assert section["summary"] == "Intro & setup."
+        module = section["modules"][0]
+        assert module["module_id"] == 10
+        assert module["module_type"] == "resource"
+        assert "view_url" in module
+        file_record = module["files"][0]
+        assert file_record["file_name"] == "w1.pdf"
+        assert file_record["file_size"] == 2048
+        assert "dedupe_key" in file_record
+        # Raw authenticated URLs never appear.
+        assert "file_url" not in file_record
+        assert "fileurl" not in str(result).lower()
 
     def test_get_week_materials_returns_list(self):
         sections = [
@@ -618,3 +661,526 @@ class TestFastMCPRegistration:
     @pytest.mark.parametrize("name", TOOL_NAMES)
     def test_tool_is_registered_with_fastmcp(self, name):
         assert name in mcp_server.mcp._tool_manager._tools
+
+
+# ── Week-not-found structured errors (MCP) ─────────────────────────
+
+
+def _econ_demo_course_id():
+    from worsaga.demo import DemoMoodleClient
+
+    for course in DemoMoodleClient().get_courses():
+        if course.get("shortname") == "ECON101":
+            return course["id"]
+    raise AssertionError("demo dataset must include ECON101")
+
+
+class TestWeekNotFoundMcp:
+    """Nonsense/unmatched weeks must return an agent-branchable structured
+    error, never a fabricated success payload. Empty-but-matched stays a
+    valid success. Exercised against the built-in demo dataset."""
+
+    NONSENSE = "qwertyuiop_not_a_real_week"
+
+    def _demo_client(self):
+        from worsaga.demo import DemoMoodleClient
+
+        return DemoMoodleClient()
+
+    def test_get_weekly_summary_unmatched_week(self):
+        course_id = _econ_demo_course_id()
+        with patch.object(mcp_server, "_get_client",
+                          return_value=self._demo_client()):
+            result = mcp_server.get_weekly_summary(course_id, self.NONSENSE)
+
+        assert result["error_code"] == "week_not_found"
+        assert self.NONSENSE in result["error"]
+        assert any("Week 3" in n for n in result["available_sections"])
+        # A fabricated summary would carry bullets/method; the error must not.
+        assert "bullets" not in result
+        assert "method" not in result
+
+    def test_get_weekly_summary_empty_but_valid_week(self):
+        course_id = _econ_demo_course_id()
+        with patch.object(mcp_server, "_get_client",
+                          return_value=self._demo_client()):
+            result = mcp_server.get_weekly_summary(course_id, "revision")
+
+        assert "error" not in result
+        assert result["bullets"]
+        assert "Revision" in result["section_name"]
+
+    def test_export_study_pack_unmatched_week(self, tmp_path):
+        course_id = _econ_demo_course_id()
+        with patch.object(mcp_server, "_get_client",
+                          return_value=self._demo_client()), \
+             patch.object(mcp_server, "default_downloads_dir",
+                          return_value=tmp_path):
+            result = mcp_server.export_study_pack(course_id, self.NONSENSE)
+
+        assert result["error_code"] == "week_not_found"
+        assert self.NONSENSE in result["error"]
+        assert "path" not in result
+        # Nothing may be written for an unmatched week.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_get_week_materials_unmatched_week(self):
+        course_id = _econ_demo_course_id()
+        with patch.object(mcp_server, "_get_client",
+                          return_value=self._demo_client()):
+            result = mcp_server.get_week_materials(course_id, self.NONSENSE)
+
+        assert isinstance(result, dict)
+        assert result["error_code"] == "week_not_found"
+        assert any("Week 3" in n for n in result["available_sections"])
+        # No token/URL leakage on the error path.
+        assert "token" not in str(result).lower()
+        assert "fileurl" not in str(result).lower()
+
+    def test_get_week_materials_empty_but_valid_week(self):
+        course_id = _econ_demo_course_id()
+        with patch.object(mcp_server, "_get_client",
+                          return_value=self._demo_client()):
+            result = mcp_server.get_week_materials(course_id, "revision")
+
+        # A matched section with no downloadable files is a valid empty list.
+        assert isinstance(result, list)
+        assert result == []
+
+    def test_get_week_materials_valid_week_returns_list(self):
+        course_id = _econ_demo_course_id()
+        with patch.object(mcp_server, "_get_client",
+                          return_value=self._demo_client()):
+            result = mcp_server.get_week_materials(course_id, "3")
+
+        assert isinstance(result, list)
+        assert result
+        assert any(m["file_name"].endswith(".pdf") for m in result)
+
+
+# ── ISSUE 1: normalization/token hygiene for list/contents tools ──────
+
+_LEAK_TOKEN = "wstoken_SUPERSECRET_deadbeef"
+
+
+class TestListCoursesNoTokenLeak:
+    """list_courses must normalise the raw payload — no HTML, no course
+    image URL, and above all no embedded webservice token."""
+
+    def _raw_courses(self):
+        return [{
+            "id": 1, "shortname": "ECON101", "fullname": "Economics",
+            "category": 2, "startdate": 1_725_148_800, "enddate": 1_744_675_200,
+            "enrolledusercount": 214,
+            "summary": "<div style='x'><p>HTML <b>summary</b> body</p></div>",
+            "summaryformat": 1,
+            # On mobile-service Moodle the course image URL embeds the token.
+            "overviewfiles": [{
+                "filename": "course.jpg",
+                "fileurl": (
+                    "https://moodle.example.com/webservice/pluginfile.php/"
+                    f"1/course/overviewfiles/0/course.jpg?token={_LEAK_TOKEN}"
+                ),
+            }],
+        }]
+
+    def test_no_token_or_html_in_list_courses(self):
+        client = _FakeClient(courses=self._raw_courses())
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.list_courses()
+
+        dumped = json.dumps(result)
+        assert _LEAK_TOKEN not in dumped
+        assert "token" not in dumped.lower()
+        assert "pluginfile" not in dumped
+        assert "<" not in dumped  # no HTML fragments
+        assert result[0]["shortname"] == "ECON101"
+        assert result[0]["start_at"] == 1_725_148_800
+        assert "enrolledusercount" not in result[0]
+
+
+class TestCourseContentsNoTokenLeak:
+    """get_course_contents must route through the sanitize boundary: a
+    token-bearing fileurl in the raw payload must never reach the output."""
+
+    def _raw_sections(self):
+        return [{
+            "id": 1, "section": 1, "name": "Week 1",
+            "summary": "<div style='color:red'><p>Read <b>ch. 1</b></p></div>",
+            "modules": [{
+                "id": 10, "name": "Lecture 1 slides", "modname": "resource",
+                "description": "<p>slides</p>",
+                "contents": [{
+                    "type": "file", "filename": "w1.pdf",
+                    "fileurl": (
+                        "https://moodle.example.com/webservice/pluginfile.php/"
+                        f"10/mod_resource/content/1/w1.pdf?token={_LEAK_TOKEN}"
+                    ),
+                    "filepath": "/", "filesize": 4096,
+                    "mimetype": "application/pdf", "timemodified": 1700000000,
+                }],
+            }],
+        }]
+
+    def test_no_token_or_fileurl_in_course_contents(self):
+        client = _FakeClient(contents=self._raw_sections())
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.get_course_contents(42)
+
+        dumped = json.dumps(result)
+        assert _LEAK_TOKEN not in dumped
+        assert "token" not in dumped.lower()
+        assert "file_url" not in dumped
+        assert "fileurl" not in dumped.lower()
+        assert "<" not in dumped  # section summary is stripped to plain text
+        # The compact shape is still useful.
+        section = result[0]
+        assert section["summary"] == "Read ch. 1"
+        assert section["modules"][0]["files"][0]["file_name"] == "w1.pdf"
+
+    def test_course_contents_much_smaller_than_raw(self):
+        raw = self._raw_sections()
+        client = _FakeClient(contents=raw)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.get_course_contents(42)
+        assert len(json.dumps(result)) < len(json.dumps(raw))
+
+
+# ── ISSUE 2: course/assignment not-found structured errors (MCP) ──────
+
+
+def _demo():
+    from worsaga.demo import DemoMoodleClient
+
+    return DemoMoodleClient()
+
+
+class TestCourseNotFoundMcp:
+    """Every tool taking a course/assignment id returns an agent-branchable
+    structured error for a bad id, not an isError string of raw DB wording.
+    Exercised against the demo dataset (course 999999 is not enrolled)."""
+
+    BAD = 999999
+
+    def _assert_course_not_found(self, result):
+        assert isinstance(result, dict)
+        assert result["error_code"] == "course_not_found"
+        assert str(self.BAD) in result["error"]
+        # Raw Moodle DB wording never surfaces; no token leakage.
+        assert "data record" not in result["error"].lower()
+        assert "token" not in str(result).lower()
+
+    def test_get_course_contents_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(mcp_server.get_course_contents(self.BAD))
+
+    def test_get_grades_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(mcp_server.get_grades(self.BAD))
+
+    def test_get_grade_summary_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(mcp_server.get_grade_summary(self.BAD))
+
+    def test_get_week_materials_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(
+                mcp_server.get_week_materials(self.BAD, "3")
+            )
+
+    def test_search_course_content_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(
+                mcp_server.search_course_content(self.BAD, "regression")
+            )
+
+    def test_get_weekly_summary_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(
+                mcp_server.get_weekly_summary(self.BAD, "3")
+            )
+
+    def test_extract_material_course_not_found(self):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(
+                mcp_server.extract_material(self.BAD, "3")
+            )
+
+    def test_download_material_course_not_found(self, tmp_path):
+        with patch.object(mcp_server, "_get_client", return_value=_demo()), \
+             patch.object(mcp_server, "default_downloads_dir",
+                          return_value=tmp_path):
+            self._assert_course_not_found(
+                mcp_server.download_material(self.BAD, "3")
+            )
+
+    def test_get_calendar_events_week_course_not_found(self):
+        # Week filtering fetches course contents, which surfaces a bad
+        # course id as course_not_found rather than raising.
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            self._assert_course_not_found(
+                mcp_server.get_calendar_events(self.BAD, week="3")
+            )
+
+    def test_get_assignment_status_assignment_not_found(self):
+        course_id = _econ_demo_course_id()
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            result = mcp_server.get_assignment_status(course_id, self.BAD)
+        assert result["error_code"] == "assignment_not_found"
+        assert str(self.BAD) in result["error"]
+
+    def test_error_codes_are_documented_vocabulary(self):
+        assert "course_not_found" in mcp_server.ERROR_CODES
+        assert "assignment_not_found" in mcp_server.ERROR_CODES
+        assert "week_not_found" in mcp_server.ERROR_CODES
+
+
+# ── ISSUE 3: extract_material response is deterministically bounded ────
+
+
+def _section_with_big_txt(char_count):
+    text = "\n".join(
+        f"unique economics note number {i} on supply demand and elasticity"
+        for i in range(char_count // 60 + 1)
+    )
+    return _section_with_txt_material(text_name="big.txt"), text.encode()
+
+
+class TestExtractMaterialBounding:
+    def test_markdown_omitted_by_default(self):
+        sections = _section_with_txt_material()
+        client = _FakeClient(contents=sections, file_bytes=b"Short study note.")
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(42, "1", index=0)
+        assert result["pages"]
+        assert "markdown" not in result["pages"][0]
+        assert result["pages"][0]["text"]
+
+    def test_markdown_included_on_request(self):
+        sections = _section_with_txt_material()
+        client = _FakeClient(contents=sections, file_bytes=b"Short study note.")
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(
+                42, "1", index=0, include_markdown=True,
+            )
+        assert "markdown" in result["pages"][0]
+
+    def test_response_bounded_default(self):
+        sections, blob = _section_with_big_txt(400_000)
+        client = _FakeClient(contents=sections, file_bytes=blob)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(42, "1", index=0)
+        assert len(json.dumps(result)) <= mcp_server.MAX_EXTRACT_RESPONSE_CHARS
+        # No markdown duplication on the default path.
+        assert all("markdown" not in p for p in result["pages"])
+
+    def test_response_bounded_with_markdown(self):
+        sections, blob = _section_with_big_txt(400_000)
+        client = _FakeClient(contents=sections, file_bytes=blob)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(
+                42, "1", index=0, include_markdown=True,
+            )
+        dumped = json.dumps(result)
+        assert len(dumped) <= mcp_server.MAX_EXTRACT_RESPONSE_CHARS
+        assert _LEAK_TOKEN not in dumped
+
+    def test_oversize_response_warns_about_truncation(self):
+        sections, blob = _section_with_big_txt(400_000)
+        client = _FakeClient(contents=sections, file_bytes=blob)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.extract_material(
+                42, "1", index=0, include_markdown=True,
+            )
+        assert len(json.dumps(result)) <= mcp_server.MAX_EXTRACT_RESPONSE_CHARS
+        assert any("truncated" in w.lower() for w in result["warnings"])
+
+
+# ── Course-argument resolution: int|str short-codes (MCP) ─────────────
+
+
+class TestCourseArgResolution:
+    """Course-taking tools accept a numeric id *or* a course short-code
+    (exact match or unambiguous prefix), returning structured errors for
+    unknown and ambiguous names — so an agent need not call list_courses
+    first."""
+
+    def _courses(self):
+        return [
+            {"id": 10, "shortname": "ECON101", "fullname": "Economics"},
+            {"id": 20, "shortname": "PSY110", "fullname": "Psychology"},
+        ]
+
+    def _grade_payload(self):
+        return {"usergrades": [{"courseid": 10, "gradeitems": [
+            {"id": 1, "itemname": "Essay", "gradeformatted": "70.00",
+             "percentageformatted": "70.0 %"},
+        ]}]}
+
+    def test_shortname_digit_and_numeric_id_are_identical(self):
+        client = _FakeClient(
+            courses=self._courses(), grade_payload=self._grade_payload(),
+        )
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            by_name = mcp_server.get_grades("ECON101")
+            by_id = mcp_server.get_grades(10)
+            by_digit = mcp_server.get_grades("10")
+        assert by_name == by_id == by_digit
+        assert by_name and by_name[0]["item_name"] == "Essay"
+
+    def test_shortname_is_case_insensitive(self):
+        client = _FakeClient(
+            courses=self._courses(), grade_payload=self._grade_payload(),
+        )
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            assert mcp_server.get_grades("econ101") == mcp_server.get_grades(10)
+
+    def test_unknown_name_returns_course_not_found(self):
+        client = _FakeClient(courses=self._courses())
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.get_grades("NOTACOURSE")
+        assert result["error_code"] == "course_not_found"
+        assert "NOTACOURSE" in result["error"]
+        assert "token" not in str(result).lower()
+
+    def test_ambiguous_prefix_returns_candidate_list(self):
+        courses = [
+            {"id": 30, "shortname": "CS210_2526", "fullname": "AI 25/26"},
+            {"id": 31, "shortname": "CS210_2425", "fullname": "AI 24/25"},
+        ]
+        with patch.object(mcp_server, "_get_client",
+                          return_value=_FakeClient(courses=courses)):
+            result = mcp_server.get_grades("CS210")
+        assert result["error_code"] == "course_ambiguous"
+        assert {c["id"] for c in result["candidates"]} == {30, 31}
+        assert all(
+            {"id", "shortname", "fullname"} <= set(c)
+            for c in result["candidates"]
+        )
+        assert "ambiguous" in result["error"]
+
+    def test_none_still_means_all_courses(self):
+        client = _FakeClient(
+            courses=self._courses(), grade_payload=self._grade_payload(),
+        )
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.get_grades()
+        assert isinstance(result, list)
+
+    def test_resolution_shared_across_tools(self):
+        client = _FakeClient(
+            courses=self._courses(),
+            forums_payload={"forums": [
+                {"id": 5, "course": 10, "name": "Announcements"}]},
+        )
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            by_name = mcp_server.get_course_forums("ECON101")
+            by_id = mcp_server.get_course_forums(10)
+        assert by_name == by_id
+        assert by_name and by_name[0]["forum_id"] == 5
+
+    def test_ambiguous_code_is_documented_vocabulary(self):
+        assert "course_ambiguous" in mcp_server.ERROR_CODES
+
+
+# ── get_connection_info: read-only auth/site/user check (MCP) ──────────
+
+
+class TestGetConnectionInfo:
+    """A cheap, read-only "am I connected?" tool: correct compact shape,
+    demo flag honoured, no token in the output, and auth/network failures
+    surfaced as structured error dicts."""
+
+    def test_demo_shape_and_no_token_word(self, monkeypatch):
+        monkeypatch.setenv("WORSAGA_DEMO", "1")
+        with patch.object(mcp_server, "_get_client", return_value=_demo()):
+            result = mcp_server.get_connection_info()
+        assert result["authenticated"] is True
+        assert result["demo_mode"] is True
+        assert result["config_source"] == "demo"
+        assert result["config_path"] is None
+        assert result["user_id"] == 7
+        assert result["user_display_name"] == "Demo Student"
+        assert result["site_url"] == "https://moodle.demo.invalid"
+        assert result["worsaga_version"]
+        # No token, and no webservice path, in the base site URL.
+        assert "token" not in json.dumps(result).lower()
+        assert "webservice" not in result["site_url"]
+
+    def test_no_secret_token_leaks_from_live_client(self, monkeypatch):
+        monkeypatch.delenv("WORSAGA_DEMO", raising=False)
+
+        class _TokenClient:
+            is_demo = False
+            base_url = "https://moodle.example.com"
+            _token = _LEAK_TOKEN  # secret that must never surface
+
+            def call(self, wsfunction, **params):
+                return {
+                    "sitename": "Example University", "userid": 5,
+                    "fullname": "Jane Doe", "username": "jdoe",
+                    "siteurl": "https://moodle.example.com",
+                }
+
+        with patch.object(mcp_server, "_get_client", return_value=_TokenClient()):
+            result = mcp_server.get_connection_info()
+        assert _LEAK_TOKEN not in json.dumps(result)
+        assert result["authenticated"] is True
+        assert result["demo_mode"] is False
+        assert result["user_display_name"] == "Jane Doe"
+        assert result["config_source"] in {"env", "file", "unset"}
+
+    def test_auth_failure_returns_auth_error_code(self, monkeypatch):
+        monkeypatch.delenv("WORSAGA_DEMO", raising=False)
+        from worsaga.client import MoodleRequestError
+
+        class _AuthFail:
+            base_url = "https://moodle.example.com"
+
+            def call(self, wsfunction, **params):
+                raise MoodleRequestError(
+                    "Moodle API error: Invalid token supplied",
+                    errorcode="invalidtoken",
+                )
+
+        with patch.object(mcp_server, "_get_client", return_value=_AuthFail()):
+            result = mcp_server.get_connection_info()
+        assert result["error_code"] == "auth"
+        assert _LEAK_TOKEN not in json.dumps(result)
+
+    def test_network_failure_returns_network_error_code(self, monkeypatch):
+        monkeypatch.delenv("WORSAGA_DEMO", raising=False)
+        import urllib.error
+
+        class _NetFail:
+            base_url = "https://moodle.example.com"
+
+            def call(self, wsfunction, **params):
+                raise urllib.error.URLError("connection timed out")
+
+        with patch.object(mcp_server, "_get_client", return_value=_NetFail()):
+            result = mcp_server.get_connection_info()
+        assert result["error_code"] == "network"
+
+    def test_missing_config_returns_auth_error_code(self, monkeypatch):
+        monkeypatch.delenv("WORSAGA_DEMO", raising=False)
+
+        def _raise():
+            raise ValueError("Moodle URL not configured. Run 'worsaga setup'.")
+
+        with patch.object(mcp_server, "_get_client", side_effect=_raise):
+            result = mcp_server.get_connection_info()
+        assert result["error_code"] == "auth"
+        assert "configured" in result["error"]
+
+
+def test_module_docstring_lists_every_registered_tool():
+    """The module docstring's tool enumeration must match tools/list exactly,
+    so the documented surface never drifts from the registered one."""
+    import re
+
+    registered = set(mcp_server.mcp._tool_manager._tools)
+    listed = set(re.findall(r"^ {4}- (\w+)$", mcp_server.__doc__ or "", re.M))
+    assert listed == registered
+    assert "get_connection_info" in registered
+    assert len(registered) == 26

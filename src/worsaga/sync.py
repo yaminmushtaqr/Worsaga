@@ -40,6 +40,7 @@ from typing import Any, Callable
 
 from worsaga.cache import CacheStore, default_cache_path
 from worsaga.client import MoodleClient, MoodleWriteAttemptError
+from worsaga.concurrency import ProgressCallback, run_parallel
 from worsaga.deadlines import get_upcoming_deadlines
 from worsaga.forums import normalize_forum_discussions, normalize_forums
 from worsaga.grades import collect_grades
@@ -169,29 +170,53 @@ def _safe_fetch(
         return None
 
 
-def _fetch_file_metadata(client: MoodleClient) -> list[dict[str, Any]]:
-    """Return token-free material metadata across all enrolled courses."""
-    records: list[dict[str, Any]] = []
-    for course in client.get_courses():
+def _fetch_file_metadata(
+    client: MoodleClient,
+    *,
+    on_progress: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
+    """Return token-free material metadata across all enrolled courses.
+
+    The per-course ``get_course_contents`` fetch fans out concurrently and
+    the results are reassembled in course order. As with the sequential
+    version, a per-course failure propagates (this snapshot is strict — an
+    errored fetch must never look like an empty Moodle); the caller's
+    :func:`_safe_fetch` turns it into a skipped category.
+    """
+    courses = [c for c in client.get_courses() if c.get("id")]
+
+    def _fetch_course(course: dict[str, Any]) -> list[dict[str, Any]]:
         course_id = course.get("id")
-        if not course_id:
-            continue
         sections = client.get_course_contents(course_id)
         materials = strip_file_urls(
             extract_materials(sections, course_id, base_url=client.base_url)
         )
         for material in materials:
             material["course_shortname"] = str(course.get("shortname", ""))
-        records.extend(materials)
+        return materials
+
+    records: list[dict[str, Any]] = []
+    for per_course in run_parallel(
+        courses,
+        _fetch_course,
+        label_fn=lambda c: str(c.get("shortname") or c.get("id") or ""),
+        on_progress=on_progress,
+    ):
+        records.extend(per_course)
     return records
 
 
-def _fetch_forum_discussions(client: MoodleClient) -> list[dict[str, Any]]:
+def _fetch_forum_discussions(
+    client: MoodleClient,
+    *,
+    on_progress: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
     """Return all forum discussions across enrolled courses.
 
     Unlike :func:`worsaga.forums.get_latest_updates`, per-forum failures
     propagate: for change detection an errored fetch must never be
-    mistaken for a Moodle with no forum activity.
+    mistaken for a Moodle with no forum activity. The per-forum fetch fans
+    out concurrently with results reassembled in forum order.
     """
     courses = client.get_courses()
     course_ids = [c["id"] for c in courses if c.get("id")]
@@ -199,8 +224,8 @@ def _fetch_forum_discussions(client: MoodleClient) -> list[dict[str, Any]]:
         c["id"]: str(c.get("shortname") or c["id"]) for c in courses if c.get("id")
     }
     forums = normalize_forums(client.get_forums_by_courses(course_ids), course_id=0)
-    records: list[dict[str, Any]] = []
-    for forum in forums:
+
+    def _fetch_forum(forum: dict[str, Any]) -> list[dict[str, Any]]:
         course_id = forum.get("course_id") or 0
         discussions = normalize_forum_discussions(
             client.get_forum_discussions(forum["forum_id"]),
@@ -213,7 +238,16 @@ def _fetch_forum_discussions(client: MoodleClient) -> list[dict[str, Any]]:
             discussion["course_shortname"] = course_names.get(
                 course_id, str(course_id)
             )
-        records.extend(discussions)
+        return discussions
+
+    records: list[dict[str, Any]] = []
+    for per_forum in run_parallel(
+        forums,
+        _fetch_forum,
+        label_fn=lambda f: str(f.get("name") or f.get("forum_id") or ""),
+        on_progress=on_progress,
+    ):
+        records.extend(per_forum)
     return records
 
 
@@ -221,6 +255,7 @@ def collect_snapshots(
     client: MoodleClient,
     *,
     lookahead_days: int = SYNC_LOOKAHEAD_DAYS,
+    on_progress: ProgressCallback | None = None,
 ) -> tuple[
     dict[str, list[dict[str, Any]] | None],
     dict[str, list[Any] | None],
@@ -233,9 +268,20 @@ def collect_snapshots(
     *warnings*. ``scopes`` records per-category coverage where partial
     success is tolerated (grades: the course ids whose gradebooks were
     actually readable); ``None`` scope means full coverage.
+
+    ``on_progress`` (default silent) receives per-course/per-forum progress
+    from the grades, files, and forums fan-outs, each label prefixed with
+    its phase (e.g. ``files: ECON101``).
     """
     warnings: list[str] = []
     scopes: dict[str, list[Any] | None] = {name: None for name in SYNC_CATEGORIES}
+
+    def _phase(name: str) -> ProgressCallback | None:
+        if on_progress is None:
+            return None
+        return lambda done, total, label: on_progress(
+            done, total, f"{name}: {label}"
+        )
 
     try:
         course_ids = [c["id"] for c in client.get_courses() if c.get("id")]
@@ -247,7 +293,8 @@ def collect_snapshots(
         return {name: None for name in SYNC_CATEGORIES}, scopes, warnings
 
     grades_result = _safe_fetch(
-        "grades", warnings, lambda: collect_grades(client),
+        "grades", warnings,
+        lambda: collect_grades(client, on_progress=_phase("grades")),
     )
     grades_snapshot: list[dict[str, Any]] | None = None
     if grades_result is not None:
@@ -271,11 +318,13 @@ def collect_snapshots(
             ),
         ),
         "files": _safe_fetch(
-            "files", warnings, lambda: _fetch_file_metadata(client),
+            "files", warnings,
+            lambda: _fetch_file_metadata(client, on_progress=_phase("files")),
         ),
         "grades": grades_snapshot,
         "forums": _safe_fetch(
-            "forums", warnings, lambda: _fetch_forum_discussions(client),
+            "forums", warnings,
+            lambda: _fetch_forum_discussions(client, on_progress=_phase("forums")),
         ),
     }
     return snapshots, scopes, warnings
@@ -287,12 +336,19 @@ def run_sync(
     cache_path: str | Path | None = None,
     lookahead_days: int = SYNC_LOOKAHEAD_DAYS,
     now: int | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Sync metadata into the local cache and return detected changes."""
+    """Sync metadata into the local cache and return detected changes.
+
+    ``on_progress`` (default silent) is forwarded to the per-course /
+    per-forum snapshot fan-outs so callers can show live progress while the
+    network-bound fetch phase runs; the diff/write phase against the cache
+    stays single-threaded.
+    """
     started_at = int(time.time()) if now is None else int(now)
     site = client.base_url
     snapshots, scopes, warnings = collect_snapshots(
-        client, lookahead_days=lookahead_days,
+        client, lookahead_days=lookahead_days, on_progress=on_progress,
     )
 
     categories: dict[str, Any] = {}

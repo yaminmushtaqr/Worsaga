@@ -18,6 +18,71 @@ from pathlib import PurePosixPath
 from worsaga.extraction import FILE_PRIORITY
 
 
+# ── Errors ───────────────────────────────────────────────────────
+
+
+def week_not_found_message(week: int | str, course_label: str | int = "") -> str:
+    """Return the canonical "no matching section" message for a week query.
+
+    Shared by :class:`WeekNotFoundError` and the CLI so the human and
+    structured surfaces phrase an unmatched week identically. ASCII only,
+    so it stays safe on legacy console encodings.
+    """
+    location = f" in course {course_label}" if course_label != "" else ""
+    return f"no section matching week '{week}'{location}"
+
+
+class WeekNotFoundError(ValueError):
+    """Raised when a week query matches no section in a course.
+
+    This is the explicit-failure signal for a genuinely unmatched week
+    (nonsense input, or a week simply not present in the course). It is
+    deliberately distinct from a section that *does* match but has no
+    downloadable materials — that is a legitimate empty state and never
+    raises.
+
+    Subclasses :class:`ValueError` so the CLI's top-level handler turns
+    an unhandled instance into a clean ``Error: ...`` exit rather than a
+    traceback; every surface still catches it explicitly to add the
+    available-section list.
+
+    Attributes
+    ----------
+    week : int | str
+        The offending week query.
+    available_sections : list[str]
+        Names of the sections actually present, to help the user recover.
+    course_label : str
+        Course id or shortname used in the message.
+    """
+
+    def __init__(
+        self,
+        week: int | str,
+        *,
+        available_sections: list[str] | None = None,
+        course_label: str | int = "",
+    ):
+        self.week = week
+        self.available_sections = available_sections or []
+        self.course_label = str(course_label)
+        super().__init__(week_not_found_message(week, course_label))
+
+
+def section_names(sections: list[dict]) -> list[str]:
+    """Return the non-empty section names in course order.
+
+    Used to build the ``available_sections`` recovery list shown when a
+    week query matches nothing.
+    """
+    names: list[str] = []
+    for section in sections:
+        name = str(section.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
 # ── Constants ────────────────────────────────────────────────────
 
 MAX_FILES_PER_SECTION = 5
@@ -262,6 +327,16 @@ def find_best_section(
         material_candidates.sort(key=lambda x: -x[0])
         _, section, name = material_candidates[0]
         return (section, "fallback", name)
+
+    # A section matched this week by name/number but has no downloadable
+    # files, and neither does any other section (a materials-free course).
+    # Return that matched-but-empty section rather than losing the match:
+    # an empty week is a valid state, and a genuine "no section matches"
+    # must stay the only case that yields ``None`` here so callers can
+    # treat it as an explicit failure.
+    if scored:
+        _, section, stype, name = scored[0]
+        return (section, stype, name)
 
     return (None, "general", "")
 

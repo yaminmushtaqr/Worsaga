@@ -29,7 +29,12 @@ from worsaga.cache import sanitize_payload
 from worsaga.client import DownloadError
 from worsaga.extraction import MAX_TEXT_PER_FILE, extract_file_structured
 from worsaga.materials import _reserve_path, _sanitize_filename
-from worsaga.sections import find_best_section, get_downloadable_files
+from worsaga.sections import (
+    WeekNotFoundError,
+    find_best_section,
+    get_downloadable_files,
+    section_names,
+)
 from worsaga.summaries import build_summary
 
 if TYPE_CHECKING:
@@ -99,6 +104,13 @@ def build_study_pack(
         ``section_type``, ``summary_method``, ``bullets``, ``files``
         (name/size/pages per included file), ``suggested_filename``,
         and ``warnings``.
+
+    Raises
+    ------
+    WeekNotFoundError
+        When *week* matches no section in the course. A section that
+        matches but has no downloadable materials is a valid empty state
+        and yields a coherent pack without raising.
     """
     generated_at = int(time.time()) if now is None else int(now)
 
@@ -113,6 +125,12 @@ def build_study_pack(
     if sections is None:
         sections = client.get_course_contents(course_id)
     section, section_type, section_name = find_best_section(sections, week)
+    if section is None:
+        raise WeekNotFoundError(
+            week,
+            available_sections=section_names(sections),
+            course_label=course_shortname or str(course_id),
+        )
 
     warnings: list[str] = []
     file_texts: list[tuple[str, str]] = []

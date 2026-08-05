@@ -1,10 +1,16 @@
 """Tests for grade normalization and retrieval."""
 
+import time
 from unittest.mock import Mock
 
 import pytest
 
-from worsaga.grades import get_grade_summary, get_grades, normalize_grade_items
+from worsaga.grades import (
+    collect_grades,
+    get_grade_summary,
+    get_grades,
+    normalize_grade_items,
+)
 
 
 def _payload(*items):
@@ -38,6 +44,31 @@ def test_normalize_grade_items_rich_payload():
     assert record["feedback"] == "Good work"
     assert record["status"] == "graded"
     assert record["graded"] is True
+
+
+def test_normalize_grade_items_captures_graded_at_and_derives_iso():
+    result = normalize_grade_items(
+        _payload({
+            "id": 10, "itemname": "Midterm", "gradeformatted": "85.00",
+            "gradedategraded": 1_700_000_000,
+        }),
+        course_id=1,
+        course_shortname="ECON101",
+    )
+    record = result[0]
+    assert record["graded_at"] == 1_700_000_000
+    assert record["graded_iso"] == "2023-11-14T22:13:20+00:00"
+    assert record["graded_str"]
+
+
+def test_normalize_grade_items_no_grade_date_leaves_derived_empty():
+    result = normalize_grade_items(
+        _payload({"id": 10, "itemname": "Essay", "gradeformatted": "-"}),
+        course_id=1,
+        course_shortname="ECON101",
+    )
+    assert result[0]["graded_at"] is None
+    assert result[0]["graded_iso"] == ""
 
 
 def test_normalize_grade_items_statuses():
@@ -117,6 +148,69 @@ def test_get_grades_one_course_reraises_fetch_error():
     client.get_user_grade_items = Mock(side_effect=RuntimeError("denied"))
     with pytest.raises(RuntimeError, match="denied"):
         get_grades(client, course_id=1)
+
+
+class _DelayedGradeClient:
+    """Fake whose per-course fetch has staggered latency and one failure.
+
+    Course fetch latency is reverse-proportional to input order, so the
+    concurrent fan-out completes courses in roughly the opposite order to
+    the input — exercising order preservation and progress correctness
+    under real threading.
+    """
+
+    def __init__(self):
+        # Five courses; CC303 (id 3) is not gradable for this account.
+        self.courses = [
+            {"id": 1, "shortname": "AA101"},
+            {"id": 2, "shortname": "BB202"},
+            {"id": 3, "shortname": "CC303"},
+            {"id": 4, "shortname": "DD404"},
+            {"id": 5, "shortname": "EE505"},
+        ]
+
+    def get_courses(self):
+        return self.courses
+
+    def get_user_grade_items(self, course_id, user_id=None):
+        # Later courses answer sooner, so completion order != input order.
+        time.sleep(0.02 * (6 - course_id))
+        if course_id == 3:
+            raise RuntimeError("Cannot view grades")
+        return {"usergrades": [{"gradeitems": [
+            {"id": course_id, "itemname": f"Item {course_id}",
+             "gradeformatted": "70.00", "grademin": 0, "grademax": 100},
+        ]}]}
+
+
+def test_collect_grades_parallel_order_warning_attribution_and_progress():
+    client = _DelayedGradeClient()
+    seen = []
+    result = collect_grades(
+        client, on_progress=lambda d, t, lbl: seen.append((d, t, lbl)),
+    )
+
+    # Results are reassembled deterministically (sorted by shortname) despite
+    # out-of-order completion; the failed course contributes no records.
+    assert [r["course_shortname"] for r in result["grades"]] == [
+        "AA101", "BB202", "DD404", "EE505",
+    ]
+
+    # The permission failure is a non-fatal warning attributed to its own
+    # course — not smeared onto whichever course happened to finish first.
+    assert len(result["warnings"]) == 1
+    warning = result["warnings"][0]
+    assert warning["course_id"] == 3
+    assert warning["course_shortname"] == "CC303"
+    assert "Cannot view grades" in warning["message"]
+
+    # Progress counts every course exactly once, monotonically, with the
+    # right total, regardless of completion order.
+    assert [done for done, _, _ in seen] == [1, 2, 3, 4, 5]
+    assert {total for _, total, _ in seen} == {5}
+    assert sorted(label for _, _, label in seen) == [
+        "AA101", "BB202", "CC303", "DD404", "EE505",
+    ]
 
 
 def test_grade_summary_counts_statuses_and_totals():

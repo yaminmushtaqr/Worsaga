@@ -3,8 +3,11 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from worsaga.cli import main
 from worsaga.demo import DemoMoodleClient
+from worsaga.sections import WeekNotFoundError
 from worsaga.studypack import (
     build_study_pack,
     study_pack_filename,
@@ -102,10 +105,27 @@ class TestBuildStudyPack:
         build_study_pack(client, _econ_course_id(), 3, on_file=seen.append)
         assert seen and all(name.endswith(".pdf") for name in seen)
 
-    def test_empty_week_falls_back(self):
+    def test_unmatched_week_raises(self):
         client = DemoMoodleClient()
-        result = build_study_pack(client, _econ_course_id(), "nonexistent week")
-        # No section match still yields a coherent pack with fallback notes.
+        # A week that matches no section must fail loudly rather than
+        # fabricate a plausible pack from an unrelated section.
+        with pytest.raises(WeekNotFoundError) as exc_info:
+            build_study_pack(client, _econ_course_id(), "zzz_nonsense")
+        exc = exc_info.value
+        assert exc.week == "zzz_nonsense"
+        assert "no section matching week 'zzz_nonsense'" in str(exc)
+        assert "ECON101" in str(exc)
+        # Available sections are offered to help the caller recover.
+        assert any("Week 3" in name for name in exc.available_sections)
+
+    def test_empty_but_valid_week_still_builds(self):
+        client = DemoMoodleClient()
+        # "revision" matches the empty "Revision and Exam Preparation"
+        # section: a legitimate empty state, not a not-found error.
+        result = build_study_pack(client, _econ_course_id(), "revision")
+        assert "Revision" in result["section_name"]
+        # Matched special-week section, so fallback notes rather than a raise.
+        assert result["section_type"] in ("revision", "exam")
         assert result["bullets"]
         assert "_No downloadable materials" in result["markdown"]
 

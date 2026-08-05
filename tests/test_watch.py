@@ -210,6 +210,41 @@ class TestCliSurface:
         err = capsys.readouterr().err
         assert "every 60s" in err
 
+    def test_below_floor_interval_warns(self, capsys):
+        # Issue 1: a below-floor watch interval is clamped up, with a
+        # one-line stderr warning stating requested vs applied value.
+        main(["--demo", "watch", "--cycles", "1", "--no-notify",
+              "--interval", "30s"])
+        err = capsys.readouterr().err
+        assert (
+            "Warning: interval 30s is below the minimum for watch; "
+            "using 60s."
+        ) in err
+
+    def test_announces_cycle_start_with_course_count(self, capsys):
+        # Issue 2: a full-account sync can take minutes; watch announces the
+        # cycle (with the course count) so it never looks hung.
+        main(["--demo", "watch", "--cycles", "1", "--no-notify"])
+        err = capsys.readouterr().err
+        assert "Sync cycle started (4 courses)..." in err
+
+    def test_progress_on_stderr_not_stdout(self, capsys):
+        main(["--demo", "watch", "--cycles", "1", "--no-notify"])
+        captured = capsys.readouterr()
+        # Per-course progress is on stderr; stdout stays a clean data channel.
+        assert "[" in captured.err and "]" in captured.err
+        assert "files:" in captured.err
+        assert "Sync cycle started" not in captured.out
+        assert "files:" not in captured.out
+
+    def test_quiet_suppresses_cycle_start_and_progress(self, capsys):
+        main(["--demo", "watch", "--cycles", "1", "--no-notify", "-q"])
+        captured = capsys.readouterr()
+        assert "Sync cycle started" not in captured.err
+        assert "files:" not in captured.err
+        # The per-cycle result line still reaches stdout.
+        assert "cycle 1:" in captured.out
+
     def test_watch_reports_summary(self, capsys):
         main(["--demo", "watch", "--cycles", "1", "--no-notify"])
         err = capsys.readouterr().err
