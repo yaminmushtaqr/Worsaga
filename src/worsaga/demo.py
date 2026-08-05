@@ -676,6 +676,16 @@ class DemoMoodleClient:
     def userid(self) -> int:
         return DEMO_USERID
 
+    @property
+    def verified_userid(self) -> int | None:
+        """Mirror :attr:`MoodleClient.verified_userid` — always known offline.
+
+        The demo principal is fixed, so demo runs stamp and check their
+        local stores exactly like live ones and the account guard is
+        testable with no credentials and no network.
+        """
+        return DEMO_USERID
+
     def call(self, wsfunction: str, **params):
         raise RuntimeError(
             "Demo mode is fully offline - no Moodle web-service call "

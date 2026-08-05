@@ -231,6 +231,22 @@ class TestCacheStore:
             assert state == {"last_synced_at": 200, "scope": None}
             assert store.get_category_state("other", "grades") is None
 
+    def test_symlinked_cache_path_is_refused(self, tmp_path):
+        """SQLite would follow the link and write course data wherever it
+        points; the store refuses to open it at all."""
+        from worsaga.secureio import SecureWriteError
+
+        real = tmp_path / "elsewhere.db"
+        real.write_bytes(b"")
+        link = tmp_path / "cache.db"
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("this environment cannot create symbolic links")
+        with pytest.raises(SecureWriteError) as exc:
+            CacheStore(link)
+        assert "symbolic link" in str(exc.value)
+
     def test_cache_file_is_owner_only_on_posix(self, tmp_path):
         import os
         import stat

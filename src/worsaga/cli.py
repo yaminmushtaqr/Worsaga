@@ -92,6 +92,7 @@ from worsaga.autosync import (
     remove_autosync,
 )
 from worsaga.output import render_structured, truncate_cell, wants_structured
+from worsaga.principal import known_principal
 from worsaga.sections import (
     WeekNotFoundError,
     find_best_section,
@@ -164,7 +165,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--token", default=None, metavar="TOKEN",
-        help="Moodle API token (overrides config/env)",
+        help=(
+            "DEPRECATED: Moodle API token on the command line, where shell "
+            "history and process listings expose it. Prefer WORSAGA_TOKEN, "
+            "a credentials file, or --token-stdin"
+        ),
+    )
+    parser.add_argument(
+        "--token-stdin", action="store_true",
+        help="Read the Moodle API token from the first line of stdin",
     )
     parser.add_argument(
         "--userid", default=None, type=int, metavar="ID",
@@ -480,7 +489,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("setup", parents=[_shared], help="Guided first-time configuration")
     sp.add_argument("--url", dest="setup_url", default=None, metavar="URL", help="Moodle site URL")
-    sp.add_argument("--token", dest="setup_token", default=None, metavar="TOKEN", help="Moodle API token")
+    sp.add_argument(
+        "--token", dest="setup_token", default=None, metavar="TOKEN",
+        help=(
+            "DEPRECATED: Moodle API token on the command line, where shell "
+            "history and process listings expose it. Prefer --token-stdin, "
+            "WORSAGA_TOKEN, or the interactive prompt"
+        ),
+    )
+    sp.add_argument(
+        "--token-stdin", dest="setup_token_stdin", action="store_true",
+        help=(
+            "Read the Moodle API token from the first line of stdin "
+            "(requires --url); the token never appears in the command line"
+        ),
+    )
     sp.add_argument("--userid", dest="setup_userid", default=None, type=int, metavar="ID", help="Moodle user ID")
 
     sr = sub.add_parser(
@@ -686,6 +709,74 @@ def _build_parser() -> argparse.ArgumentParser:
 def _demo_mode(args: argparse.Namespace) -> bool:
     """Return True when demo mode is requested via flag or environment."""
     return getattr(args, "demo", False) or demo_mode_enabled()
+
+
+def _read_token_from_stdin() -> str:
+    """Return the first line of stdin as the API token.
+
+    Works piped (``pass show moodle | worsaga setup --url ... --token-stdin``)
+    and typed at a terminal. Nothing is ever echoed, printed, or placed in
+    the process command line.
+    """
+    try:
+        line = sys.stdin.readline()
+    except (OSError, ValueError) as exc:
+        print(
+            f"Error: could not read the token from standard input: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # A leading BOM survives decoding when the producer wrote UTF-8 with a
+    # signature (PowerShell redirection, some editors); it is not part of
+    # the token and would make every request fail with an opaque
+    # "invalid token" from Moodle.
+    token = line.lstrip("\ufeff").strip()
+    if not token:
+        print(
+            "Error: --token-stdin was given but standard input contained "
+            "no token.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return token
+
+
+def _apply_token_source(
+    args: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> None:
+    """Resolve where the token comes from, before any command runs.
+
+    ``--token-stdin`` (global or on ``setup``) is read here and lands on
+    ``args.token``, so every downstream consumer keeps reading one
+    attribute. A token passed as ``--token VALUE`` still works, but earns
+    a deprecation warning on stderr: an argument is visible in shell
+    history and in any process listing on the machine, which a secret
+    should never be.
+    """
+    from_stdin = (
+        getattr(args, "token_stdin", False)
+        or getattr(args, "setup_token_stdin", False)
+    )
+    # ``is not None``, not truthiness: ``--token ""`` is still the user
+    # putting a token option on the command line, and it must be caught
+    # as a conflict rather than silently letting stdin win.
+    in_argv = any(
+        getattr(args, name, None) is not None
+        for name in ("token", "setup_token")
+    )
+    if from_stdin and in_argv:
+        parser.error("--token and --token-stdin cannot be used together")
+    args.token_from_stdin = bool(from_stdin)
+    if from_stdin:
+        args.token = _read_token_from_stdin()
+        return
+    if in_argv:
+        print(
+            "Warning: --token puts your Moodle token in the command line, "
+            "where shell history and process listings can expose it. Use "
+            "WORSAGA_TOKEN, a credentials file, or --token-stdin instead.",
+            file=sys.stderr,
+        )
 
 
 def _client(args: argparse.Namespace) -> MoodleClient:
@@ -1557,6 +1648,9 @@ def cmd_search_text(args: argparse.Namespace) -> None:
         course_id=course_id,
         course_shortname=course_shortname,
         limit=args.limit,
+        # Only an identity this process already verified; asking for one
+        # would turn 'search-text' into a networked command.
+        principal=known_principal(client),
     )
 
     if _emit_data(args, result):
@@ -2045,6 +2139,21 @@ def cmd_setup(args: argparse.Namespace) -> None:
     # subcommand's own weren't given.  The subcommand attrs are always
     # present (defaulting to None), so we just use what we have.
 
+    if getattr(args, "token_from_stdin", False) and not setup_url:
+        # The token has already been consumed from stdin, so the guided
+        # prompts below can no longer read a URL from there.
+        print(
+            "Error: --token-stdin also needs --url, because the guided "
+            "prompts cannot read from standard input once the token has "
+            "been taken from it.",
+            file=sys.stderr,
+        )
+        print(
+            "  worsaga setup --url <MOODLE_URL> --token-stdin < token.txt",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if setup_url and setup_token:
         # Fully non-interactive path
         print("worsaga setup (non-interactive)")
@@ -2084,8 +2193,8 @@ def cmd_setup(args: argparse.Namespace) -> None:
         )
         print("Configure non-interactively instead:", file=sys.stderr)
         print(
-            "  worsaga setup --url <MOODLE_URL> --token <TOKEN> "
-            "[--userid <ID>]",
+            "  worsaga setup --url <MOODLE_URL> --token-stdin [--userid <ID>]"
+            "  (token piped in, never in the command line)",
             file=sys.stderr,
         )
         print(
@@ -2125,7 +2234,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
         print(
             "Error: setup aborted (no input received). Provide credentials "
             "non-interactively with "
-            "'worsaga setup --url <URL> --token <TOKEN>'.",
+            "'worsaga setup --url <URL> --token-stdin'.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2199,6 +2308,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if getattr(args, "json", False) and getattr(args, "yaml", False):
         parser.error("--json and --yaml cannot be used together")
+
+    _apply_token_source(args, parser)
 
     if args.command is None:
         if should_show_banner(json_mode=args.json, quiet=args.quiet):

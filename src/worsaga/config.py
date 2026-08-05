@@ -17,11 +17,13 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import platformdirs
+
+from worsaga.secureio import write_private_file
 
 _APP_NAME = "worsaga"
 _PLATFORM_CONFIG_DIR = Path(platformdirs.user_config_dir(_APP_NAME))
@@ -163,8 +165,24 @@ def _validate_moodle_url(url: str) -> None:
 @dataclass(frozen=True)
 class MoodleConfig:
     url: str
-    token: str
+    # repr=False plus the explicit __repr__ below: this object is held by
+    # every client, so it appears in tracebacks, logging calls, and
+    # debugger dumps. None of those may print the token.
+    token: str = field(repr=False)
     userid: int = 0
+
+    def __repr__(self) -> str:
+        """Render the config with the token redacted.
+
+        Deliberately says nothing about the token beyond its presence —
+        not its length, not a prefix — so a captured traceback or an
+        agent transcript never narrows the search space for the secret.
+        """
+        marker = "'***'" if self.token else "''"
+        return (
+            f"MoodleConfig(url={self.url!r}, token={marker}, "
+            f"userid={self.userid!r})"
+        )
 
     def __post_init__(self):
         if self.url:
@@ -246,19 +264,23 @@ class MoodleConfig:
         userid: int = 0,
         path: Path | None = None,
     ) -> Path:
-        """Write credentials to a JSON config file. Returns the path written."""
+        """Write credentials to a JSON config file. Returns the path written.
+
+        The file is created owner-only (0600) *at open*, written whole,
+        and renamed into place, so there is never a moment where a
+        readable, half-written, or previously world-readable credentials
+        file exists on disk. A destination that is a symbolic link is
+        refused rather than followed. See :mod:`worsaga.secureio` for the
+        primitive and for what those guarantees mean on Windows, where
+        POSIX modes do not apply and the file inherits the profile
+        directory's ACLs.
+        """
         canonical_url = canonical_moodle_url(url)
         dest = path or DEFAULT_CONFIG_PATH
-        dest.parent.mkdir(parents=True, exist_ok=True)
         payload = {"url": canonical_url, "token": token, "userid": userid}
-        with open(dest, "w") as f:
-            json.dump(payload, f, indent=2)
-            f.write("\n")
-        # Set owner-only permissions where the OS supports it.
-        # On Windows, POSIX chmod is a no-op or unavailable, so skip it.
-        if os.name != "nt":
-            dest.chmod(0o600)
-        return dest
+        return write_private_file(
+            dest, json.dumps(payload, indent=2) + "\n",
+        )
 
 
 def test_connection(config: MoodleConfig | None = None) -> dict:

@@ -24,7 +24,11 @@ with a timeout.
 Alongside the scheduler entry, install writes a small local metadata
 record (``autosync.json`` in the user data directory) so ``status``
 can report the intended interval and command without parsing
-locale-dependent scheduler output.
+locale-dependent scheduler output. The record is owner-only, records the
+authenticated user id when one is known, and install refuses to overwrite
+a record belonging to a different Moodle account (see
+:mod:`worsaga.principal`). Every scheduler subprocess runs with the API
+token stripped from its environment (see :func:`worsaga.secureio.child_env`).
 """
 
 from __future__ import annotations
@@ -35,14 +39,26 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 import platformdirs
 
+from worsaga.principal import (
+    PrincipalMismatchError,
+    bind_principal,
+    known_principal,
+)
+from worsaga.secureio import child_env, write_private_file
+
 _APP_NAME = "worsaga"
+
+#: What to tell a user whose auto-sync record belongs to another account.
+_RECORD_REMEDY = (
+    "Run 'worsaga auto-sync remove' (or 'remove --force-local' if the "
+    "scheduler cannot be queried) to clear it, then install again."
+)
 
 WINDOWS_TASK_NAME = "WorsagaAutoSync"
 MACOS_LABEL = "com.worsaga.autosync"
@@ -151,26 +167,16 @@ def _read_record_with_error() -> tuple[dict[str, Any] | None, str | None]:
 
 
 def _write_record(record: dict[str, Any]) -> None:
-    """Write the record atomically (temp file + rename).
+    """Write the record atomically, owner-only (temp file + rename).
 
     A crash mid-write must never leave a truncated record: an
     unreadable record makes scheduler removal fail closed until the
     user reaches for ``--force-local``.
     """
-    path = autosync_record_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp",
+    write_private_file(
+        autosync_record_path(),
+        json.dumps(record, indent=2, sort_keys=True) + "\n",
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
-            tmp_file.write(
-                json.dumps(record, indent=2, sort_keys=True) + "\n"
-            )
-        os.replace(tmp_name, path)
-    except OSError:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
 
 
 def _stage_existing_record() -> tuple[bool, str | None]:
@@ -201,6 +207,109 @@ def _stage_existing_record() -> tuple[bool, str | None]:
     return True, None
 
 
+def _local_client() -> Any | None:
+    """Build the configured (or demo) client, or None if that fails.
+
+    Configuration only — building a client makes no network request.
+    Used for the two things this module wants to know about the local
+    account without going online: which site it is, and whether an
+    identity has already been verified in this process.
+    """
+    try:
+        from worsaga.client import MoodleClient
+        from worsaga.config import MoodleConfig
+        from worsaga.demo import DemoMoodleClient, demo_mode_enabled
+
+        if demo_mode_enabled():
+            return DemoMoodleClient()
+        return MoodleClient(MoodleConfig.load())
+    except Exception:
+        return None
+
+
+def _local_binding() -> tuple[int | None, str]:
+    """Return ``(known user id, site)`` for the local account, offline.
+
+    Deliberately uses :func:`worsaga.principal.known_principal` rather
+    than forcing verification: registering a scheduled job must keep
+    working with no network and with credentials that are not set up
+    yet, so the record is bound opportunistically. The record holds no
+    account data of its own — the guards that carry weight are on the
+    cache and the index, which do.
+    """
+    client = _local_client()
+    if client is None:
+        return None, ""
+    try:
+        return known_principal(client), str(client.base_url)
+    except Exception:
+        return None, ""
+
+
+def _record_principal(record: dict[str, Any] | None) -> int | None:
+    """Return the Moodle user id stamped on *record*, if any."""
+    if not record:
+        return None
+    try:
+        return int(record.get("principal_userid") or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def _binding_fields(principal: int | None, site: str) -> dict[str, Any]:
+    """Return the record fields describing an account binding.
+
+    The site is recorded whenever it is known — it comes from
+    configuration and costs no network access — so a later install can
+    tell "same Moodle, other account" (a conflict) from "different
+    Moodle entirely" (a stale binding to discard).
+    """
+    fields: dict[str, Any] = {}
+    if site:
+        fields["site"] = site
+    if principal is not None:
+        fields["principal_userid"] = int(principal)
+    return fields
+
+
+def _record_binding(principal: int | None, site: str) -> dict[str, Any]:
+    """Return the binding fields a rewritten record should carry.
+
+    Raises :class:`worsaga.principal.PrincipalMismatchError` when the
+    existing record was installed by a different Moodle account on the
+    same site. An unreadable record is treated as unstamped: install
+    already replaces it, and failing closed here would leave the user
+    with no way to reinstall short of deleting the file by hand.
+
+    Install rewrites the record wholesale, so a binding that still
+    applies is carried forward when this run could not verify an
+    identity — otherwise an offline reinstall would quietly unbind the
+    record and let the next account adopt it. A binding recorded for a
+    *different* site no longer applies to anything and is dropped rather
+    than carried onto the new one.
+    """
+    record, _ = _read_record_with_error()
+    stored = _record_principal(record)
+    stored_site = str(record.get("site") or "") if record else ""
+    # A record written against another Moodle describes an account this
+    # install has nothing to do with: stale, not a conflict. A record with
+    # no site at all predates site-stamping and is treated as this site's.
+    if stored_site and site and stored_site != site:
+        stored = None
+    if principal is None:
+        return _binding_fields(stored, site or stored_site)
+    bind_principal(
+        stored=stored,
+        principal=principal,
+        site=site or "the configured site",
+        store_label="auto-sync record",
+        store_path=str(autosync_record_path()),
+        remedy=_RECORD_REMEDY,
+        holds_data=record is not None,
+    )
+    return _binding_fields(principal, site)
+
+
 def _stale_record_state() -> tuple[bool, str | None]:
     """Return whether quarantined metadata exists, without mutating it."""
     try:
@@ -219,8 +328,11 @@ def _delete_record() -> None:
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
+    # env=: schedulers need the ordinary environment, but none of them
+    # needs WORSAGA_TOKEN, so the child never gets a copy of it.
     return subprocess.run(
         args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT,
+        env=child_env(),
     )
 
 
@@ -268,11 +380,23 @@ def install_autosync(
     interval_minutes: int = DEFAULT_INTERVAL_MINUTES,
     *,
     dry_run: bool = False,
+    principal: int | None = None,
+    site: str = "",
 ) -> dict[str, Any]:
     """Register the periodic background sync with the platform scheduler.
 
     With ``dry_run=True`` nothing is executed or written; the returned
     ``actions`` list shows exactly what a real install would do.
+
+    *principal* and *site* bind the record to a Moodle account; when
+    neither is given they are resolved locally with no network access
+    (see :func:`_local_binding`). The site is recorded whenever it is
+    configured; the user id only when this process has already verified
+    one. An existing record installed by a *different* account for the
+    same site makes this a structured failure that changes nothing;
+    a record for a different site is discarded as stale. Installing
+    without a verifiable identity (offline, no credentials yet) is still
+    allowed and simply leaves the record without a user id.
     """
     interval_minutes = _clamp_interval(interval_minutes)
     platform = autosync_platform()
@@ -285,6 +409,17 @@ def install_autosync(
         "command": command,
         "actions": [],
     }
+
+    if principal is None and not site:
+        principal, site = _local_binding()
+    # Checked before the scheduler is touched, in dry runs too: a dry run
+    # that reported a clean plan for an install that cannot happen would
+    # be worse than useless.
+    try:
+        binding = _record_binding(principal, site)
+    except PrincipalMismatchError as exc:
+        result["error"] = str(exc)
+        return result
 
     record_staged = False
 
@@ -415,14 +550,16 @@ def install_autosync(
         # mutation, so a failed rewrite cannot leave old metadata looking
         # current to subsequent status calls.
         result["installed"] = True
+        record: dict[str, Any] = {
+            "platform": platform,
+            "method": result["method"],
+            "interval_minutes": interval_minutes,
+            "command": command,
+            "installed_at": int(time.time()),
+            **binding,
+        }
         try:
-            _write_record({
-                "platform": platform,
-                "method": result["method"],
-                "interval_minutes": interval_minutes,
-                "command": command,
-                "installed_at": int(time.time()),
-            })
+            _write_record(record)
             result["record_written"] = True
             result["record_stale"] = False
             try:
@@ -622,14 +759,10 @@ def _attach_last_sync(result: dict[str, Any]) -> None:
     """
     try:
         from worsaga.cache import read_last_sync_at
-        from worsaga.client import MoodleClient
-        from worsaga.config import MoodleConfig
-        from worsaga.demo import DemoMoodleClient, demo_mode_enabled
 
-        client = (
-            DemoMoodleClient() if demo_mode_enabled()
-            else MoodleClient(MoodleConfig.load())
-        )
+        client = _local_client()
+        if client is None:
+            return
         ts = read_last_sync_at(client.base_url)
         if ts is not None:
             result["last_sync_at"] = ts

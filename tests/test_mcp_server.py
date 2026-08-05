@@ -975,6 +975,54 @@ class TestCourseNotFoundMcp:
         assert "assignment_not_found" in mcp_server.ERROR_CODES
         assert "forum_not_found" in mcp_server.ERROR_CODES
         assert "week_not_found" in mcp_server.ERROR_CODES
+        assert "principal_mismatch" in mcp_server.ERROR_CODES
+
+
+class TestPrincipalMismatchMcp:
+    """A store belonging to another Moodle account is a structured error,
+    not an unhandled tool exception."""
+
+    def _bound_to_someone_else(self, tmp_path, monkeypatch):
+        """Point the stores at files stamped for a different account."""
+        from worsaga.cache import CacheStore
+        from worsaga.textindex import TextIndexStore
+
+        client = _demo()
+        cache_path = tmp_path / "other-cache.db"
+        index_path = tmp_path / "other-search.db"
+        monkeypatch.setenv("WORSAGA_CACHE_PATH", str(cache_path))
+        monkeypatch.setenv("WORSAGA_INDEX_PATH", str(index_path))
+        with CacheStore(cache_path) as store:
+            store.bind_principal(client.base_url, 999)
+            store.commit()
+        with TextIndexStore(index_path) as store:
+            store.bind_principal(client.base_url, 999)
+        return client
+
+    def test_sync_now_returns_the_structured_error(self, tmp_path, monkeypatch):
+        client = self._bound_to_someone_else(tmp_path, monkeypatch)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.sync_now()
+        assert result["error_code"] == "principal_mismatch"
+        assert "999" in result["error"]
+
+    def test_build_search_index_returns_the_structured_error(
+        self, tmp_path, monkeypatch,
+    ):
+        client = self._bound_to_someone_else(tmp_path, monkeypatch)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.build_search_index()
+        assert result["error_code"] == "principal_mismatch"
+        assert "999" in result["error"]
+
+    def test_search_text_returns_the_structured_error(
+        self, tmp_path, monkeypatch,
+    ):
+        client = self._bound_to_someone_else(tmp_path, monkeypatch)
+        with patch.object(mcp_server, "_get_client", return_value=client):
+            result = mcp_server.search_text("elasticity")
+        assert result["error_code"] == "principal_mismatch"
+        assert "999" in result["error"]
 
 
 # ── ISSUE 3: extract_material response is deterministically bounded ────

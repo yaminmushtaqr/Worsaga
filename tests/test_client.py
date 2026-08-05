@@ -449,6 +449,84 @@ class TestVerifiedPrincipal:
         assert transport.params_for("core_message_get_messages")["useridto"] == ["7"]
 
 
+class TestServerErrorTokenRedaction:
+    """Moodle's own error text becomes a Worsaga error string, and that
+    string is printed, logged, and pasted into bug reports."""
+
+    TOKEN = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+
+    def _client(self) -> MoodleClient:
+        return MoodleClient(config=MoodleConfig(
+            url="https://moodle.example.com", token=self.TOKEN, userid=1,
+        ))
+
+    def _transport(self, message: str, errorcode: str = "invalidtoken"):
+        payload = json.dumps({
+            "exception": "moodle_exception",
+            "errorcode": errorcode,
+            "message": message,
+        }).encode()
+
+        def transport(req, timeout=30):
+            params = urllib.parse.parse_qs(req.data.decode())
+            if (params.get("wsfunction") or [""])[0] == \
+                    "core_webservice_get_site_info":
+                return _FakeResponse(json.dumps({"userid": 1}).encode())
+            return _FakeResponse(payload)
+
+        return transport
+
+    def test_echoed_token_is_redacted_from_the_message(self):
+        transport = self._transport(
+            f"Invalid parameter: wstoken={self.TOKEN} was rejected"
+        )
+        with patch("urllib.request.urlopen", side_effect=transport):
+            with pytest.raises(MoodleRequestError) as exc:
+                self._client().get_courses()
+        text = str(exc.value)
+        assert self.TOKEN not in text
+        assert "***" in text
+        assert "was rejected" in text
+
+    def test_urlencoded_token_is_redacted_too(self):
+        # The token goes out through urlencode, so a server quoting the
+        # request back can echo the percent-encoded form.
+        token = "tok en+with/specials"
+        encoded = urllib.parse.quote_plus(token)
+        client = MoodleClient(config=MoodleConfig(
+            url="https://moodle.example.com", token=token, userid=1,
+        ))
+        transport = self._transport(f"bad request: wstoken={encoded}")
+        with patch("urllib.request.urlopen", side_effect=transport):
+            with pytest.raises(MoodleRequestError) as exc:
+                client.get_courses()
+        assert encoded not in str(exc.value)
+        assert "***" in str(exc.value)
+
+    def test_errorcode_is_redacted_as_well(self):
+        transport = self._transport("nope", errorcode=f"bad-{self.TOKEN}")
+        with patch("urllib.request.urlopen", side_effect=transport):
+            with pytest.raises(MoodleRequestError) as exc:
+                self._client().get_courses()
+        assert self.TOKEN not in exc.value.errorcode
+        assert "***" in exc.value.errorcode
+
+    def test_ordinary_errors_are_untouched(self):
+        transport = self._transport("Invalid token - token not found")
+        with patch("urllib.request.urlopen", side_effect=transport):
+            with pytest.raises(MoodleRequestError) as exc:
+                self._client().get_courses()
+        assert str(exc.value) == (
+            "Moodle API error: Invalid token - token not found"
+        )
+
+    def test_empty_token_does_not_redact_everything(self):
+        client = MoodleClient(config=MoodleConfig(
+            url="https://moodle.example.com", token="", userid=1,
+        ))
+        assert client._redact_token("plain message") == "plain message"
+
+
 class TestParameterPolicy:
     """Only the parameters Worsaga sends for a function may go on the wire."""
 

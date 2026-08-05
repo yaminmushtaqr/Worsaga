@@ -16,7 +16,8 @@ instead of raising: a missing or broken notification stack must never
 take down a sync loop. Callers are expected to print their own console
 fallback when ``sent`` is false. Notification content is course
 metadata only — callers must not put tokens or URLs in it, and all
-subprocess calls run without a shell and with a timeout.
+subprocess calls run without a shell, with a timeout, and with the API
+token stripped from the child's environment.
 
 All operations are local. Nothing is sent over the network.
 """
@@ -28,6 +29,8 @@ import shutil
 import subprocess
 import sys
 from xml.sax.saxutils import escape
+
+from worsaga.secureio import child_env
 
 #: Seconds a notification subprocess may run before being abandoned.
 NOTIFY_TIMEOUT = 10
@@ -66,8 +69,11 @@ def notification_backend() -> str | None:
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
+    # env=: the notifier needs the ordinary environment (PATH, DISPLAY,
+    # DBUS_SESSION_BUS_ADDRESS, SystemRoot) but never the API token.
     return subprocess.run(
         args, capture_output=True, text=True, timeout=NOTIFY_TIMEOUT,
+        env=child_env(),
     )
 
 

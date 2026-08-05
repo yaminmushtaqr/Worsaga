@@ -100,6 +100,7 @@ from worsaga.sections import (
     week_not_found_message,
 )
 from worsaga.autosync import autosync_status as _autosync_status
+from worsaga.principal import PrincipalMismatchError, known_principal
 from worsaga.studypack import build_study_pack as _build_study_pack
 from worsaga.studypack import write_study_pack as _write_study_pack
 from worsaga.summaries import build_weekly_summary, format_bullets
@@ -148,6 +149,9 @@ ERROR_CODES = (
     "week_not_found",       # week query matched no section
     "invalid_output_dir",   # output_dir escaped the downloads directory
     "index_unavailable",    # local search index could not be opened
+    # a local store (sync cache / search index) belongs to a different
+    # Moodle account than the one this server is authenticated as
+    "principal_mismatch",
     # DownloadError.code values (download_material / extract_material) and
     # get_connection_info auth/network failures:
     "auth", "not_found", "network", "oversize", "invalid_url", "empty",
@@ -934,7 +938,10 @@ def sync_now(lookahead_days: int = SYNC_LOOKAHEAD_DAYS) -> dict[str, Any]:
     lookahead_days : int
         Deadline look-ahead window in days (default 60).
     """
-    return _run_sync(_get_client(), lookahead_days=lookahead_days)
+    try:
+        return _run_sync(_get_client(), lookahead_days=lookahead_days)
+    except PrincipalMismatchError as exc:
+        return {"error": str(exc), "error_code": "principal_mismatch"}
 
 
 @mcp.tool()
@@ -1015,6 +1022,8 @@ def build_search_index(
             week=week or None,
             max_files=max_files,
         )
+    except PrincipalMismatchError as exc:
+        return {"error": str(exc), "error_code": "principal_mismatch"}
     except TextIndexError as exc:
         return {"error": str(exc), "error_code": "index_unavailable"}
     except ValueError as exc:
@@ -1067,7 +1076,12 @@ def search_text(
             query,
             course_id=resolved or None,
             limit=limit,
+            # Only an identity this server already verified, so the
+            # no-network contract above still holds.
+            principal=known_principal(client),
         )
+    except PrincipalMismatchError as exc:
+        return {"error": str(exc), "error_code": "principal_mismatch"}
     except TextIndexError as exc:
         return {"error": str(exc), "error_code": "index_unavailable"}
 

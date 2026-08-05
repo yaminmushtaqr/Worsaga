@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from worsaga import secureio
 from worsaga.config import (
     DEFAULT_CONFIG_PATH,
     MoodleConfig,
@@ -13,6 +14,7 @@ from worsaga.config import (
     _find_config_file,
     canonical_moodle_url,
 )
+from worsaga.secureio import SecureWriteError
 
 
 class TestConfigLoad:
@@ -160,7 +162,7 @@ class TestWriteConfig:
         assert mode == "0o600"
 
     def test_write_config_does_not_crash_on_windows(self, tmp_path, monkeypatch):
-        """Simulates Windows (os.name == 'nt') — chmod should be skipped."""
+        """Simulates Windows (os.name == 'nt') — POSIX modes do not apply."""
         monkeypatch.setattr(os, "name", "nt")
         dest = tmp_path / "config.json"
         result = MoodleConfig.write_config(url="https://x.com", token="t", path=dest)
@@ -169,6 +171,59 @@ class TestWriteConfig:
         data = json.loads(dest.read_text())
         assert data["url"] == "https://x.com"
         assert data["token"] == "t"
+
+    def test_write_requests_owner_only_mode(self, tmp_path, monkeypatch):
+        """Platform-independent: 0600 is what the create asks for."""
+        modes = []
+        real_open = os.open
+
+        def spy(path, flags, mode=0o777, **kwargs):
+            if flags & os.O_CREAT:  # ignore the read-only directory fsync
+                modes.append(mode)
+            return real_open(path, flags, mode, **kwargs)
+
+        monkeypatch.setattr(secureio.os, "open", spy)
+        MoodleConfig.write_config(
+            url="https://x.com", token="t", path=tmp_path / "config.json",
+        )
+        assert modes == [0o600]
+
+    def test_write_is_atomic_and_leaves_no_temp_file(self, tmp_path):
+        dest = tmp_path / "config.json"
+        MoodleConfig.write_config(url="https://x.com", token="first", path=dest)
+        MoodleConfig.write_config(url="https://x.com", token="second", path=dest)
+        assert json.loads(dest.read_text())["token"] == "second"
+        assert [p.name for p in tmp_path.iterdir()] == ["config.json"]
+
+    def test_failed_write_keeps_the_previous_credentials(
+        self, tmp_path, monkeypatch,
+    ):
+        dest = tmp_path / "config.json"
+        MoodleConfig.write_config(url="https://x.com", token="good", path=dest)
+        monkeypatch.setattr(
+            secureio.os, "replace",
+            lambda *a, **k: (_ for _ in ()).throw(PermissionError("denied")),
+        )
+        with pytest.raises(PermissionError):
+            MoodleConfig.write_config(
+                url="https://x.com", token="bad", path=dest,
+            )
+        assert json.loads(dest.read_text())["token"] == "good"
+        assert [p.name for p in tmp_path.iterdir()] == ["config.json"]
+
+    def test_refuses_to_write_through_a_symlink(self, tmp_path):
+        real = tmp_path / "elsewhere.json"
+        real.write_text("original")
+        link = tmp_path / "config.json"
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("this environment cannot create symbolic links")
+        with pytest.raises(SecureWriteError):
+            MoodleConfig.write_config(
+                url="https://x.com", token="t", path=link,
+            )
+        assert real.read_text() == "original"
 
     def test_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.delenv("WORSAGA_URL", raising=False)
@@ -182,6 +237,62 @@ class TestWriteConfig:
         assert cfg.url == "https://m.example.com"
         assert cfg.token == "tok"
         assert cfg.userid == 5
+
+
+class TestTokenRedaction:
+    """The config object is held by every client, so it shows up in
+    tracebacks, log records, and debugger dumps. None of them may
+    print the token."""
+
+    TOKEN = "s3cr3t-token-value"
+
+    def _config(self):
+        return MoodleConfig(
+            url="https://moodle.example.edu", token=self.TOKEN, userid=7,
+        )
+
+    def test_repr_hides_the_token(self):
+        text = repr(self._config())
+        assert self.TOKEN not in text
+        assert "token='***'" in text
+
+    def test_repr_still_identifies_the_site_and_user(self):
+        text = repr(self._config())
+        assert "https://moodle.example.edu" in text
+        assert "userid=7" in text
+
+    def test_str_hides_the_token(self):
+        assert self.TOKEN not in str(self._config())
+
+    def test_format_hides_the_token(self):
+        assert self.TOKEN not in f"{self._config()}"
+
+    def test_empty_token_is_shown_as_empty(self):
+        text = repr(MoodleConfig(url="https://moodle.example.edu", token=""))
+        assert "token=''" in text
+
+    def test_traceback_never_carries_the_token(self):
+        import traceback
+
+        config = self._config()
+        try:
+            raise RuntimeError(f"boom while using {config!r}")
+        except RuntimeError:
+            text = "".join(traceback.format_exc())
+        assert self.TOKEN not in text
+        assert "token='***'" in text
+
+    def test_logging_a_config_never_carries_the_token(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            logging.getLogger("worsaga.test").warning(
+                "config was %r", self._config(),
+            )
+        assert self.TOKEN not in caplog.text
+
+    def test_the_token_is_still_readable_on_the_attribute(self):
+        assert self._config().token == self.TOKEN
 
 
 class TestPlatformDirsIntegration:

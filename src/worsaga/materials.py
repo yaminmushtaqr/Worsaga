@@ -24,6 +24,7 @@ from worsaga.models import (
     course_module_record,
     course_section_record,
 )
+from worsaga.secureio import ensure_private_dir, open_new_private_file
 
 if TYPE_CHECKING:
     from worsaga.client import MoodleClient
@@ -429,11 +430,17 @@ def _reserve_path(path: Path) -> Path:
     the caller later overwrites via ``os.replace``), so two concurrent
     downloads can never both pick the same final name and silently
     overwrite each other.
+
+    The placeholder is created owner-only. Course files and study packs
+    are personal academic material, and the placeholder is what a study
+    pack is written *into* — before this, the default 0o777 mode left
+    both readable (and executable) by every other local user whose umask
+    allowed it.
     """
     while True:
         candidate = _available_path(path)
         try:
-            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = open_new_private_file(candidate)
         except FileExistsError:
             continue
         os.close(fd)
@@ -595,7 +602,9 @@ def download_material(
         raise DownloadError("empty", f"Download failed for '{file_name}'.")
 
     dest_dir = Path(output_dir) if output_dir else Path.cwd()
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    # Only directories this call has to create are made owner-only; an
+    # existing destination the user chose is left exactly as it is.
+    ensure_private_dir(dest_dir)
     dest_path = _reserve_path(dest_dir / _sanitize_filename(file_name))
 
     # Write to a uniquely named temp file and rename over the reserved

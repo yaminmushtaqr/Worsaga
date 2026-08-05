@@ -72,6 +72,7 @@ from worsaga.autosync import (
     remove_autosync,
 )
 from worsaga.cache import CacheStore, default_cache_path, read_last_sync_at
+from worsaga.principal import PrincipalMismatchError
 from worsaga.notify import notification_backend, send_notification
 from worsaga.studypack import build_study_pack, write_study_pack
 from worsaga.watch import run_watch
@@ -110,6 +111,7 @@ __all__ = [
     "MoodleConfig",
     "MoodleScopeError",
     "MoodleWriteAttemptError",
+    "PrincipalMismatchError",
     "SELF_SCOPED_PARAMS",
     "SUPPORTED_EXTENSIONS",
     "SYNC_CATEGORIES",

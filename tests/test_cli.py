@@ -977,6 +977,150 @@ class TestCommandOutput:
         assert "Week 2" in out
 
 
+class TestTokenSource:
+    """--token is deprecated but still works; --token-stdin replaces it."""
+
+    TOKEN = "piped-token-value"
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.setenv("WORSAGA_URL", "https://moodle.example.edu")
+        monkeypatch.setenv("WORSAGA_USERID", "5")
+        monkeypatch.delenv("WORSAGA_TOKEN", raising=False)
+        monkeypatch.delenv("WORSAGA_DEMO", raising=False)
+
+    def _stdin(self, monkeypatch, text):
+        import io
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO(text))
+
+    @patch("worsaga.cli.test_connection")
+    def test_token_in_argv_still_works_but_warns(self, mock_conn, capsys):
+        mock_conn.return_value = {"userid": 5, "username": "u", "sitename": "s"}
+        main(["--token", "argv-token", "doctor"])
+        captured = capsys.readouterr()
+        assert "Warning:" in captured.err
+        assert "shell history" in captured.err
+        assert "--token-stdin" in captured.err
+        # Deprecated, not broken: the command still ran with that token.
+        assert mock_conn.call_args[0][0].token == "argv-token"
+
+    @patch("worsaga.cli.test_connection")
+    @patch("worsaga.cli.MoodleConfig.write_config")
+    def test_setup_token_in_argv_warns(
+        self, mock_write, mock_conn, capsys, tmp_path,
+    ):
+        mock_conn.return_value = {"userid": 42}
+        mock_write.return_value = tmp_path / "config.json"
+        main(["setup", "--url", "https://m.example.com", "--token", "tok"])
+        assert "shell history" in capsys.readouterr().err
+        mock_write.assert_called_once()
+
+    @patch("worsaga.cli.test_connection")
+    def test_global_token_stdin_feeds_the_client(
+        self, mock_conn, monkeypatch, capsys,
+    ):
+        mock_conn.return_value = {"userid": 5, "username": "u", "sitename": "s"}
+        self._stdin(monkeypatch, f"{self.TOKEN}\n")
+        main(["--token-stdin", "doctor"])
+        assert mock_conn.call_args[0][0].token == self.TOKEN
+        captured = capsys.readouterr()
+        # No deprecation warning, and the secret is never echoed.
+        assert "Warning:" not in captured.err
+        assert self.TOKEN not in captured.out
+        assert self.TOKEN not in captured.err
+
+    @patch("worsaga.cli.test_connection")
+    @patch("worsaga.cli.MoodleConfig.write_config")
+    def test_setup_token_stdin_round_trip(
+        self, mock_write, mock_conn, monkeypatch, capsys, tmp_path,
+    ):
+        mock_conn.return_value = {"userid": 42}
+        mock_write.return_value = tmp_path / "config.json"
+        self._stdin(monkeypatch, f"  {self.TOKEN}  \n")
+        main([
+            "setup", "--url", "https://m.example.com", "--token-stdin",
+        ])
+        # Surrounding whitespace and the newline are stripped.
+        assert mock_write.call_args[1]["token"] == self.TOKEN
+        captured = capsys.readouterr()
+        assert self.TOKEN not in captured.out
+        assert self.TOKEN not in captured.err
+
+    def test_token_and_token_stdin_conflict(self, monkeypatch, capsys):
+        self._stdin(monkeypatch, f"{self.TOKEN}\n")
+        with pytest.raises(SystemExit) as exc:
+            main(["--token", "argv", "--token-stdin", "doctor"])
+        assert exc.value.code == 2
+        assert "cannot be used together" in capsys.readouterr().err
+
+    def test_empty_token_value_still_counts_as_a_conflict(
+        self, monkeypatch, capsys,
+    ):
+        """--token "" is still the user putting a token option in argv."""
+        self._stdin(monkeypatch, f"{self.TOKEN}\n")
+        with pytest.raises(SystemExit) as exc:
+            main(["--token", "", "--token-stdin", "doctor"])
+        assert exc.value.code == 2
+        assert "cannot be used together" in capsys.readouterr().err
+
+    def test_empty_setup_token_value_still_counts_as_a_conflict(
+        self, monkeypatch, capsys,
+    ):
+        self._stdin(monkeypatch, f"{self.TOKEN}\n")
+        with pytest.raises(SystemExit) as exc:
+            main([
+                "setup", "--url", "https://m.example.com",
+                "--token", "", "--token-stdin",
+            ])
+        assert exc.value.code == 2
+        assert "cannot be used together" in capsys.readouterr().err
+
+    @patch("worsaga.cli.test_connection")
+    def test_utf8_bom_is_stripped_from_the_piped_token(
+        self, mock_conn, monkeypatch,
+    ):
+        """A UTF-8 signature is not part of the token, and leaving it in
+        makes Moodle answer with an opaque 'invalid token'."""
+        mock_conn.return_value = {"userid": 5, "username": "u", "sitename": "s"}
+        self._stdin(monkeypatch, "\ufeff" + self.TOKEN + "\n")
+        main(["--token-stdin", "doctor"])
+        assert mock_conn.call_args[0][0].token == self.TOKEN
+
+    def test_empty_stdin_is_a_clean_error(self, monkeypatch, capsys):
+        self._stdin(monkeypatch, "\n")
+        with pytest.raises(SystemExit) as exc:
+            main(["--token-stdin", "doctor"])
+        assert exc.value.code == 1
+        assert "no token" in capsys.readouterr().err
+
+    @patch("worsaga.cli.MoodleConfig.write_config")
+    def test_setup_token_stdin_needs_a_url(
+        self, mock_write, monkeypatch, capsys,
+    ):
+        self._stdin(monkeypatch, f"{self.TOKEN}\n")
+        with pytest.raises(SystemExit) as exc:
+            main(["setup", "--token-stdin"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "--token-stdin" in err and "--url" in err
+        mock_write.assert_not_called()
+
+    def test_help_marks_token_deprecated(self, capsys):
+        with pytest.raises(SystemExit):
+            main(["--help"])
+        out = capsys.readouterr().out
+        assert "DEPRECATED" in out
+        assert "--token-stdin" in out
+
+    def test_setup_help_marks_token_deprecated(self, capsys):
+        with pytest.raises(SystemExit):
+            main(["setup", "--help"])
+        out = capsys.readouterr().out
+        assert "DEPRECATED" in out
+        assert "--token-stdin" in out
+
+
 class TestNonInteractiveSetup:
     @patch("worsaga.cli.test_connection")
     @patch("worsaga.cli.MoodleConfig.write_config")
@@ -1065,17 +1209,23 @@ class TestSetupNonInteractiveGuard:
         assert "aborted" in capsys.readouterr().err.lower()
         mock_write.assert_not_called()
 
-    def test_subprocess_stdin_devnull_no_traceback(self):
+    def test_subprocess_stdin_devnull_no_traceback(self, tmp_path):
         """End-to-end: `worsaga setup` with closed stdin never traces back."""
         repo_root = Path(__file__).resolve().parents[1]
         env = dict(os.environ)
         env["PYTHONPATH"] = str(repo_root / "src")
         # Ensure no ambient credentials divert the interactive fallback.
+        # The child escapes the suite's in-process isolation fixture, so an
+        # existing throwaway creds file shadows the developer's real
+        # platform config outright (an unset or missing WORSAGA_CREDS_PATH
+        # would fall through to the real config.json).
         for var in (
-            "WORSAGA_URL", "WORSAGA_TOKEN", "WORSAGA_USERID",
-            "WORSAGA_CREDS_PATH", "WORSAGA_DEMO",
+            "WORSAGA_URL", "WORSAGA_TOKEN", "WORSAGA_USERID", "WORSAGA_DEMO",
         ):
             env.pop(var, None)
+        sandbox_creds = tmp_path / "empty-config.json"
+        sandbox_creds.write_text("{}")
+        env["WORSAGA_CREDS_PATH"] = str(sandbox_creds)
         proc = subprocess.run(
             [sys.executable, "-m", "worsaga.cli", "setup"],
             stdin=subprocess.DEVNULL,

@@ -110,6 +110,22 @@ class TestDefaultIndexPath:
 
 
 class TestTextIndexStore:
+    def test_symlinked_index_path_is_refused(self, tmp_path):
+        """SQLite would follow the link and write indexed course text
+        wherever it points; the store refuses to open it at all."""
+        from worsaga.secureio import SecureWriteError
+
+        real = tmp_path / "elsewhere.db"
+        real.write_bytes(b"")
+        link = tmp_path / "search.db"
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("this environment cannot create symbolic links")
+        with pytest.raises(SecureWriteError) as exc:
+            TextIndexStore(link)
+        assert "symbolic link" in str(exc.value)
+
     def _put(self, store, *, doc_key="1:doc", pages=None, meta=None,
              fingerprint="fp1"):
         store.upsert_document(

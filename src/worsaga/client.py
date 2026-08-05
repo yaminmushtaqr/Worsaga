@@ -284,8 +284,14 @@ class MoodleRequestError(RuntimeError):
     Carries Moodle's stable ``errorcode`` (localisation-independent)
     alongside the human message so callers can classify failures without
     string-matching a translated message. The ``str()`` form keeps the
-    historical ``"Moodle API error: ..."`` wording. Messages never contain
-    tokens (Moodle does not echo the ``wstoken`` in exception payloads).
+    historical ``"Moodle API error: ..."`` wording.
+
+    Both fields are built from text the *server* chose, so the client
+    passes them through :meth:`MoodleClient._redact_token` first. Stock
+    Moodle does not echo the ``wstoken`` in an exception payload, but a
+    plugin, a reverse proxy, or a WAF that quotes the offending request
+    can, and this message goes on to be printed, logged, and pasted into
+    bug reports.
     """
 
     def __init__(self, message: str, *, errorcode: str = ""):
@@ -535,6 +541,43 @@ class MoodleClient:
                 )
             return self._userid
 
+    def _redact_token(self, text: str) -> str:
+        """Replace this client's token with ``***`` in server-supplied text.
+
+        Applied where a Moodle error payload becomes an exception
+        message. The token travels through ``urlencode`` on the way out,
+        so a server quoting the request back can echo either the raw
+        value or a percent-encoded one; both forms are matched.
+
+        Deliberately narrow: this covers the one place server text
+        crosses into Worsaga's own error strings. Redaction at every
+        output boundary is separate, later work — this is not a claim
+        that no other path could ever carry the value.
+        """
+        token = self._config.token
+        if not token:
+            return text
+        cleaned = text.replace(token, "***")
+        for encoded in (
+            urllib.parse.quote_plus(token), urllib.parse.quote(token),
+        ):
+            if encoded != token:
+                cleaned = cleaned.replace(encoded, "***")
+        return cleaned
+
+    @property
+    def verified_userid(self) -> int | None:
+        """The verified user id if it is already known, else ``None``.
+
+        Never makes a request — unlike :attr:`userid`, which fetches on
+        first use. Read paths that promise not to contact Moodle (the
+        local text search) use this to apply the account-binding check
+        when the identity happens to be known already, and to skip it
+        silently when it is not.
+        """
+        with self._identity_lock:
+            return self._userid
+
     def site_info(self) -> dict:
         """Return a copy of this client's ``core_webservice_get_site_info``.
 
@@ -717,8 +760,11 @@ class MoodleClient:
 
         if isinstance(result, dict) and "exception" in result:
             raise MoodleRequestError(
-                f"Moodle API error: {result.get('message', result)}",
-                errorcode=str(result.get("errorcode") or ""),
+                "Moodle API error: "
+                + self._redact_token(str(result.get("message", result))),
+                errorcode=self._redact_token(
+                    str(result.get("errorcode") or "")
+                ),
             )
 
         return result

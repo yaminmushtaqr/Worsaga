@@ -16,9 +16,16 @@ sanitized before every write —
   (query strings, URLs) are redacted;
 - tuples and sets are converted to sanitized lists.
 
-On POSIX the cache file is created owner-only (0600), matching the
-credential file treatment. Set ``WORSAGA_CACHE_PATH`` to relocate the
-cache (used by tests).
+On POSIX the cache file is created owner-only (0600) *before* SQLite
+opens it, so the database and its rollback journal are private from the
+first byte, matching the credential file treatment. Set
+``WORSAGA_CACHE_PATH`` to relocate the cache (used by tests).
+
+Rows for a site are also bound to the Moodle account that collected
+them: :meth:`CacheStore.bind_principal` stamps the verified user id and
+refuses a write from a different account for the same site. Reads that
+make no network request (``get_recent_changes``, ``read_last_sync_at``)
+are deliberately unguarded — see :mod:`worsaga.principal` for why.
 """
 
 from __future__ import annotations
@@ -33,8 +40,22 @@ from typing import Any
 
 import platformdirs
 
+from worsaga.principal import (
+    bind_principal as _bind_principal,
+)
+from worsaga.principal import (
+    principal_meta_key,
+)
+from worsaga.secureio import ensure_private_file
+
 _APP_NAME = "worsaga"
 SCHEMA_VERSION = 1
+
+#: What to tell a user whose cache belongs to another account.
+_CACHE_REMEDY = (
+    "Delete that file and run 'worsaga sync' again to rebuild it for this "
+    "account, or set WORSAGA_CACHE_PATH to a separate path per account."
+)
 
 # Keys that must never be persisted, at any nesting depth. Any key whose
 # lowercased name *contains* "token" is dropped as well.
@@ -166,11 +187,26 @@ class CacheStore:
     :meth:`begin_immediate` + :meth:`commit`. ``BEGIN IMMEDIATE``
     serializes concurrent sync transactions so two processes can never
     diff against the same stale state and record duplicate events.
+
+    **Account binding is enforced one layer up.** :meth:`bind_principal`
+    is the check, but it is the orchestration layer (``run_sync``, and
+    the CLI and MCP surfaces above it) that calls it before writing.
+    Reaching for :meth:`upsert_item` or :meth:`record_change` directly
+    from library code bypasses the guard entirely. That is a deliberate
+    interim shape — threading a principal through every mutation would
+    be churn against the per-account store namespacing planned for
+    0.9.0, which removes the need for the check at this level.
     """
 
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path else default_cache_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Cached metadata is course data — owner-only, like credentials.
+        # Created before SQLite opens it so the database *and* the
+        # rollback journal SQLite derives from its mode are private from
+        # the start; a chmod afterwards would have missed the journal and
+        # left a readable window. (POSIX modes only; on Windows the file
+        # inherits the profile directory's ACLs.)
+        ensure_private_file(self.path)
         self._conn = sqlite3.connect(self.path, isolation_level=None)
         self._conn.execute("PRAGMA busy_timeout = 10000")
         self._conn.executescript(_SCHEMA)
@@ -178,13 +214,6 @@ class CacheStore:
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
             ("schema_version", str(SCHEMA_VERSION)),
         )
-        # Cached metadata is course data — owner-only, like credentials.
-        # (POSIX only; Windows ACLs are inherited from the profile dir.)
-        if os.name != "nt":
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
 
     def __enter__(self) -> CacheStore:
         return self
@@ -206,6 +235,59 @@ class CacheStore:
     def commit(self) -> None:
         if self._conn.in_transaction:
             self._conn.execute("COMMIT")
+
+    # ── Account binding ───────────────────────────────────────────
+
+    def get_principal(self, site: str) -> int | None:
+        """Return the Moodle user id this cache's *site* rows belong to."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (principal_meta_key(site),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
+
+    def holds_site_data(self, site: str) -> bool:
+        """Return True if any earlier sync recorded something for *site*."""
+        row = self._conn.execute(
+            "SELECT 1 FROM category_syncs WHERE site = ?"
+            " UNION ALL SELECT 1 FROM items WHERE site = ? LIMIT 1",
+            (site, site),
+        ).fetchone()
+        return row is not None
+
+    def bind_principal(self, site: str, principal: int | None) -> bool:
+        """Bind this cache's *site* rows to the authenticated account.
+
+        Called by the sync write path before it writes anything, so a
+        cross-account run is refused with the cache untouched. See
+        :mod:`worsaga.principal` for the adoption and refusal rules.
+
+        Returns whether the caller may go on to write. ``False`` means
+        this run verified no identity while the cache already belongs to
+        one, so its rows cannot be attributed to anybody; a mismatch
+        raises instead.
+        """
+        stored = self.get_principal(site)
+        stamp = _bind_principal(
+            stored=stored,
+            principal=principal,
+            site=site,
+            store_label="sync cache",
+            store_path=str(self.path),
+            remedy=_CACHE_REMEDY,
+            holds_data=self.holds_site_data(site),
+        )
+        if stamp is not None:
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (principal_meta_key(site), str(stamp)),
+            )
+        return principal is not None or stored is None
 
     # ── Items ─────────────────────────────────────────────────────
 

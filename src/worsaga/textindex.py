@@ -22,13 +22,21 @@ for the metadata cache: raw ``file_url`` values are never stored, the
 only URL kept is the token-free ``view_url``, and every stored string
 is passed through :func:`worsaga.cache.sanitize_payload` so embedded
 ``token=``-style values are redacted. On POSIX the database file is
-created owner-only (0600). Set ``WORSAGA_INDEX_PATH`` to relocate the
-index (used by tests).
+created owner-only (0600) before SQLite opens it, so the index and its
+journal are private from the first byte. Set ``WORSAGA_INDEX_PATH`` to
+relocate the index (used by tests).
+
+Indexed documents are bound to the Moodle account that fetched them:
+building refuses to add to an index another account filled for the same
+site, and searching applies the same check whenever the process has
+already verified an identity. A purely offline search does not — see
+:mod:`worsaga.principal` for that boundary.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import sqlite3
 import time
@@ -45,12 +53,29 @@ from worsaga.extraction import (
     extract_file_structured,
 )
 from worsaga.materials import extract_materials, get_section_materials
+from worsaga.principal import (
+    assert_principal,
+    known_principal,
+    principal_meta_key,
+)
+from worsaga.principal import (
+    bind_principal as _bind_principal,
+)
+from worsaga.secureio import ensure_private_file
 
 if TYPE_CHECKING:
     from worsaga.client import MoodleClient
 
+logger = logging.getLogger(__name__)
+
 _APP_NAME = "worsaga"
 SCHEMA_VERSION = 1
+
+#: What to tell a user whose index belongs to another account.
+_INDEX_REMEDY = (
+    "Delete that file and run 'worsaga index' again to rebuild it for this "
+    "account, or set WORSAGA_INDEX_PATH to a separate path per account."
+)
 
 #: Default cap on files fetched per build run. Unchanged files are
 #: skipped without a fetch, so repeated runs make incremental progress
@@ -138,11 +163,22 @@ class TextIndexStore:
     row, insert fresh pages) are grouped in a single ``BEGIN IMMEDIATE``
     transaction so a crash mid-write can never leave a document row
     pointing at half-written pages.
+
+    **Account binding is enforced one layer up.** :meth:`bind_principal`
+    and :meth:`check_principal` are the checks, but ``build_text_index``
+    and ``search_text_index`` are what call them. Calling
+    :meth:`upsert_document` directly from library code bypasses the
+    guard. Deliberate interim shape — see the same note on
+    :class:`worsaga.cache.CacheStore`.
     """
 
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path else default_index_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Indexed text is course data — owner-only, like the cache, and
+        # created before SQLite opens the path so the database and its
+        # journal are both private from the start. (POSIX modes only;
+        # on Windows the file inherits the profile directory's ACLs.)
+        ensure_private_file(self.path)
         self._conn = sqlite3.connect(self.path, isolation_level=None)
         self._conn.execute("PRAGMA busy_timeout = 10000")
         self._conn.executescript(_SCHEMA)
@@ -159,13 +195,6 @@ class TextIndexStore:
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
             ("schema_version", str(SCHEMA_VERSION)),
         )
-        # Indexed text is course data — owner-only, like the cache.
-        # (POSIX only; Windows ACLs are inherited from the profile dir.)
-        if os.name != "nt":
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
 
     def __enter__(self) -> TextIndexStore:
         return self
@@ -177,6 +206,66 @@ class TextIndexStore:
         if self._conn.in_transaction:
             self._conn.execute("ROLLBACK")
         self._conn.close()
+
+    # ── Account binding ───────────────────────────────────────────
+
+    def get_principal(self, site: str) -> int | None:
+        """Return the Moodle user id this index's *site* documents came from."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (principal_meta_key(site),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
+
+    def holds_site_data(self, site: str) -> bool:
+        """Return True if any document for *site* is already indexed."""
+        row = self._conn.execute(
+            "SELECT 1 FROM documents WHERE site = ? LIMIT 1", (site,),
+        ).fetchone()
+        return row is not None
+
+    def bind_principal(self, site: str, principal: int | None) -> bool:
+        """Bind this index's *site* documents to the authenticated account.
+
+        Returns whether the caller may go on to write; ``False`` means
+        this run verified no identity while the index already belongs to
+        one. A mismatch raises instead.
+        """
+        stored = self.get_principal(site)
+        stamp = _bind_principal(
+            stored=stored,
+            principal=principal,
+            site=site,
+            store_label="search index",
+            store_path=str(self.path),
+            remedy=_INDEX_REMEDY,
+            holds_data=self.holds_site_data(site),
+        )
+        if stamp is not None:
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (principal_meta_key(site), str(stamp)),
+            )
+        return principal is not None or stored is None
+
+    def check_principal(self, site: str, principal: int | None) -> None:
+        """Refuse a read of *site* documents belonging to another account.
+
+        Check-only: an unstamped index is not adopted by a read.
+        """
+        assert_principal(
+            stored=self.get_principal(site),
+            principal=principal,
+            site=site,
+            store_label="search index",
+            store_path=str(self.path),
+            remedy=_INDEX_REMEDY,
+        )
 
     # ── Documents ─────────────────────────────────────────────────
 
@@ -416,6 +505,22 @@ def build_text_index(
     covered: list[dict[str, Any]] = []
 
     with TextIndexStore(index_path) as store:
+        # Before the first document is written, and read here rather than
+        # earlier: the course list above is an authenticated call that
+        # injects the user id, so reaching this point with data means the
+        # identity is verified. An index another account filled for this
+        # site is refused, not appended to.
+        if not store.bind_principal(site, known_principal(client)):
+            logger.warning(
+                "The account behind this run was never verified, and the "
+                "search index at %s already belongs to another account; "
+                "nothing was indexed.", store.path,
+            )
+            warnings.append(
+                "nothing was indexed: this run could not be attributed to "
+                "the account the index belongs to"
+            )
+            courses = []
         for course in courses:
             cid = course["id"]
             shortname = str(course.get("shortname", ""))
@@ -547,13 +652,21 @@ def search_text_index(
     course_shortname: str | None = None,
     limit: int = 20,
     index_path: str | Path | None = None,
+    principal: int | None = None,
 ) -> dict[str, Any]:
     """Search the local index (no network) and return hits plus coverage.
 
     The ``index`` stats let callers distinguish "no match" from "nothing
     indexed yet" and prompt for a ``worsaga index`` run.
+
+    *principal* is the verified user id when the calling process already
+    knows one (see :func:`worsaga.principal.known_principal`); the search
+    then refuses an index bound to a different account. Callers that
+    cannot supply one without a network request must pass ``None`` — this
+    function's contract is that it never contacts Moodle.
     """
     with TextIndexStore(index_path) as store:
+        store.check_principal(site, principal)
         hits = store.search(
             site, query,
             course_id=course_id,

@@ -29,6 +29,7 @@ from worsaga.cache import sanitize_payload
 from worsaga.client import DownloadError
 from worsaga.extraction import MAX_TEXT_PER_FILE, extract_file_structured
 from worsaga.materials import _reserve_path, _sanitize_filename
+from worsaga.secureio import ensure_private_dir, write_private_file
 from worsaga.sections import (
     WeekNotFoundError,
     find_best_section,
@@ -268,13 +269,21 @@ def write_study_pack(
     The destination name is collision-safe: an existing file is never
     overwritten — a numeric suffix is added instead. Content is always
     written UTF-8 so packs are portable regardless of the platform's
-    legacy default encoding.
+    legacy default encoding. The reserved file is owner-only from
+    creation (a study pack contains a week's course material verbatim),
+    and a directory created here is owner-only too.
+
+    The reservation claims the *name*; the content then goes through
+    :func:`worsaga.secureio.write_private_file`, which refuses a
+    destination that is no longer a regular file and replaces it by
+    rename. Reopening the reserved path by name to write into it would
+    have followed a symbolic link swapped in after the reservation.
     """
     dest = Path(dest_dir)
-    dest.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(dest)
     path = _reserve_path(dest / _sanitize_filename(filename))
     try:
-        path.write_text(markdown, encoding="utf-8")
+        write_private_file(path, markdown)
     except OSError:
         path.unlink(missing_ok=True)
         raise

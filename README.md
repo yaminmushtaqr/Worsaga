@@ -52,10 +52,11 @@ worsaga courses
 worsaga summary <course> --week <n>
 ```
 
-Non-interactive setup (for scripts):
+Non-interactive setup (for scripts) — the token is piped in, so it never
+appears in your shell history or in the process list:
 
 ```bash
-worsaga setup --url https://moodle.example.ac.uk --token YOUR_TOKEN
+pass show moodle/token | worsaga setup --url https://moodle.example.ac.uk --token-stdin
 ```
 
 ### Getting a Moodle API token
@@ -98,11 +99,45 @@ demo mode (see below). Demo mode never contacts any Moodle site.
 
 Credentials are resolved in this order:
 
-1. **Explicit arguments** passed on the command line (`--url`, `--token`, `--userid`)
+1. **Explicit arguments** passed on the command line (`--url`, `--userid`, and
+   the token via `--token-stdin`)
 2. **Environment variables**: `WORSAGA_URL`, `WORSAGA_TOKEN`, `WORSAGA_USERID`
 3. **Config file** (first found):
    - `$WORSAGA_CREDS_PATH` (if set)
    - Platform-native config directory (see below)
+
+### How to supply the token
+
+In order of preference:
+
+1. **`worsaga setup`** — the interactive prompt. The token is never echoed and
+   is saved to the config file below.
+2. **A credentials file** — written by `setup`, or maintained yourself. It is
+   created readable only by you (`0600` on Linux and macOS; on Windows it
+   inherits your user profile's permissions) and is replaced atomically, so it
+   always holds either the old contents or the new ones, never a mixture.
+3. **`WORSAGA_TOKEN`** — the environment variable, for CI and containers.
+4. **`--token-stdin`** — for scripts that hold the token in a password
+   manager or secret store:
+
+   ```bash
+   pass show moodle/token | worsaga setup --url https://moodle.example.ac.uk --token-stdin
+   pass show moodle/token | worsaga --token-stdin courses
+   ```
+
+`--token YOUR_TOKEN` still works but is **deprecated** and prints a warning:
+command-line arguments are saved in your shell history and are visible to
+every other process on the machine through the process list. If you have used
+it, reset that token on your Moodle token page and switch to one of the
+options above.
+
+Worsaga's own helper processes (the auto-sync scheduler and desktop
+notifications) run with `WORSAGA_TOKEN` removed from their environment. The
+token is never written to the cache or the search index, it is stripped from
+the `file_url` values in every result, and it is redacted from Moodle's own
+error messages before they are shown. Redaction at *every* output boundary is
+upcoming hardening rather than a guarantee today, so treat command output you
+paste elsewhere with the same care you would give any log.
 
 The Moodle URL must use `https://` — the API token is sent with every
 request, so plain HTTP would expose it. `http://` is accepted only for a

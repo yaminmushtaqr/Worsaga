@@ -46,6 +46,7 @@ from worsaga.forums import normalize_forum_discussions, normalize_forums
 from worsaga.grades import collect_grades
 from worsaga.materials import extract_materials, strip_file_urls
 from worsaga.models import change_record
+from worsaga.principal import known_principal
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +360,38 @@ def run_sync(
         # and then diffs against the committed state instead of racing
         # this one and double-recording the same events.
         cache.begin_immediate()
+        # First statement in the transaction, and the principal is read
+        # here rather than before the fan-out: every authenticated read
+        # injects the user id, so a collection that produced anything has
+        # already verified the client. A cache belonging to a different
+        # account raises here, and the rollback on close leaves it as it
+        # was.
+        if not cache.bind_principal(site, known_principal(client)):
+            logger.warning(
+                "Nothing could be fetched from %s this run, so the account "
+                "behind it was never verified. The local sync cache at %s "
+                "already belongs to another account, so no rows and no run "
+                "record were written. Check the connection and credentials "
+                "and sync again.",
+                site, cache.path,
+            )
+            warnings.append(
+                "nothing was written to the local cache: no Moodle call "
+                "succeeded, so this run could not be attributed to the "
+                "account the cache belongs to"
+            )
+            return {
+                "site": site,
+                "synced_at": started_at,
+                "categories": {
+                    name: {"synced": False, "items": 0, "new": 0,
+                           "updated": 0, "adopted": 0, "baseline": False}
+                    for name in SYNC_CATEGORIES
+                },
+                "changes": [],
+                "warnings": warnings,
+                "cache_path": str(cache.path),
+            }
         for name in SYNC_CATEGORIES:
             snapshot = snapshots[name]
             if snapshot is None:

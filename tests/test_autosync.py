@@ -5,6 +5,7 @@ touches the real Task Scheduler, launchd, or systemd.
 """
 
 import json
+import os
 import subprocess
 import sys
 from unittest.mock import patch
@@ -85,6 +86,37 @@ class TestSyncCommand:
     def test_never_contains_credentials(self, monkeypatch):
         monkeypatch.setenv("WORSAGA_TOKEN", "supersecret")
         assert "supersecret" not in " ".join(sync_command())
+
+
+class TestSubprocessEnvironment:
+    """Scheduler children get the normal environment minus the token."""
+
+    def _recorded_env(self, monkeypatch):
+        recorded = {}
+
+        def fake_run(args, **kwargs):
+            recorded.update(kwargs)
+            return _ok()
+
+        monkeypatch.setattr(autosync.subprocess, "run", fake_run)
+        autosync._run(["schtasks", "/Query"])
+        return recorded["env"]
+
+    def test_token_is_stripped(self, monkeypatch):
+        monkeypatch.setenv("WORSAGA_TOKEN", "supersecret")
+        env = self._recorded_env(monkeypatch)
+        assert "WORSAGA_TOKEN" not in env
+        assert "supersecret" not in "".join(env.values())
+
+    def test_ordinary_environment_survives(self, monkeypatch):
+        monkeypatch.setenv("WORSAGA_TOKEN", "supersecret")
+        monkeypatch.setenv("WORSAGA_URL", "https://moodle.example.edu")
+        env = self._recorded_env(monkeypatch)
+        # schtasks/launchctl/systemctl need these to run at all.
+        for name in ("PATH", "SYSTEMROOT", "HOME", "USERPROFILE"):
+            if name in os.environ:
+                assert env[name] == os.environ[name]
+        assert env["WORSAGA_URL"] == "https://moodle.example.edu"
 
 
 class TestInstallWindows:

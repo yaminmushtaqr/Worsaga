@@ -51,6 +51,33 @@ All notable changes to Worsaga are documented in this file.
   suppressed by `-q/--quiet` and in `--json`/`--yaml` machine modes. It is
   wired through an optional callback on the shared orchestrators, so the MCP
   server (which shares them over stdio) passes nothing and stays silent.
+- `--token-stdin`, a way to pass the API token that never puts it in the
+  command line. Available globally (`pass show moodle | worsaga --token-stdin
+  courses`) and on `setup` (`worsaga setup --url <URL> --token-stdin`, which
+  reads the first line of stdin, strips it, and writes the credentials file).
+  It works piped and typed, echoes nothing, and never appears in an error
+  message. `setup --token-stdin` requires `--url`, because the guided prompts
+  cannot read a URL from a stdin the token has already been taken from.
+
+- A new `principal_mismatch` value in the MCP `error_code` vocabulary.
+  `sync_now`, `build_search_index`, and `search_text` return
+  `{"error", "error_code": "principal_mismatch"}` when the local store they
+  would use belongs to a different Moodle account, instead of raising an
+  unstructured tool error. The message names both user ids and the file to
+  remove.
+
+### Deprecated
+
+- Passing the token as a command-line argument. `--token VALUE` (global) and
+  `worsaga setup --token VALUE` still work exactly as before, but now print a
+  one-line warning to stderr: an argument is recorded in shell history and is
+  visible to every other process on the machine through the process list, so
+  a secret should never travel that way. Released versions up to and
+  including 0.8.1 documented this as the ordinary non-interactive path, so
+  anyone who used it should treat that token as exposed and reset it. Use
+  `WORSAGA_TOKEN`, a credentials file, `--token-stdin`, or the interactive
+  `worsaga setup` prompt instead; the help text and README now list them in
+  that order of preference.
 
 ### Fixed
 
@@ -223,6 +250,86 @@ All notable changes to Worsaga are documented in this file.
 
 ### Security
 
+- Every file Worsaga creates to hold credentials or course data is now
+  owner-only from the moment it exists, through one shared primitive
+  (`worsaga.secureio`) rather than a permission
+  dance repeated at each call site. Previously the mode was applied *after*
+  creation, or not at all: on POSIX with an ordinary `umask 022`, the
+  placeholder that `download` and `study-pack` reserve was created `0755`
+  (world-readable **and** executable), a written study pack kept that mode,
+  and the cache and search-index databases were created `0644` by SQLite and
+  only chmod-ed afterwards — which never covered the rollback journal SQLite
+  writes beside them, so indexed course text was readable by any other local
+  user for the duration of a write. Files are now created with mode `0600` in
+  the `os.open` call itself, and the databases are created before SQLite opens
+  them so the database *and* its journal are private from the first byte; a
+  database left loose by an older release is tightened on the next open.
+  Directories Worsaga creates (the config, data, and download directories, and
+  a `--output` directory it has to create) are made `0700` at creation,
+  including intermediate levels; a directory that already exists is never
+  chmod-ed, since the user may have shared it on purpose. On Windows POSIX
+  modes do not apply and these paths keep inheriting the user profile's ACLs.
+  The launchd plist and systemd unit files `auto-sync install` writes stay
+  ordinary `0644`: they hold no secrets — the scheduled command line carries
+  no credentials — and the platform's service manager has to be able to read
+  them.
+- The credentials file is now written atomically and never through a symbolic
+  link. It is written to a private sibling temp file, fsynced, and renamed
+  over the destination, so `config.json` always holds either the old content
+  or the new content and never a mixture, and no reader can observe a
+  half-written one. A destination that exists as a symbolic link (or anything
+  other than a regular file) is refused with a clear error instead of
+  followed, and because the rename replaces the link itself, a link planted
+  between the check and the write cannot redirect the token either. The same
+  refusal now guards the cache and search-index paths before SQLite opens
+  them, and the study-pack export routes its content through the same write
+  instead of reopening the reserved filename — a symlink swapped in after the
+  name was reserved is refused rather than followed.
+- `MoodleConfig` no longer prints the token in its `repr`. The config object
+  is held by every client, so it reached tracebacks, log records, `--verbose`
+  style dumps, and agent transcripts verbatim; it now renders as
+  `MoodleConfig(url='https://...', token='***', userid=7)`, saying nothing
+  about the token beyond whether one is set. Reading `config.token` is
+  unchanged.
+- The API token is redacted from Moodle's own error text. When a web-service
+  call returns an `exception` payload, the server-chosen `message` and
+  `errorcode` become a `MoodleRequestError` that the CLI prints and agents
+  surface; any occurrence of the configured token (raw or percent-encoded, as
+  it appears after `urlencode`) is now replaced with `***` first. Stock Moodle
+  does not echo `wstoken` back, but a plugin, reverse proxy, or WAF that
+  quotes the offending request can, and that message ends up in terminals,
+  logs, and bug reports. This is a targeted fix at the one place server text
+  becomes a Worsaga error string, not a general output-boundary redaction —
+  that is separate, upcoming work.
+- Worsaga's own subprocesses no longer inherit the API token. The scheduler
+  helpers (`schtasks`, `launchctl`, `systemctl`) and the desktop-notification
+  helpers (PowerShell toast, `osascript`, `notify-send`) previously ran with
+  the full environment, which on many systems means any process able to read
+  `/proc/<pid>/environ` could recover `WORSAGA_TOKEN` from them. They now run
+  with `WORSAGA_TOKEN` removed and everything else (`PATH`, `SystemRoot`,
+  `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, ...) intact.
+- Local stores are now bound to the Moodle account that filled them. The sync
+  cache, the full-text index, and the auto-sync record each record the
+  *verified* user id (the one the site itself reports) alongside their
+  existing site keying. A write from a different account for the same site is
+  refused with an error naming both user ids and the file to remove, instead
+  of silently diffing one account's Moodle against another's baseline or
+  answering searches from another account's documents — the case where two
+  Moodle accounts share one OS login (re-enrolment, a shared lab machine, a
+  personal and a staff token). The identity is read at the moment the store is
+  written, never earlier, so a run whose first call failed and whose later
+  calls succeeded cannot slip past the check unattributed; a run that verified
+  no identity at all writes nothing into a store that already belongs to an
+  account, and says so, rather than failing hard on a network outage. A store
+  with no stamp is adopted by the first
+  authenticated caller, with a one-line notice when it already held data, so
+  existing local data survives the upgrade. Reads that make no network request
+  (`worsaga changes`, an offline `search-text`) are deliberately not guarded:
+  there is no verified identity available offline, and a check against an
+  unverified id would guarantee nothing — the OS user boundary is the real
+  line there, and the module documents this rather than implying more. This is
+  an interim guard; full per-account namespacing of the store paths is planned
+  for 0.9.0.
 - The authenticated user is now verified against the Moodle site instead of
   taken on trust from configuration. `WORSAGA_USERID` (and the `userid` in a
   credentials file or `--userid`) is treated as a hint: on first use the

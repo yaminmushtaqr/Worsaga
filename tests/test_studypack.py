@@ -1,11 +1,15 @@
 """Tests for Markdown study-pack building and export."""
 
 import json
+import os
+import stat
 from unittest.mock import patch
 
 import pytest
 
+from worsaga import secureio, studypack
 from worsaga.cli import main
+from worsaga.secureio import SecureWriteError
 from worsaga.demo import DemoMoodleClient
 from worsaga.sections import WeekNotFoundError
 from worsaga.studypack import (
@@ -165,6 +169,57 @@ class TestWriteStudyPack:
         assert first != second
         assert first.read_text(encoding="utf-8") == "one"
         assert second.read_text(encoding="utf-8") == "two"
+
+    def test_pack_file_is_created_owner_only(self, tmp_path, monkeypatch):
+        """A pack holds a week's course material verbatim — 0600, and the
+        mode is requested at creation (checkable on every platform).
+
+        Two creations: the reserved placeholder that claims the name, and
+        the temp file the content is written into before the rename.
+        """
+        modes = []
+        real_open = os.open
+
+        def spy(path, flags, mode=0o777, **kwargs):
+            if flags & os.O_CREAT:  # ignore the read-only directory fsync
+                modes.append(mode)
+            return real_open(path, flags, mode, **kwargs)
+
+        monkeypatch.setattr(secureio.os, "open", spy)
+        write_study_pack("# T\n", tmp_path / "packs", "pack.md")
+        assert modes == [0o600, 0o600]
+
+    def test_placeholder_swapped_for_a_symlink_is_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        """The reservation claims a name; between then and the write it
+        could be replaced with a link to somewhere else."""
+        target = tmp_path / "victim.md"
+        target.write_text("original", encoding="utf-8")
+        real_reserve = studypack._reserve_path
+
+        def swap(path):
+            reserved = real_reserve(path)
+            reserved.unlink()
+            reserved.symlink_to(target)
+            return reserved
+
+        try:
+            (tmp_path / "probe").symlink_to(target)
+        except (OSError, NotImplementedError):
+            pytest.skip("this environment cannot create symbolic links")
+        monkeypatch.setattr(studypack, "_reserve_path", swap)
+        with pytest.raises(SecureWriteError):
+            write_study_pack("# leaked\n", tmp_path, "pack.md")
+        assert target.read_text(encoding="utf-8") == "original"
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX permissions are not applicable on Windows"
+    )
+    def test_pack_file_mode_on_posix(self, tmp_path):
+        path = write_study_pack("# T\n", tmp_path / "packs", "pack.md")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE((tmp_path / "packs").stat().st_mode) == 0o700
 
 
 class TestCliSurface:

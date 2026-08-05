@@ -1,13 +1,17 @@
 """Tests for material selection, download, and the download CLI/MCP surface."""
 
 import json
+import os
+import stat
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from worsaga import secureio
 from worsaga.materials import (
     MaterialSelectionError,
+    _reserve_path,
     _sanitize_filename,
     candidate_summary,
     download_material,
@@ -336,6 +340,55 @@ class TestDownloadMaterial:
 
 
 # ── No-token-leak guarantees ────────────────────────────────────
+
+
+class TestDownloadPermissions:
+    """Downloaded course files are personal academic material: the
+    reserved placeholder and the final file are owner-only."""
+
+    def test_reserved_placeholder_is_owner_only(self, tmp_path, monkeypatch):
+        modes = []
+        real_open = os.open
+
+        def spy(path, flags, mode=0o777, **kwargs):
+            modes.append(mode)
+            return real_open(path, flags, mode, **kwargs)
+
+        monkeypatch.setattr(secureio.os, "open", spy)
+        _reserve_path(tmp_path / "slides.pdf")
+        assert modes == [0o600]
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX permissions are not applicable on Windows"
+    )
+    def test_placeholder_mode_on_posix(self, tmp_path):
+        path = _reserve_path(tmp_path / "slides.pdf")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX permissions are not applicable on Windows"
+    )
+    def test_downloaded_file_and_new_dir_on_posix(self, tmp_path):
+        nested = tmp_path / "sub"
+        mock_client = MagicMock()
+        mock_client.download_file.return_value = b"data"
+        result = download_material(
+            mock_client, _materials()[0], output_dir=nested,
+        )
+        assert stat.S_IMODE(Path(result["local_path"]).stat().st_mode) == 0o600
+        assert stat.S_IMODE(nested.stat().st_mode) == 0o700
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX permissions are not applicable on Windows"
+    )
+    def test_existing_output_dir_is_left_alone(self, tmp_path):
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        shared.chmod(0o755)
+        mock_client = MagicMock()
+        mock_client.download_file.return_value = b"data"
+        download_material(mock_client, _materials()[0], output_dir=shared)
+        assert stat.S_IMODE(shared.stat().st_mode) == 0o755
 
 
 class TestNoTokenLeak:
