@@ -36,8 +36,19 @@ R = TypeVar("R")
 #: Default cap on worker threads for a single fan-out. Deliberately small:
 #: enough to hide per-request latency across dozens of courses without
 #: hammering Moodle or exhausting connections. Override per process with the
-#: ``WORSAGA_CONCURRENCY`` environment variable.
-DEFAULT_MAX_WORKERS = 6
+#: ``WORSAGA_CONCURRENCY`` environment variable (itself capped at 8).
+#:
+#: Moodle core applies no server-side rate limiting to web-service calls, and
+#: ecosystem guidance for well-behaved clients is roughly two concurrent
+#: connections per site, so the ceiling is the only thing standing between a
+#: typo and a self-inflicted load spike on someone else's server. A proper
+#: per-origin limiter lands in a later phase; until then this is the interim
+#: politeness ceiling.
+DEFAULT_MAX_WORKERS = 4
+
+#: Hard ceiling on ``WORSAGA_CONCURRENCY``. The escape hatch exists for slow
+#: sites, not for turning Worsaga into a load generator.
+MAX_ALLOWED_WORKERS = 8
 
 #: Progress callback signature: ``(completed, total, label)``. ``completed``
 #: counts finished items (1..total); ``label`` describes the item that just
@@ -49,14 +60,14 @@ def resolve_max_workers(total: int) -> int:
     """Return the worker-thread count for a fan-out of *total* items.
 
     Never more than the item count and at least 1. ``WORSAGA_CONCURRENCY``
-    overrides :data:`DEFAULT_MAX_WORKERS` (clamped to 1..32); an unset or
+    overrides :data:`DEFAULT_MAX_WORKERS` (clamped to 1..8); an unset or
     unparseable value falls back to the default.
     """
     cap = DEFAULT_MAX_WORKERS
     raw = os.environ.get("WORSAGA_CONCURRENCY", "").strip()
     if raw:
         try:
-            cap = max(1, min(32, int(raw)))
+            cap = max(1, min(MAX_ALLOWED_WORKERS, int(raw)))
         except ValueError:
             cap = DEFAULT_MAX_WORKERS
     return max(1, min(cap, total))
@@ -124,6 +135,7 @@ def run_parallel(
 
 __all__ = [
     "DEFAULT_MAX_WORKERS",
+    "MAX_ALLOWED_WORKERS",
     "ProgressCallback",
     "resolve_max_workers",
     "run_parallel",

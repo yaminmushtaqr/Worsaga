@@ -5,6 +5,7 @@ JSON-encoded strings, and that error shapes for ``download_material`` are
 preserved as structured dicts.
 """
 
+import inspect
 import json
 
 import pytest
@@ -158,6 +159,13 @@ class TestNativeReturns:
 
         assert isinstance(result, dict)
         assert result["status_counts"] == {"missing": 1}
+
+    def test_grade_tools_expose_no_user_id_parameter(self):
+        # Self-only by construction: an agent has no way to ask these tools
+        # for another student's gradebook, whatever the token can do.
+        for name in ("get_grades", "get_grade_summary"):
+            params = inspect.signature(getattr(mcp_server, name)).parameters
+            assert list(params) == ["course_id"], name
 
     def test_get_assignments_returns_list(self):
         client = _FakeClient(

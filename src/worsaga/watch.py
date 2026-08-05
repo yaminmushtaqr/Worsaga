@@ -33,7 +33,10 @@ if TYPE_CHECKING:
     from worsaga.client import MoodleClient
 
 DEFAULT_WATCH_INTERVAL = 900  # 15 minutes
-MIN_WATCH_INTERVAL = 60
+#: Politeness floor. Each cycle is a full metadata sync across every
+#: enrolled course, so a tighter loop only multiplies load on a shared
+#: Moodle instance without surfacing changes meaningfully sooner.
+MIN_WATCH_INTERVAL = 300  # 5 minutes
 
 #: Change titles listed in a notification body before "and N more".
 _NOTIFY_MAX_LINES = 3

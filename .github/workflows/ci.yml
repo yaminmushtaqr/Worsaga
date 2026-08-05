@@ -89,6 +89,32 @@ jobs:
       - name: Run pytest
         run: python -m pytest -q
 
+  mcp-compat:
+    # mcp 2.0 dropped mcp.server.fastmcp, which the MCP server imports, so
+    # the extra is pinned to >=1.28,<2. Test both ends of that window: the
+    # declared floor and whatever the range currently resolves to.
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp-spec: ["mcp==1.28.*", "mcp>=1.28,<2"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install package with the selected mcp release
+        # One resolve, so the floor job also gets the transitive
+        # dependencies mcp 1.28 asks for rather than a newer release's.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp,yaml]" "${{ matrix.mcp-spec }}"
+      - name: Report resolved mcp version
+        run: |
+          python -c "from importlib.metadata import version; print('mcp', version('mcp'))"
+      - name: Run pytest
+        run: python -m pytest -q
+
   package-smoke:
     strategy:
       fail-fast: false

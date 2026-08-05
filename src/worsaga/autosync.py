@@ -49,8 +49,10 @@ MACOS_LABEL = "com.worsaga.autosync"
 LINUX_UNIT = "worsaga-autosync"
 
 DEFAULT_INTERVAL_MINUTES = 30
-#: schtasks /SC MINUTE accepts 1-1439; 5 is a politeness floor.
-MIN_INTERVAL_MINUTES = 5
+#: schtasks /SC MINUTE accepts 1-1439; 15 is a politeness floor. A metadata
+#: sync fans out over every enrolled course, so a shorter period buys no
+#: freshness worth the load it puts on a shared Moodle instance.
+MIN_INTERVAL_MINUTES = 15
 MAX_INTERVAL_MINUTES = 1439
 
 _SUBPROCESS_TIMEOUT = 30

@@ -172,7 +172,7 @@ class _DelayedGradeClient:
     def get_courses(self):
         return self.courses
 
-    def get_user_grade_items(self, course_id, user_id=None):
+    def get_user_grade_items(self, course_id):
         # Later courses answer sooner, so completion order != input order.
         time.sleep(0.02 * (6 - course_id))
         if course_id == 3:

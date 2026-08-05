@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from worsaga.autosync import DEFAULT_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES
 from worsaga.cli import (
     CourseResolutionError,
     _build_parser,
@@ -17,6 +18,8 @@ from worsaga.cli import (
     _resolve_course_id,
     main,
 )
+from worsaga.concurrency import DEFAULT_MAX_WORKERS, MAX_ALLOWED_WORKERS
+from worsaga.watch import DEFAULT_WATCH_INTERVAL, MIN_WATCH_INTERVAL
 
 
 class TestParser:
@@ -296,6 +299,41 @@ class TestParser:
         out = capsys.readouterr().out
         assert "file_url" in out
         assert "provenance" in out.lower()
+
+
+class TestPolitenessPolicy:
+    """Literal pins on the politeness values, and the text users see.
+
+    Every other test interpolates these constants, so lowering a floor or
+    raising the concurrency ceiling would still pass the suite. Pinning the
+    literals here makes changing one a deliberate policy decision rather
+    than an incidental test fix.
+    """
+
+    def test_autosync_interval_policy(self):
+        assert MIN_INTERVAL_MINUTES == 15
+        assert DEFAULT_INTERVAL_MINUTES == 30
+
+    def test_watch_interval_policy(self):
+        assert MIN_WATCH_INTERVAL == 300
+        assert DEFAULT_WATCH_INTERVAL == 900
+
+    def test_concurrency_policy(self):
+        assert DEFAULT_MAX_WORKERS == 4
+        assert MAX_ALLOWED_WORKERS == 8
+
+    def test_watch_help_states_the_floor(self, capsys):
+        with pytest.raises(SystemExit):
+            main(["watch", "--help"])
+        # Whitespace-normalised: argparse rewraps help at the terminal width.
+        out = " ".join(capsys.readouterr().out.split())
+        assert "minimum 300s" in out
+
+    def test_autosync_help_states_the_floor(self, capsys):
+        with pytest.raises(SystemExit):
+            main(["auto-sync", "--help"])
+        out = " ".join(capsys.readouterr().out.split())
+        assert "minimum 15m" in out
 
 
 class TestUpdateCommand:

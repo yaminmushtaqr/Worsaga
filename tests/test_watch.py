@@ -57,12 +57,12 @@ class TestRunWatch:
         sleeps = []
         with patch.object(watch_mod, "run_sync", self._fake_sync([[], [], []])):
             summary = run_watch(
-                object(), interval_seconds=120, max_cycles=3,
+                object(), interval_seconds=600, max_cycles=3,
                 sleep_fn=sleeps.append,
             )
         assert summary["cycles"] == 3
         # No sleep after the final cycle.
-        assert sleeps == [120, 120]
+        assert sleeps == [600, 600]
 
     def test_interval_clamped_to_minimum(self):
         sleeps = []
@@ -166,7 +166,7 @@ class TestCliSurface:
 
     def test_watch_json_is_ndjson(self, capsys):
         main(["--demo", "--json", "watch", "--cycles", "2", "--no-notify",
-              "--interval", "1m"])
+              "--interval", "5m"])
         lines = [
             line for line in capsys.readouterr().out.splitlines() if line
         ]
@@ -208,7 +208,7 @@ class TestCliSurface:
         main(["--demo", "watch", "--cycles", "1", "--no-notify",
               "--interval", "1s"])
         err = capsys.readouterr().err
-        assert "every 60s" in err
+        assert f"every {MIN_WATCH_INTERVAL}s" in err
 
     def test_below_floor_interval_warns(self, capsys):
         # Issue 1: a below-floor watch interval is clamped up, with a
@@ -218,7 +218,7 @@ class TestCliSurface:
         err = capsys.readouterr().err
         assert (
             "Warning: interval 30s is below the minimum for watch; "
-            "using 60s."
+            f"using {MIN_WATCH_INTERVAL}s."
         ) in err
 
     def test_announces_cycle_start_with_course_count(self, capsys):
@@ -256,5 +256,5 @@ class TestCliSurface:
         client = DemoMoodleClient()
         assert client.get_courses()
         main(["--demo", "watch", "--cycles", "2", "--no-notify",
-              "--interval", "60", "-q"])
+              "--interval", "300", "-q"])
         assert "cycle 2:" in capsys.readouterr().out

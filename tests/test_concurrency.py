@@ -6,6 +6,7 @@ import pytest
 
 from worsaga.concurrency import (
     DEFAULT_MAX_WORKERS,
+    MAX_ALLOWED_WORKERS,
     resolve_max_workers,
     run_parallel,
 )
@@ -84,12 +85,23 @@ def test_resolve_max_workers_never_exceeds_item_count():
 def test_resolve_max_workers_env_override(monkeypatch):
     monkeypatch.setenv("WORSAGA_CONCURRENCY", "3")
     assert resolve_max_workers(100) == 3
-    # Clamped to a sane ceiling.
+    # Clamped to the politeness ceiling: the escape hatch cannot turn
+    # Worsaga into a load generator against someone else's Moodle.
     monkeypatch.setenv("WORSAGA_CONCURRENCY", "9999")
-    assert resolve_max_workers(100) == 32
+    assert resolve_max_workers(100) == MAX_ALLOWED_WORKERS
+    monkeypatch.setenv("WORSAGA_CONCURRENCY", "0")
+    assert resolve_max_workers(100) == 1
     # Unparseable values fall back to the default.
     monkeypatch.setenv("WORSAGA_CONCURRENCY", "lots")
     assert resolve_max_workers(100) == DEFAULT_MAX_WORKERS
+
+
+def test_concurrency_ceiling_stays_polite():
+    # Moodle core has no server-side web-service rate limiting, so these
+    # bounds are the only pacing until a per-origin limiter lands.
+    assert DEFAULT_MAX_WORKERS == 4
+    assert MAX_ALLOWED_WORKERS == 8
+    assert DEFAULT_MAX_WORKERS <= MAX_ALLOWED_WORKERS
 
 
 def test_run_parallel_max_workers_one_is_sequential():

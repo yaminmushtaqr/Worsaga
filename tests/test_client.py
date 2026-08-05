@@ -1,6 +1,8 @@
 """Tests for the read-only Moodle client safeguards."""
 
+import inspect
 import urllib.error
+import urllib.parse
 
 import pytest
 from unittest.mock import patch
@@ -11,11 +13,14 @@ from worsaga.client import (
     ALLOWED_FUNCTION_POLICIES,
     ALLOWED_FUNCTIONS,
     BLOCKED_PATTERNS,
+    IDENTITY_PARAMS,
+    SELF_SCOPED_PARAMS,
     AssignmentNotFoundError,
     CourseNotFoundError,
     DownloadError,
     MoodleClient,
     MoodleRequestError,
+    MoodleScopeError,
     MoodleWriteAttemptError,
 )
 from worsaga.config import MoodleConfig
@@ -80,7 +85,20 @@ class TestAllowlist:
             client.call("core_enrol_get_users_courses", userid=1)
 
         from worsaga import __version__
-        assert seen["ua"] == f"worsaga/{__version__}"
+        assert seen["ua"] == (
+            f"worsaga/{__version__} (+https://github.com/yaminmushtaqr/worsaga)"
+        )
+
+    def test_user_agent_identifies_version_and_project(self):
+        """Bot etiquette: an admin seeing the traffic can identify the
+        client and reach its maintainers."""
+        from worsaga import __version__
+        from worsaga.client import PROJECT_URL, _user_agent
+
+        ua = _user_agent()
+        assert ua.startswith(f"worsaga/{__version__} ")
+        assert f"(+{PROJECT_URL})" in ua
+        assert PROJECT_URL.startswith("https://")
 
 
 # ── Blocked-pattern enforcement ────────────────────────────────────
@@ -128,6 +146,91 @@ class TestBlockedPatterns:
                 )
 
 
+# ── Self-scope enforcement ─────────────────────────────────────────
+
+
+_SCOPED = sorted(SELF_SCOPED_PARAMS.items())
+
+
+class TestSelfScope:
+    """A call may only ever name the authenticated user.
+
+    The convenience wrappers no longer accept a user id, but ``call()`` is
+    public and forwards arbitrary parameters, so the guarantee has to hold
+    at the dispatcher itself.
+    """
+
+    def _capture(self, seen):
+        def _fake_urlopen(req, timeout=30):
+            seen["params"] = urllib.parse.parse_qs(req.data.decode())
+            return _FakeResponse(b"{}")
+
+        return _fake_urlopen
+
+    @pytest.mark.parametrize("wsfunction,param", _SCOPED)
+    def test_other_user_refused_before_any_request(self, client, wsfunction, param):
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            with pytest.raises(MoodleScopeError, match="not the authenticated user"):
+                client.call(wsfunction, **{param: 99})
+        mock_urlopen.assert_not_called()
+
+    @pytest.mark.parametrize("wsfunction,param", _SCOPED)
+    def test_omitted_identity_param_is_injected(self, client, wsfunction, param):
+        seen = {}
+        with patch("urllib.request.urlopen", side_effect=self._capture(seen)):
+            client.call(wsfunction)
+        assert seen["params"][param] == [str(client.userid)]
+
+    @pytest.mark.parametrize("wsfunction,param", _SCOPED)
+    def test_own_userid_is_accepted(self, client, wsfunction, param):
+        seen = {}
+        with patch("urllib.request.urlopen", side_effect=self._capture(seen)):
+            client.call(wsfunction, **{param: client.userid})
+        assert seen["params"][param] == [str(client.userid)]
+
+    def test_own_userid_accepted_as_string(self, client):
+        # Moodle params travel as strings; the comparison must not reject
+        # the authenticated user just because the caller passed "1".
+        seen = {}
+        with patch("urllib.request.urlopen", side_effect=self._capture(seen)):
+            client.call(
+                "gradereport_user_get_grade_items",
+                courseid=10,
+                userid=str(client.userid),
+            )
+        assert seen["params"]["userid"] == [str(client.userid)]
+
+    def test_identity_param_checked_on_unmapped_function_too(self, client):
+        # mod_assign_get_submission_status takes an optional userid on
+        # current Moodle. Worsaga never sends one (so it is not in the
+        # injection map), but naming someone else is still refused.
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            with pytest.raises(MoodleScopeError):
+                client.call(
+                    "mod_assign_get_submission_status", assignid=1, userid=99,
+                )
+        mock_urlopen.assert_not_called()
+
+    def test_useridfrom_filter_is_not_an_identity_claim(self, client):
+        # useridfrom=0 means "any sender" and must stay untouched; only
+        # useridto says whose mailbox is being read.
+        seen = {}
+        with patch("urllib.request.urlopen", side_effect=self._capture(seen)):
+            client.call("core_message_get_messages", useridfrom=0)
+        assert seen["params"]["useridfrom"] == ["0"]
+        assert seen["params"]["useridto"] == [str(client.userid)]
+
+    def test_scope_error_is_not_swallowed_as_a_permission_warning(self):
+        # Orchestrators re-raise MoodleWriteAttemptError rather than turning
+        # it into a per-course "no access" warning; a scope violation needs
+        # the same non-swallowable treatment.
+        assert issubclass(MoodleScopeError, MoodleWriteAttemptError)
+
+    def test_every_scoped_function_is_allowlisted(self):
+        assert set(SELF_SCOPED_PARAMS) <= set(ALLOWED_FUNCTIONS)
+        assert IDENTITY_PARAMS == {"userid", "useridto"}
+
+
 # ── Config-based construction ──────────────────────────────────────
 
 
@@ -166,32 +269,49 @@ class TestClientConvenienceMethods:
             userid=1,
         )
 
-    def test_get_user_grade_items_accepts_explicit_userid(self, client):
-        with patch.object(client, "call", return_value={}) as mock_call:
-            client.get_user_grade_items(10, user_id=99)
-        mock_call.assert_called_once_with(
-            "gradereport_user_get_grade_items",
-            courseid=10,
-            userid=99,
-        )
+    def test_get_user_grade_items_is_self_only(self, client):
+        # Removed in 0.8.2: the method takes no user-id parameter at all, so
+        # it cannot be aimed at another student even with a token that
+        # carries teacher capabilities.
+        params = inspect.signature(MoodleClient.get_user_grade_items).parameters
+        assert list(params) == ["self", "course_id"]
+        with pytest.raises(TypeError):
+            client.get_user_grade_items(10, 99)
 
-    def test_get_course_grades_defaults_to_config_userid(self, client):
-        with patch.object(client, "call", return_value={}) as mock_call:
-            client.get_course_grades(10)
-        mock_call.assert_called_once_with(
-            "core_grades_get_grades",
-            courseid=10,
-            **{"userids[0]": 1},
-        )
+    def test_get_user_grade_items_wire_params_carry_own_userid(self, client):
+        # Guarded at the wire, not just the call() seam: the request body
+        # always carries this client's own userid.
+        seen = {}
 
-    def test_get_course_grades_accepts_multiple_userids(self, client):
-        with patch.object(client, "call", return_value={}) as mock_call:
-            client.get_course_grades(10, user_ids=[7, 8])
-        mock_call.assert_called_once_with(
-            "core_grades_get_grades",
-            courseid=10,
-            **{"userids[0]": 7, "userids[1]": 8},
-        )
+        def _fake_urlopen(req, timeout=30):
+            seen["params"] = urllib.parse.parse_qs(req.data.decode())
+            return _FakeResponse(b"{}")
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            client.get_user_grade_items(10)
+
+        assert seen["params"]["wsfunction"] == [
+            "gradereport_user_get_grade_items"
+        ]
+        assert seen["params"]["courseid"] == ["10"]
+        assert seen["params"]["userid"] == [str(client.userid)]
+
+    def test_core_grades_get_grades_is_not_allowlisted(self, client):
+        # Removed in 0.8.2: it takes a userids list, so a teacher-capable
+        # token could read other students' grades through it. The
+        # authenticated user's own gradebook comes from
+        # gradereport_user_get_grade_items.
+        assert "core_grades_get_grades" not in ALLOWED_FUNCTIONS
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            with pytest.raises(MoodleWriteAttemptError):
+                client.call(
+                    "core_grades_get_grades", courseid=10, **{"userids[0]": 99},
+                )
+        mock_urlopen.assert_not_called()
+
+    def test_get_course_grades_is_gone(self, client):
+        # The multi-user grade reader was deleted, not merely unused.
+        assert not hasattr(client, "get_course_grades")
 
     def test_get_forums_by_courses(self, client):
         with patch.object(client, "call", return_value={}) as mock_call:
@@ -336,8 +456,8 @@ class TestDownloadFile:
                 "https://moodle.example.com/pluginfile.php/123/file.txt",
             )
 
-        from worsaga import __version__
-        assert seen["ua"] == f"worsaga/{__version__}"
+        from worsaga.client import _user_agent
+        assert seen["ua"] == _user_agent()
 
     def test_download_file_rejects_external_host_before_tokenizing(self, client):
         with patch("urllib.request.urlopen") as mock_urlopen:

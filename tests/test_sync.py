@@ -74,7 +74,7 @@ class _FakeClient:
     def get_course_contents(self, course_id):
         return self.contents
 
-    def get_user_grade_items(self, course_id, user_id=None):
+    def get_user_grade_items(self, course_id):
         return self.grades
 
     def get_forums_by_courses(self, course_ids):
@@ -320,7 +320,7 @@ class _TwoCourseClient(_FakeClient):
         ]}]}
         self.fail_202_grades = True
 
-    def get_user_grade_items(self, course_id, user_id=None):
+    def get_user_grade_items(self, course_id):
         if int(course_id) == 202:
             if self.fail_202_grades:
                 raise RuntimeError("gradebook denied")

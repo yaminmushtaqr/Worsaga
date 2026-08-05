@@ -907,7 +907,7 @@ class TestCliSurface:
 
     def test_install_below_floor_interval_warns(self, capsys):
         # Issue 1: a sub-floor interval is honoured but clamped to the
-        # politeness floor (5 min), and the CLI says so on stderr instead
+        # politeness floor (15 min), and the CLI says so on stderr instead
         # of silently scheduling a slower sync than requested.
         fake = {"installed": False, "dry_run": True, "platform": "windows",
                 "method": "schtasks", "interval_minutes": MIN_INTERVAL_MINUTES,

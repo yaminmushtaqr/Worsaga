@@ -731,7 +731,7 @@ class DemoMoodleClient:
             self._data["submission_statuses"].get(int(assignment_id), {})
         )
 
-    def get_user_grade_items(self, course_id: int, user_id: int | None = None) -> dict:
+    def get_user_grade_items(self, course_id: int) -> dict:
         self._require_known_course(course_id)
         return copy.deepcopy(
             self._data["grades"].get(int(course_id), {"usergrades": []})

@@ -25,7 +25,7 @@ classifiers = [
 dependencies = ["platformdirs>=2.10", "pymupdf>=1.23", "rich>=13.0"]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0"]
+mcp = ["mcp>=1.28,<2"]
 yaml = ["PyYAML>=6.0"]
 dev = ["pytest>=7.0", "ruff>=0.4"]
 

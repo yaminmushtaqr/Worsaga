@@ -4,7 +4,9 @@ This module is the ONLY permitted way to call the Moodle API.
 Direct HTTP calls to Moodle bypassing this module are forbidden.
 
 ENFORCEMENT: Any wsfunction not on the ALLOWED_FUNCTIONS allowlist will raise
-MoodleWriteAttemptError before any network request is made.
+MoodleWriteAttemptError before any network request is made. Any call that
+names a user other than the authenticated one raises MoodleScopeError,
+likewise before any request is made.
 
 Permitted: read-only data fetching only.
 Forbidden: submitting assignments, opening quizzes, posting, uploading, or any
@@ -79,11 +81,11 @@ ALLOWED_FUNCTION_POLICIES = {
         "changes_user_state": False,
         "exposed": True,
     },
-    "core_grades_get_grades": {
-        "purpose": "read grade data where permitted",
-        "changes_user_state": False,
-        "exposed": False,
-    },
+    # core_grades_get_grades is deliberately NOT allowlisted: it takes a
+    # userids list, so a teacher-capable token could read other students'
+    # grades through it. The authenticated user's own gradebook already
+    # comes from gradereport_user_get_grade_items. Re-add only alongside a
+    # real feature and a privacy review.
     "mod_forum_get_forums_by_courses": {
         "purpose": "read forum containers in courses",
         "changes_user_state": False,
@@ -121,9 +123,52 @@ BLOCKED_PATTERNS = [
     "attempt", "start_attempt", "process_attempt", "view_",
 ]
 
+# ─────────────────────────────────────────────────────────────────
+# SELF-SCOPE — an allowlisted function that names a user may only
+# ever name the authenticated one.
+# ─────────────────────────────────────────────────────────────────
+#: Maps an allowlisted wsfunction to the request parameter naming the user
+#: whose data comes back. The parameter is injected when a caller omits it,
+#: so no route through :meth:`MoodleClient.call` — wrapper method or raw
+#: call — can read another person's grades, courses, or messages, even with
+#: a token carrying teacher or admin capabilities.
+#:
+#: Only functions whose wrappers already send the parameter are listed.
+#: Moodle rejects unexpected keys outright, so injecting one that a given
+#: site's version does not accept would break an otherwise working call.
+#: Phase 0A formalises this into a full per-function parameter policy that
+#: also covers the optional user-identity arguments on the remaining
+#: allowlisted functions (for example mod_assign_get_submission_status).
+SELF_SCOPED_PARAMS = {
+    "core_enrol_get_users_courses": "userid",
+    "gradereport_user_get_grade_items": "userid",
+    "core_message_get_messages": "useridto",
+    "message_popup_get_popup_notifications": "useridto",
+}
+
+#: Parameter names that identify whose data is being read. Checked on
+#: *every* allowlisted call, so naming someone else is refused even on a
+#: function that is not in the injection map above. Deliberately excludes
+#: ``useridfrom``, which is a sender filter (0 means "anyone"), not a claim
+#: about whose mailbox is being read.
+IDENTITY_PARAMS = frozenset(SELF_SCOPED_PARAMS.values())
+
 
 class MoodleWriteAttemptError(PermissionError):
     """Raised when code tries to call a non-read-only Moodle function."""
+
+
+class MoodleScopeError(MoodleWriteAttemptError):
+    """Raised when a call would request a user other than the authenticated one.
+
+    Subclasses :class:`MoodleWriteAttemptError` deliberately. Both are
+    pre-network refusals of a call the safety model forbids, and every
+    orchestrator already re-raises ``MoodleWriteAttemptError`` instead of
+    degrading it into a per-course "no access" warning. A scope violation
+    is a bug or an attack, never a course this account cannot see, so it
+    needs exactly that non-swallowable treatment — inherited here rather
+    than taught to each orchestrator separately.
+    """
 
 
 class MoodleRequestError(RuntimeError):
@@ -239,10 +284,16 @@ class DownloadError(RuntimeError):
         self.code = code
 
 
+#: Advertised in the User-Agent so a Moodle administrator who sees the
+#: traffic can identify the client and reach its maintainers. Must stay in
+#: sync with the Repository URL in pyproject.toml.
+PROJECT_URL = "https://github.com/yaminmushtaqr/worsaga"
+
+
 def _user_agent() -> str:
     from worsaga import __version__
 
-    return f"worsaga/{__version__}"
+    return f"worsaga/{__version__} (+{PROJECT_URL})"
 
 
 def _download_display_name(fileurl: str) -> str:
@@ -281,7 +332,9 @@ class MoodleClient:
         """Call a Moodle web-service function (read-only only).
 
         Raises MoodleWriteAttemptError if the function is not on the
-        allowlist or matches a blocked pattern.
+        allowlist or matches a blocked pattern, and MoodleScopeError if it
+        names a user other than the authenticated one. Both checks run
+        before any request is built.
         """
         fn = wsfunction.lower()
 
@@ -300,7 +353,22 @@ class MoodleClient:
                 f"To add it, verify it is read-only and add it to ALLOWED_FUNCTIONS."
             )
 
-        # 3. Make the request
+        # 3. Self-scope. Checked against whatever the caller passed, then
+        # filled in when it was omitted, so the wire parameters always
+        # name the authenticated user.
+        for key, value in params.items():
+            if key in IDENTITY_PARAMS and str(value) != str(self.userid):
+                raise MoodleScopeError(
+                    f"BLOCKED: '{wsfunction}' was called with {key}={value}, "
+                    f"which is not the authenticated user ({self.userid}). "
+                    "Worsaga only ever reads the authenticated user's own "
+                    "data. This call has been prevented."
+                )
+        scoped_param = SELF_SCOPED_PARAMS.get(wsfunction)
+        if scoped_param is not None:
+            params.setdefault(scoped_param, self.userid)
+
+        # 4. Make the request
         params.update({
             "wstoken": self._config.token,
             "moodlewsrestformat": "json",
@@ -359,8 +427,12 @@ class MoodleClient:
                 raise AssignmentNotFoundError(assignment_id) from None
             raise
 
-    def get_user_grade_items(self, course_id: int, user_id: int | None = None) -> dict:
-        """Return gradebook items for a course and user.
+    def get_user_grade_items(self, course_id: int) -> dict:
+        """Return the authenticated user's gradebook items for a course.
+
+        Self-only by construction: there is no user-id parameter, so no
+        caller can aim this at another student even with a token that
+        carries teacher capabilities.
 
         Raises :class:`CourseNotFoundError` when Moodle reports the course
         id does not exist for this user.
@@ -369,24 +441,12 @@ class MoodleClient:
             return self.call(
                 "gradereport_user_get_grade_items",
                 courseid=course_id,
-                userid=self.userid if user_id is None else user_id,
+                userid=self.userid,
             )
         except MoodleRequestError as exc:
             if _is_missing_record_error(exc):
                 raise CourseNotFoundError(course_id) from None
             raise
-
-    def get_course_grades(
-        self,
-        course_id: int,
-        user_ids: list[int] | None = None,
-    ) -> dict:
-        """Return course grades for one or more users where Moodle permits it."""
-        if user_ids is None:
-            user_ids = [self.userid]
-        params = {"courseid": course_id}
-        params.update({f"userids[{i}]": uid for i, uid in enumerate(user_ids)})
-        return self.call("core_grades_get_grades", **params)
 
     def get_quizzes(self, course_ids: list[int] | None = None) -> dict:
         """Return quizzes for the given courses (or all enrolled courses)."""

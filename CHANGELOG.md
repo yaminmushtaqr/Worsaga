@@ -130,14 +130,14 @@ All notable changes to Worsaga are documented in this file.
   file too large to fit is truncated with an explicit warning that says how
   to get the rest. The CLI `extract` command is unchanged.
 - A below-minimum `--interval` is no longer silently overridden. `worsaga
-  watch` (floor 60s) and `worsaga auto-sync install` (floor 5 min)
+  watch` (floor 300s) and `worsaga auto-sync install` (floor 15 min)
   previously clamped a too-small interval up with no indication — a
-  `--interval 30s` watch quietly ran every 60s, and `auto-sync install
-  --interval 30s|45|2m|90s` quietly became every 5 min. Both now print a
-  one-line stderr warning stating the requested and applied values (e.g.
-  `Warning: interval 30s is below the minimum for watch; using 60s.`), and
-  each floor is documented in the command's `--interval` help text. The
-  clamping behaviour itself is unchanged.
+  `--interval 30s` watch quietly ran on the floor, and `auto-sync install
+  --interval 30s|45|2m|90s` quietly became the minimum period. Both now
+  print a one-line stderr warning stating the requested and applied values
+  (e.g. `Warning: interval 30s is below the minimum for watch; using
+  300s.`), and each floor is documented in the command's `--interval` help
+  text. The clamping behaviour itself is unchanged.
 - The `notifications` "Sender" column is no longer always blank.
   `message_popup_get_popup_notifications` on many Moodle instances returns
   only a numeric `useridfrom` and no `userfromfullname`, which the sender
@@ -160,14 +160,19 @@ All notable changes to Worsaga are documented in this file.
 
 - The per-course / per-forum metadata fan-outs behind `digest`, `sync`,
   `assignments`, `updates`, and `grades` now run on a small bounded thread
-  pool (default 6 workers, `WORSAGA_CONCURRENCY` to override) instead of one
-  blocking request at a time. On a real multi-course account this turns
-  multi-minute waits into seconds. Results are always reassembled in the
-  original course order and the diff/write phase of `sync` stays
-  single-threaded, so change detection is byte-for-byte identical to the
-  sequential path; per-course permission warnings stay attributed to their
-  own course. The shared read-only client is safe to use across threads (it
-  holds only immutable config and opens a fresh connection per request).
+  pool (default 4 workers; `WORSAGA_CONCURRENCY` overrides it, clamped to
+  1-8) instead of one blocking request at a time. On a real multi-course
+  account this turns multi-minute waits into seconds. Results are always
+  reassembled in the original course order and the diff/write phase of
+  `sync` stays single-threaded, so change detection is byte-for-byte
+  identical to the sequential path; per-course permission warnings stay
+  attributed to their own course. The shared read-only client is safe to use
+  across threads (it holds only immutable config and opens a fresh
+  connection per request). The bounds are deliberately conservative: Moodle
+  core applies no server-side rate limiting to web-service calls and
+  ecosystem guidance for well-behaved clients is around two concurrent
+  connections, so until a per-origin limiter lands this clamp is the only
+  thing pacing Worsaga against someone else's server.
 - The MCP `list_courses` and `get_course_contents` tools now return
   compact, normalized records through Worsaga's own model layer instead of
   the raw Moodle payloads. `list_courses` returns `id`, `shortname`,
@@ -179,9 +184,44 @@ All notable changes to Worsaga are documented in this file.
   `module_type`, `view_url`, and a `files` list of token-free metadata
   matching `get_week_materials`, including its `dedupe_key`). Both routes
   pass the token/`file_url` sanitisation boundary.
+- Raised the polling floors so a mistyped interval cannot turn Worsaga into
+  a hammer on a shared server. `worsaga watch --interval` now clamps to a
+  minimum of 300s (was 60s) and `worsaga auto-sync install --interval` to 15
+  minutes (was 5). The defaults are unchanged (15 minutes for `watch`, 30
+  minutes for `auto-sync`), a below-floor request is accepted and clamped to
+  the floor with a warning stating both values rather than rejected, and
+  each command's `--interval` help text states the new floor. Every cycle is
+  a full metadata sync across all enrolled courses, so a tighter loop cost
+  the server real work without surfacing changes meaningfully sooner.
+- Every outgoing request now identifies the project in its `User-Agent`:
+  `worsaga/<version> (+https://github.com/yaminmushtaqr/worsaga)`. Standard
+  bot etiquette — an administrator who sees the traffic can tell what it is
+  and who to contact.
+- The optional `mcp` extra now requires `mcp>=1.28,<2` (was `mcp>=1.0`).
+  mcp 2.0 removed `mcp.server.fastmcp`, which the MCP server imports, so an
+  unpinned `pip install worsaga[mcp]` could install a release that fails at
+  import. CI now runs the suite against both ends of the supported range.
 
 ### Security
 
+- Worsaga can no longer be pointed at another person's data, in two layers.
+  The client's `get_user_grade_items` used to take an optional user id and a
+  `get_course_grades` helper took a whole list of them — with a token
+  carrying elevated (teacher or admin) capabilities, either could have
+  returned other students' gradebooks. No Worsaga feature ever passed a user
+  id, so behaviour is unchanged for every real caller, but the capability
+  existed in the API. `get_user_grade_items(course_id)` is now self-only by
+  construction (no user-id argument at all), `get_course_grades` is deleted,
+  and `core_grades_get_grades` is off the read-only allowlist entirely,
+  alongside `core_enrol_get_enrolled_users` and `mod_assign_get_grades`.
+  Underneath the wrappers, the client's own dispatcher now enforces the
+  same rule for every allowlisted function: a user-identity parameter
+  (`userid`, `useridto`) is filled in with the authenticated user when a
+  caller omits it, and naming anyone else raises `MoodleScopeError` before
+  any network request is made — so the guarantee no longer depends on which
+  method a caller reaches for. The CLI `grades` command and the MCP
+  `get_grades` / `get_grade_summary` tools never exposed a user id and are
+  unaffected.
 - Closed a latent token-leak path in the MCP `get_course_contents` tool. It
   previously returned the verbatim `core_course_get_contents` payload,
   which on mobile-service-enabled Moodle instances embeds the webservice
