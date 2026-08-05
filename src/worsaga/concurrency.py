@@ -38,12 +38,11 @@ R = TypeVar("R")
 #: hammering Moodle or exhausting connections. Override per process with the
 #: ``WORSAGA_CONCURRENCY`` environment variable (itself capped at 8).
 #:
-#: Moodle core applies no server-side rate limiting to web-service calls, and
-#: ecosystem guidance for well-behaved clients is roughly two concurrent
-#: connections per site, so the ceiling is the only thing standing between a
-#: typo and a self-inflicted load spike on someone else's server. A proper
-#: per-origin limiter lands in a later phase; until then this is the interim
-#: politeness ceiling.
+#: This is **not** what paces Worsaga against a Moodle site — that is
+#: :mod:`worsaga.ratelimit`, which holds the wire to two concurrent requests
+#: per origin with a minimum gap between starts, however many workers are
+#: running. The worker count only decides how much parsing and cache work
+#: overlaps with those requests, which is why four is comfortable.
 DEFAULT_MAX_WORKERS = 4
 
 #: Hard ceiling on ``WORSAGA_CONCURRENCY``. The escape hatch exists for slow

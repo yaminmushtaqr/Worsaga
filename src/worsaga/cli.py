@@ -47,7 +47,11 @@ import urllib.error
 from worsaga.banner import print_banner, should_show_banner
 from worsaga.assignments import get_assignments as get_assignments_data
 from worsaga.calendar import get_calendar_events as get_calendar_events_data
-from worsaga.client import CourseNotFoundError, MoodleClient
+from worsaga.client import (
+    CourseNotFoundError,
+    MoodleClient,
+    MoodleRateLimitedError,
+)
 from worsaga.courses import (
     CourseAmbiguousError,
     CourseResolutionError,  # noqa: F401  re-exported for backward compat / tests
@@ -605,6 +609,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=SYNC_LOOKAHEAD_DAYS,
         help=f"Deadline look-ahead window in days (default: {SYNC_LOOKAHEAD_DAYS})",
+    )
+    sy.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "Mark this run as one nobody is watching (used by the scheduled "
+            "auto-sync). Such a run stops before making any request while "
+            "the credential circuit breaker is open; a normal foreground "
+            "sync always tries, and a successful one closes the breaker."
+        ),
     )
 
     ch = sub.add_parser(
@@ -1742,16 +1756,57 @@ def _print_change_table(changes: list[dict]) -> None:
         )
 
 
+def _fail_sync(result: dict) -> None:
+    """Report a sync that fetched nothing and exit non-zero.
+
+    A sync that could not read a single category is a failed command, not
+    a quiet success with an empty change list — an unattended caller has
+    no other way to tell the two apart, and the exit code is the one
+    signal every scheduler already understands.
+    """
+    reason = result.get("warnings") or []
+    print(
+        "Error: the sync failed - nothing could be fetched from "
+        f"{result.get('site', 'Moodle')}.",
+        file=sys.stderr,
+    )
+    for warning in reason:
+        print(f"  {warning}", file=sys.stderr)
+    if result.get("circuit_open"):
+        print(
+            "  Repeated authentication failures stopped this unattended run "
+            "before it made any request. Fix the credentials, then run "
+            "'worsaga sync' yourself to clear it.",
+            file=sys.stderr,
+        )
+    sys.exit(1)
+
+
 def cmd_sync(args: argparse.Namespace) -> None:
     client = _client(args)
     if not args.quiet and not wants_structured(args):
         print("Syncing metadata (nothing is downloaded)...", file=sys.stderr)
     result = run_sync(
         client, lookahead_days=args.days, on_progress=_progress_reporter(args),
+        unattended=getattr(args, "unattended", False),
     )
+    outcome = result.get("outcome", "success")
 
     if _emit_data(args, result):
+        # Structured mode has the outcome in the payload it just printed,
+        # but the exit code has to agree with it.
+        if outcome == "failed":
+            sys.exit(1)
         return
+
+    if outcome == "skipped":
+        print(
+            "Sync skipped: another Worsaga sync is already running for this "
+            "site. Nothing was fetched twice."
+        )
+        return
+    if outcome == "failed":
+        _fail_sync(result)
 
     print(f"Synced {result['site']}")
     for name, stats in result["categories"].items():
@@ -1860,10 +1915,31 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 print(json.dumps(result, default=str), flush=True)
             return
         stamp = _display_timestamp(result.get("synced_at"))
-        if not result.get("ok"):
+
+        def _backoff_note() -> None:
+            # One line, on stderr, only when the loop is actually slowing
+            # down: a watcher that has been failing for an hour should say
+            # so rather than looking like it is still polling normally.
+            if not result.get("backoff") or args.quiet:
+                return
             print(
-                f"[{stamp}] sync failed: {result.get('error')}",
+                f"  Backing off: next cycle in {result['next_cycle_in']}s "
+                f"({result.get('consecutive_failures', 0)} consecutive "
+                "failures).",
                 file=sys.stderr,
+            )
+
+        if not result.get("ok"):
+            detail = result.get("error") or "; ".join(
+                str(w) for w in result.get("warnings", [])
+            ) or "nothing could be fetched"
+            print(f"[{stamp}] sync failed: {detail}", file=sys.stderr)
+            _backoff_note()
+            return
+        if result.get("outcome") == "skipped":
+            print(
+                f"[{stamp}] cycle {result['cycle']}: skipped (another sync "
+                "is already running)"
             )
             return
         changes = result.get("changes", [])
@@ -1878,6 +1954,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             )
         for warning in result.get("warnings", []):
             print(f"Warning: {warning}", file=sys.stderr)
+        _backoff_note()
 
     try:
         summary = run_watch(
@@ -1896,10 +1973,12 @@ def cmd_watch(args: argparse.Namespace) -> None:
         return
 
     if not structured and not args.quiet:
+        skipped = summary.get("skipped", 0)
+        skipped_note = f", {skipped} skipped" if skipped else ""
         print(
             f"Watch finished: {summary['cycles']} cycle(s), "
             f"{summary['changes_total']} change(s), "
-            f"{summary['failures']} failed cycle(s).",
+            f"{summary['failures']} failed cycle(s){skipped_note}.",
             file=sys.stderr,
         )
 
@@ -1926,6 +2005,20 @@ def cmd_autosync(args: argparse.Namespace) -> None:
             print(
                 "  last sync (manual or scheduled): "
                 f"{_display_timestamp(result['last_sync_at'])}"
+            )
+        sync_state = result.get("sync_state") or {}
+        if sync_state.get("last_outcome"):
+            print(f"  last outcome: {sync_state['last_outcome']}")
+        streak = int(sync_state.get("consecutive_failures") or 0)
+        if streak:
+            klass = sync_state.get("failure_class") or "other"
+            print(f"  consecutive failures: {streak} ({klass})")
+        if sync_state.get("circuit_open"):
+            print(
+                "  Scheduled syncs are paused after repeated authentication "
+                "failures. Fix the credentials, then run 'worsaga sync' "
+                "yourself to resume them.",
+                file=sys.stderr,
             )
         if result.get("error"):
             print(f"Warning: {result['error']}", file=sys.stderr)
@@ -2371,6 +2464,15 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
+    except MoodleRateLimitedError:
+        # Ahead of the generic RuntimeError branch: this is not a bug and
+        # not a broken configuration, so it gets its own plain sentence
+        # and no suggestion to check anything.
+        print(
+            "Error: the site is rate-limiting requests; try again later.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     except urllib.error.HTTPError as e:
         print(f"Error: HTTP {e.code} — {e.reason}", file=sys.stderr)
         sys.exit(1)

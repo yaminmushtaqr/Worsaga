@@ -13,8 +13,11 @@ So every test gets, automatically:
 - a fake site, token, and user id in the environment;
 - `config`'s platform paths (and every module that imported
   `DEFAULT_CONFIG_PATH` by value) redirected into ``tmp_path``;
-- cache and index paths redirected into ``tmp_path``;
-- a `urlopen` that raises instead of reaching the network.
+- cache, index, and operational-state paths redirected into ``tmp_path``;
+- a `urlopen` that raises instead of reaching the network;
+- a fresh set of per-origin rate coordinators whose pacing sleeps do
+  nothing, so wire-level tests neither wait 250 ms per request nor inherit
+  a cooldown or a spent retry budget from the test before them.
 
 Tests that legitimately fake transport patch `urlopen` themselves and so
 override the guard for their own scope; demo-mode tests never reach it.
@@ -27,6 +30,7 @@ import pytest
 import worsaga as worsaga_package
 from worsaga import cli as cli_module
 from worsaga import config as config_module
+from worsaga import ratelimit as ratelimit_module
 
 #: Deliberately unroutable (RFC 6761 reserves ``.invalid``) and obviously
 #: fake, so a value that escapes into an assertion message is recognisable.
@@ -56,8 +60,20 @@ def isolate_worsaga_environment(tmp_path, monkeypatch):
 
     monkeypatch.setenv("WORSAGA_CACHE_PATH", str(tmp_path / "cache.db"))
     monkeypatch.setenv("WORSAGA_INDEX_PATH", str(tmp_path / "search.db"))
+    monkeypatch.setenv("WORSAGA_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("WORSAGA_MIN_REQUEST_GAP_MS", raising=False)
+    monkeypatch.delenv("WORSAGA_MAX_IN_FLIGHT", raising=False)
+
+    # Coordinators live in a module-level registry, so without this a
+    # cooldown or a spent retry budget from one test would be inherited by
+    # the next. The no-op sleep keeps the real 250 ms pacing out of the
+    # suite; tests that assert on pacing build their own coordinator with
+    # their own clock.
+    ratelimit_module.for_testing_reset(sleep_fn=lambda _seconds: None)
 
     def _blocked(*args, **kwargs):
         raise AssertionError("unmocked network call in test")
 
     monkeypatch.setattr(urllib.request, "urlopen", _blocked)
+    yield
+    ratelimit_module.for_testing_reset()

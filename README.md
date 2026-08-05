@@ -342,6 +342,12 @@ worsaga changes --since 7d       # replay recorded changes (no network)
 worsaga changes --category grades
 ```
 
+`worsaga sync` exits **1** when it could not fetch a single category, so a
+script or a scheduled job can tell a working sync from one that silently
+reached nothing; a partial sync prints its warnings and exits 0. With
+`--json` the same verdict is in the `outcome` field (`success`, `partial`,
+`failed`, or `skipped`).
+
 The cache lives in the platform-native user data directory
 (`WORSAGA_CACHE_PATH` overrides the location). Tokens and authenticated URLs
 are never written to it, and cache rows are keyed by Moodle site, so demo-mode
@@ -350,7 +356,7 @@ and `get_changes()`.
 
 ## Watch mode and auto-sync
 
-`worsaga watch` runs the sync loop in your terminal: it re-syncs on a fixed
+`worsaga watch` runs the sync loop in your terminal: it re-syncs on an
 interval, prints any detected changes, and raises a desktop notification
 when something changed (Windows toast, macOS notification, or
 `notify-send` on Linux — best effort, no extra dependencies). Stop it with
@@ -361,9 +367,23 @@ worsaga watch                    # sync every 15 minutes until Ctrl+C
 worsaga watch --interval 1h --no-notify
 ```
 
+If cycles start failing — the network is down, the site is unreachable —
+the interval backs off: it doubles per consecutive failure, up to eight
+intervals or one hour (whichever is smaller), with a little jitter, and
+prints one `Backing off: next cycle in Xs (N consecutive failures).` line
+to stderr. The next cycle that works returns it to the interval you asked
+for. Repeated *authentication* failures stop unattended syncing entirely
+until you run `worsaga sync` yourself and it succeeds; `worsaga auto-sync
+status` says so when that has happened.
+
+Only one sync per site runs at a time on a machine. If a `watch` loop, the
+scheduled auto-sync, and a manual `worsaga sync` overlap, the later ones
+say `Sync skipped: another Worsaga sync is already running for this site.`
+and make no requests at all, rather than fetching every course twice.
+
 For unattended syncs, `worsaga auto-sync` registers a periodic
-`worsaga sync --quiet` with your platform's scheduler — Task Scheduler on
-Windows, launchd on macOS, a systemd user timer on Linux:
+`worsaga sync --quiet --unattended` with your platform's scheduler — Task
+Scheduler on Windows, launchd on macOS, a systemd user timer on Linux:
 
 ```bash
 worsaga auto-sync install --interval 30m --dry-run  # preview, changes nothing
@@ -450,8 +470,15 @@ material data.
 - **Token availability varies by institution.** Some Moodle instances restrict
   web-service tokens. Check with your Moodle administrator about REST web
   services.
-- **Rate limiting.** Moodle servers may throttle rapid API calls. Worsaga
-  handles errors gracefully but cannot bypass institutional limits.
+- **Rate limiting.** Worsaga paces itself: never more than 2 requests in
+  flight per site, at least 250 ms between request starts, and when a site
+  answers `429` or `503` it honours the `Retry-After` wait (or backs off
+  exponentially when there is none), across every process on the machine.
+  It cannot bypass an institutional limit and does not try to — when the
+  retries run out it stops with `the site is rate-limiting requests; try
+  again later.` The two knobs move one way only:
+  `WORSAGA_MIN_REQUEST_GAP_MS` can raise the gap and `WORSAGA_MAX_IN_FLIGHT`
+  can lower the concurrency; there is no way to turn the limiter off.
 - **Only the Moodle REST API is supported.**
 
 ## Contributing

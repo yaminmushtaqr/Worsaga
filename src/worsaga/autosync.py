@@ -126,11 +126,19 @@ def sync_command() -> list[str]:
     Prefers the installed ``worsaga`` entry point; falls back to the
     current interpreter with ``-m worsaga.cli``. Never contains
     credentials.
+
+    ``--unattended`` marks the run as one nobody is watching, so it
+    honours the credential circuit breaker instead of authenticating with
+    a token the last several runs already proved is rejected. A job
+    registered by an older Worsaga simply keeps running without the flag
+    until it is reinstalled; it syncs exactly as it always did.
     """
     exe = shutil.which("worsaga")
     if exe:
-        return [exe, "sync", "--quiet"]
-    return [sys.executable, "-m", "worsaga.cli", "sync", "--quiet"]
+        return [exe, "sync", "--quiet", "--unattended"]
+    return [
+        sys.executable, "-m", "worsaga.cli", "sync", "--quiet", "--unattended",
+    ]
 
 
 def autosync_record_path() -> Path:
@@ -749,16 +757,24 @@ def autosync_status() -> dict[str, Any]:
 
 
 def _attach_last_sync(result: dict[str, Any]) -> None:
-    """Attach the site's most recent sync time, read-only.
+    """Attach the site's most recent sync time and outcome, read-only.
 
     The timestamp covers **any** sync — manual or scheduled; the cache
     records no provenance — so it shows the data is moving, not that
-    the scheduler specifically ran. Uses the read-only cache reader
-    (status must never create the cache as a side effect) and is
-    skipped silently when no site is configured or no cache exists.
+    the scheduler specifically ran. It only ever advances on a run that
+    actually synced something, so it cannot report "just now" for a site
+    that has been failing all day.
+
+    ``sync_state`` adds what the timestamp alone cannot show: the last
+    outcome, how many runs have failed in a row, and whether repeated
+    authentication failures have paused unattended syncing altogether.
+    Both readers are non-creating (status must never bring state into
+    existence as a side effect) and both are skipped silently when no
+    site is configured.
     """
     try:
         from worsaga.cache import read_last_sync_at
+        from worsaga.syncstate import read_site_state
 
         client = _local_client()
         if client is None:
@@ -766,6 +782,9 @@ def _attach_last_sync(result: dict[str, Any]) -> None:
         ts = read_last_sync_at(client.base_url)
         if ts is not None:
             result["last_sync_at"] = ts
+        state = read_site_state(client.base_url)
+        if state:
+            result["sync_state"] = state
     except Exception:
         pass
 

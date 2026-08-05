@@ -47,8 +47,9 @@ as an ``isError`` string built from raw Moodle DB wording). The
 
 from __future__ import annotations
 
+import functools
 import json
-from typing import Any
+from typing import Any, Callable, get_origin
 
 from mcp.server.fastmcp import FastMCP
 
@@ -64,6 +65,7 @@ from worsaga.client import (
     DownloadError,
     ForumNotFoundError,
     MoodleClient,
+    MoodleRateLimitedError,
 )
 from worsaga.config import MoodleConfig, default_downloads_dir
 from worsaga.courses import (
@@ -152,9 +154,18 @@ ERROR_CODES = (
     # a local store (sync cache / search index) belongs to a different
     # Moodle account than the one this server is authenticated as
     "principal_mismatch",
+    # another Worsaga process (a watch loop, the scheduled auto-sync, a
+    # second agent) already held this site's sync lock, so sync_now made
+    # no requests at all. Retrying immediately will hit the same lock;
+    # read the cache with get_changes(), or try again shortly.
+    "sync_in_progress",
     # DownloadError.code values (download_material / extract_material) and
     # get_connection_info auth/network failures:
     "auth", "not_found", "network", "oversize", "invalid_url", "empty",
+    # the Moodle site asked for fewer requests (HTTP 429/503) and the
+    # retries allowed for one request ran out. Not a bad token and not an
+    # unreachable site: wait and try again.
+    "rate_limited",
 )
 
 # Deterministic upper bound on the serialized ``extract_material`` response.
@@ -162,6 +173,50 @@ ERROR_CODES = (
 # page also carries a same-size ``markdown`` field — a 150-page PDF could
 # reach ~240k chars. This caps the whole payload.
 MAX_EXTRACT_RESPONSE_CHARS = 130_000
+
+
+def _returns_a_list(fn: Callable[..., Any]) -> bool:
+    """Whether *fn* is annotated as returning a list.
+
+    A tool declared ``-> list[...]`` has to answer with a list even when
+    it is answering with an error, which is the shape ``get_changes``
+    already established.
+    """
+    annotation = fn.__annotations__.get("return")
+    if isinstance(annotation, str):
+        return annotation.lstrip().startswith("list")
+    return get_origin(annotation) is list
+
+
+def tool(*decorator_args: Any, **decorator_kwargs: Any):
+    """Register an MCP tool that reports rate limiting in the usual shape.
+
+    Every tool that touches the network can meet HTTP 429/503, and
+    ``rate_limited`` is in :data:`ERROR_CODES` precisely so an agent can
+    branch on it. Wrapping registration in one place is what makes that
+    promise true for all 26 tools instead of the two that happened to
+    catch it — hand-wrapping each body would guarantee the next tool
+    added forgets.
+
+    Only :class:`~worsaga.client.MoodleRateLimitedError` is translated
+    here. Every other failure keeps whatever handling its own tool
+    already has, so nothing else changes shape.
+    """
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        as_list = _returns_a_list(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return fn(*args, **kwargs)
+            except MoodleRateLimitedError as exc:
+                payload = {"error": str(exc), "error_code": "rate_limited"}
+                return [payload] if as_list else payload
+
+        return mcp.tool(*decorator_args, **decorator_kwargs)(wrapper)
+
+    return decorate
 
 
 def _course_not_found(exc: CourseNotFoundError) -> dict[str, Any]:
@@ -245,7 +300,7 @@ def _numeric_course_id(course_id: int | str | None) -> int | None:
         return None
 
 
-@mcp.tool()
+@tool()
 def list_courses() -> list[dict[str, Any]]:
     """List all Moodle courses the authenticated user is enrolled in.
 
@@ -259,7 +314,7 @@ def list_courses() -> list[dict[str, Any]]:
     return [course_record(course) for course in _get_client().get_courses()]
 
 
-@mcp.tool()
+@tool()
 def get_deadlines(lookahead_days: int = 14) -> list[dict[str, Any]]:
     """Return upcoming assignment and quiz deadlines sorted by due date.
 
@@ -271,7 +326,7 @@ def get_deadlines(lookahead_days: int = 14) -> list[dict[str, Any]]:
     return get_upcoming_deadlines(_get_client(), lookahead_days=lookahead_days)
 
 
-@mcp.tool()
+@tool()
 def get_grades(
     course_id: int | str | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -299,7 +354,7 @@ def get_grades(
         return _course_not_found(exc)
 
 
-@mcp.tool()
+@tool()
 def get_grade_summary(course_id: int | str | None = None) -> dict[str, Any]:
     """Return aggregate grade status counts for one course or all courses.
 
@@ -318,7 +373,7 @@ def get_grade_summary(course_id: int | str | None = None) -> dict[str, Any]:
         return _course_not_found(exc)
 
 
-@mcp.tool()
+@tool()
 def get_assignments(
     course_id: int | str | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -339,7 +394,7 @@ def get_assignments(
         return _course_not_found(exc)
 
 
-@mcp.tool()
+@tool()
 def get_assignment_status(
     course_id: int | str, assignment_id: int,
 ) -> dict[str, Any]:
@@ -367,7 +422,7 @@ def get_assignment_status(
         return _assignment_not_found(exc)
 
 
-@mcp.tool()
+@tool()
 def get_course_forums(
     course_id: int | str,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -388,7 +443,7 @@ def get_course_forums(
         return _course_not_found(exc)
 
 
-@mcp.tool()
+@tool()
 def get_forum_discussions(
     course_id: int | str,
     forum_id: int | None = None,
@@ -418,7 +473,7 @@ def get_forum_discussions(
         return _forum_not_found(exc)
 
 
-@mcp.tool()
+@tool()
 def get_latest_updates(
     course_id: int | str | None = None,
     since_days: int = 7,
@@ -444,25 +499,25 @@ def get_latest_updates(
         return _course_not_found(exc)
 
 
-@mcp.tool()
+@tool()
 def get_notifications(unread_only: bool = False) -> list[dict[str, Any]]:
     """Return popup notifications without marking them read."""
     return _get_notifications(_get_client(), unread_only=unread_only)
 
 
-@mcp.tool()
+@tool()
 def get_messages(since_days: int | None = None) -> list[dict[str, Any]]:
     """Return messages without marking them read."""
     return _get_messages(_get_client(), since_days=since_days)
 
 
-@mcp.tool()
+@tool()
 def get_digest(since_days: int = 1) -> dict[str, Any]:
     """Return a live study digest with partial-failure warnings."""
     return _get_digest(_get_client(), since_days=since_days)
 
 
-@mcp.tool()
+@tool()
 def get_calendar_events(
     course_id: int | str | None = None,
     days: int = 30,
@@ -490,7 +545,7 @@ def get_calendar_events(
         return _course_not_found(exc)
 
 
-@mcp.tool()
+@tool()
 def get_course_contents(
     course_id: int | str,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -533,7 +588,7 @@ def get_course_contents(
     )
 
 
-@mcp.tool()
+@tool()
 def get_week_materials(
     course_id: int | str, week: str,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -585,7 +640,7 @@ def get_week_materials(
     )
 
 
-@mcp.tool()
+@tool()
 def search_course_content(
     course_id: int | str, query: str,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -615,7 +670,7 @@ def search_course_content(
     return _search_content(sections, query)
 
 
-@mcp.tool()
+@tool()
 def get_weekly_summary(course_id: int | str, week: str) -> dict[str, Any]:
     """Generate a study summary for a specific teaching week of a course.
 
@@ -659,7 +714,7 @@ def get_weekly_summary(course_id: int | str, week: str) -> dict[str, Any]:
     return result
 
 
-@mcp.tool()
+@tool()
 def download_material(
     course_id: int | str,
     week: str,
@@ -777,7 +832,7 @@ def _select_week_material(
         }
 
 
-@mcp.tool()
+@tool()
 def extract_material(
     course_id: int | str,
     week: str,
@@ -919,7 +974,7 @@ def _bound_extract_response(
     return result
 
 
-@mcp.tool()
+@tool()
 def sync_now(lookahead_days: int = SYNC_LOOKAHEAD_DAYS) -> dict[str, Any]:
     """Sync metadata into the local cache and return detected changes.
 
@@ -933,18 +988,35 @@ def sync_now(lookahead_days: int = SYNC_LOOKAHEAD_DAYS) -> dict[str, Any]:
     changes. Tokens and authenticated URLs are never stored in the
     cache.
 
+    The result carries an ``outcome``: ``"success"`` (every category
+    synced), ``"partial"`` (some did — see ``warnings``), or ``"failed"``
+    (none did, so an empty ``changes`` list means "nothing was fetched",
+    not "nothing changed"). A failed run also carries ``failure_class``
+    (``auth``, ``network``, ``rate_limited``, ``other``).
+
+    While another Worsaga process is already syncing this site, this
+    returns ``{"error", "error_code": "sync_in_progress"}`` and makes no
+    requests, rather than fetching every course a second time.
+
     Parameters
     ----------
     lookahead_days : int
         Deadline look-ahead window in days (default 60).
     """
     try:
-        return _run_sync(_get_client(), lookahead_days=lookahead_days)
+        result = _run_sync(_get_client(), lookahead_days=lookahead_days)
     except PrincipalMismatchError as exc:
         return {"error": str(exc), "error_code": "principal_mismatch"}
+    if result.get("outcome") == "skipped":
+        return {
+            "error": (result.get("warnings") or ["another sync is running"])[0],
+            "error_code": "sync_in_progress",
+            "site": result.get("site", ""),
+        }
+    return result
 
 
-@mcp.tool()
+@tool()
 def get_changes(
     since_days: int = 7,
     category: str = "",
@@ -976,7 +1048,7 @@ def get_changes(
         return [{"error": str(exc)}]
 
 
-@mcp.tool()
+@tool()
 def build_search_index(
     course_id: int | str = 0,
     week: str = "",
@@ -1030,7 +1102,7 @@ def build_search_index(
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@tool()
 def search_text(
     query: str,
     course_id: int | str = 0,
@@ -1086,7 +1158,7 @@ def search_text(
         return {"error": str(exc), "error_code": "index_unavailable"}
 
 
-@mcp.tool()
+@tool()
 def export_study_pack(
     course_id: int | str,
     week: str,
@@ -1170,7 +1242,7 @@ def export_study_pack(
     return result
 
 
-@mcp.tool()
+@tool()
 def get_autosync_status() -> dict[str, Any]:
     """Report whether a scheduled background sync is registered.
 
@@ -1187,7 +1259,7 @@ def get_autosync_status() -> dict[str, Any]:
     return _autosync_status()
 
 
-@mcp.tool()
+@tool()
 def get_connection_info() -> dict[str, Any]:
     """Report authentication and site identity without fetching any data.
 

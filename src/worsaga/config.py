@@ -40,6 +40,24 @@ def default_downloads_dir() -> Path:
     return Path(platformdirs.user_data_dir(_APP_NAME)) / "downloads"
 
 
+def default_state_dir() -> Path:
+    """Directory for Worsaga's small operational state files.
+
+    Home to the records processes leave for each other rather than for the
+    user: the per-origin backpressure cooldown
+    (:mod:`worsaga.ratelimit`) and the per-site sync outcome history
+    (:mod:`worsaga.syncstate`). Distinct from the cache — losing any of it
+    costs at most one over-eager request or one forgotten failure count.
+
+    ``WORSAGA_STATE_DIR`` relocates it (used by tests, and by anyone
+    keeping several accounts apart). Not created until first use.
+    """
+    env_dir = os.environ.get("WORSAGA_STATE_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return Path(platformdirs.user_data_dir(_APP_NAME))
+
+
 def _find_config_file(explicit: str | Path | None = None) -> Path | None:
     """Return the first config file that exists, or None."""
     if explicit:

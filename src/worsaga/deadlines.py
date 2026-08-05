@@ -21,6 +21,7 @@ def get_upcoming_deadlines(
     lookahead_days: int = 14,
     *,
     strict: bool = False,
+    courses: list[dict] | None = None,
 ) -> list[dict]:
     """Return upcoming deadlines for assignments AND quizzes, sorted by due date.
 
@@ -33,6 +34,10 @@ def get_upcoming_deadlines(
     :class:`MoodleWriteAttemptError` always propagates so the read-only
     guarantee remains observable to callers.
 
+    *courses* lets a caller that has already listed the enrolled courses
+    (the digest, a sync run) hand its list over instead of paying for a
+    second identical request; omitting it fetches one as before.
+
     Each entry contains:
         id, name, type, course, due_ts, due_str, due_iso, days_left
     """
@@ -41,7 +46,8 @@ def get_upcoming_deadlines(
     upcoming: list[dict] = []
     seen: set[tuple[str, int]] = set()
 
-    courses = client.get_courses()
+    if courses is None:
+        courses = client.get_courses()
     course_map = {c["id"]: c["shortname"] for c in courses}
     course_ids = list(course_map.keys())
 

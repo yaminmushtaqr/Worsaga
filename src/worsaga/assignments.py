@@ -22,15 +22,22 @@ logger = logging.getLogger(__name__)
 SUBMITTED_STATUSES = {"submitted", "graded", "released"}
 
 
-def _course_targets(client: MoodleClient, course_id: int | None) -> list[dict[str, Any]]:
+def _course_targets(
+    client: MoodleClient,
+    course_id: int | None,
+    courses: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Return the enrolled course records this request covers.
 
     An id outside the enrolment list is a not-found failure, never a
     synthesised ``{"id": course_id, "shortname": str(course_id)}`` target:
     fabricating one used to send an unknown id to Moodle and, if it
     answered, present a record for a course this account is not in.
+
+    *courses* reuses an enrolled-course list the caller already has.
     """
-    courses = client.get_courses()
+    if courses is None:
+        courses = client.get_courses()
     if course_id is None:
         return courses
     for course in courses:
@@ -214,6 +221,7 @@ def get_assignments(
     include_feedback: bool = False,
     now: int | float | None = None,
     on_progress: ProgressCallback | None = None,
+    courses: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return normalized assignments for one course or all enrolled courses.
 
@@ -224,8 +232,11 @@ def get_assignments(
     that assignment simply carries no submission detail — the record is still
     returned. ``on_progress`` (default silent) reports one completed
     assignment at a time.
+
+    *courses* reuses an enrolled-course list the caller already fetched
+    (the digest does) instead of listing them again.
     """
-    courses = _course_targets(client, course_id)
+    courses = _course_targets(client, course_id, courses)
     course_ids = [as_int(course.get("id"), 0) or 0 for course in courses]
     course_map = {
         as_int(course.get("id"), 0) or 0: str(course.get("shortname") or course.get("id"))

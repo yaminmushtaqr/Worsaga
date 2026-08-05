@@ -19,23 +19,22 @@ import os
 import urllib.error
 from typing import Any
 
-from worsaga.client import MoodleRequestError, MoodleWriteAttemptError
+from worsaga.client import (
+    MoodleRateLimitedError,
+    MoodleRequestError,
+    MoodleWriteAttemptError,
+    is_auth_error,
+)
 from worsaga.config import _find_config_file
 from worsaga.models import as_int
-
-# Moodle ``errorcode`` values that mean "the credentials were rejected"
-# rather than "the network/server was unreachable". Moodle localises the
-# human message but keeps the errorcode stable, so classify on it.
-_AUTH_ERRORCODES = frozenset({
-    "invalidtoken", "accessexception", "invalidlogin", "tokenexpired",
-})
 
 
 class ConnectionCheckError(RuntimeError):
     """A connection check failed for an expected auth/network reason.
 
-    ``code`` is ``"auth"`` (credentials rejected) or ``"network"`` (site
-    unreachable) — the same vocabulary as ``DownloadError.code`` — so the
+    ``code`` is ``"auth"`` (credentials rejected), ``"network"`` (site
+    unreachable), or ``"rate_limited"`` (the site asked for fewer
+    requests) — the same vocabulary as ``DownloadError.code`` — so the
     MCP tool can surface a structured ``{"error", "error_code"}`` dict. The
     message never contains a token or an authenticated URL.
     """
@@ -43,15 +42,6 @@ class ConnectionCheckError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
-
-
-def _is_auth_error(exc: MoodleRequestError) -> bool:
-    """Return True when a Moodle exception payload signals rejected auth."""
-    code = str(getattr(exc, "errorcode", "") or "").lower()
-    if code in _AUTH_ERRORCODES:
-        return True
-    message = str(exc).lower()
-    return "invalid token" in message or "invalidtoken" in message
 
 
 def fetch_site_info(client: Any) -> dict[str, Any]:
@@ -80,8 +70,14 @@ def fetch_site_info(client: Any) -> dict[str, Any]:
         raise ConnectionCheckError(
             "network", f"Could not reach Moodle: {exc.reason}"
         ) from exc
+    except MoodleRateLimitedError as exc:
+        # Before the generic MoodleRequestError branch: being asked to
+        # slow down is neither bad credentials nor an unreachable site,
+        # and saying so lets the caller suggest waiting rather than
+        # re-checking a token that is perfectly fine.
+        raise ConnectionCheckError("rate_limited", str(exc)) from exc
     except MoodleRequestError as exc:
-        code = "auth" if _is_auth_error(exc) else "network"
+        code = "auth" if is_auth_error(exc) else "network"
         raise ConnectionCheckError(code, str(exc)) from exc
     except (TimeoutError, OSError) as exc:
         raise ConnectionCheckError(

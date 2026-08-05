@@ -18,6 +18,13 @@ list to judge them. They are checked by the orchestrators that already hold
 that list (:mod:`worsaga.assignments`, :mod:`worsaga.forums`), which is the
 path every CLI command and MCP tool takes.
 
+Every request this module puts on the wire — web-service calls and file
+downloads alike — goes out through :meth:`MoodleClient._issue`, which runs
+it under the per-origin rate coordinator in :mod:`worsaga.ratelimit`: at
+most two concurrent requests per site, at least 250 ms between request
+starts, and a cooldown honoured across threads and processes when the site
+answers 429 or 503. There is deliberately no second path to the network.
+
 Permitted: read-only data fetching only.
 Forbidden: submitting assignments, opening quizzes, posting, uploading, or any
            action that creates or modifies data on Moodle.
@@ -33,8 +40,14 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Any, Callable
 
 from worsaga.config import MoodleConfig
+from worsaga.ratelimit import (
+    BACKPRESSURE_STATUSES,
+    MAX_ATTEMPTS,
+    coordinator_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -279,7 +292,19 @@ class MoodleParameterError(MoodleWriteAttemptError):
 
 
 class MoodleRequestError(RuntimeError):
-    """A Moodle web-service call returned an ``exception`` payload.
+    """The Moodle server answered, and the answer was not usable data.
+
+    The base of the server-answer failure family — an ``exception``
+    payload (this class), a refusal to serve right now
+    (:class:`MoodleRateLimitedError`), or a reply that is not a
+    web-service response at all (:class:`MoodleResponseError`). All three
+    are distinct from a local safety refusal
+    (:class:`MoodleWriteAttemptError`, which never reaches the network)
+    and from a transport failure (``urllib.error.URLError``), and all
+    three are :class:`RuntimeError` subclasses, so the CLI's top-level
+    handler renders them as a one-line ``Error:`` and the per-source
+    degradation in :mod:`worsaga.digest` and :mod:`worsaga.sync` turns
+    them into warnings rather than crashes.
 
     Carries Moodle's stable ``errorcode`` (localisation-independent)
     alongside the human message so callers can classify failures without
@@ -297,6 +322,51 @@ class MoodleRequestError(RuntimeError):
     def __init__(self, message: str, *, errorcode: str = ""):
         super().__init__(message)
         self.errorcode = errorcode
+
+
+class MoodleRateLimitedError(MoodleRequestError):
+    """Moodle refused the request with HTTP 429/503 and retries ran out.
+
+    Deliberately *not* part of the :class:`MoodleWriteAttemptError`
+    family: being asked to slow down is an ordinary, temporary answer from
+    a healthy server, not a safety violation. It therefore degrades to a
+    warning wherever a fetch failure already does (a skipped sync
+    category, a missing digest source) instead of aborting the run, and
+    the CLI prints one plain line saying the site is rate-limiting.
+
+    ``status`` is the HTTP status that caused it; ``retry_after`` is the
+    last wait Worsaga applied, in seconds.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 0,
+        retry_after: float | None = None,
+    ):
+        super().__init__(message, errorcode="ratelimited")
+        self.status = status
+        self.retry_after = retry_after
+
+
+class MoodleResponseError(MoodleRequestError):
+    """The reply was not a web-service response Worsaga can read.
+
+    Covers an oversize body, a content type that is not JSON (a login
+    page, a captive portal, a proxy error page), and a body that does not
+    parse as JSON. Raised in place of letting a raw
+    ``json.JSONDecodeError`` escape, so callers classify one error type
+    instead of the internals of the parser.
+
+    The message names only the declared content type and the size in
+    bytes — **never** any part of the body. A response body is attacker-
+    or misconfiguration-controlled text that goes on to be printed,
+    logged, and pasted into bug reports.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, errorcode="invalidresponse")
 
 
 class CourseNotFoundError(RuntimeError):
@@ -390,6 +460,31 @@ _NOT_FOUND_ERRORCODES = frozenset({
 })
 
 
+# Moodle ``errorcode`` values that mean "the credentials were rejected"
+# rather than "the server was unreachable" or "that record does not
+# exist". Moodle localises the human message but keeps the errorcode
+# stable, so classify on the code and fall back to the message.
+AUTH_ERRORCODES = frozenset({
+    "invalidtoken", "accessexception", "invalidlogin", "tokenexpired",
+    "enrolmentrequired", "servicenotavailable", "webservicesnotenabled",
+})
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    """Return True when *exc* means Moodle rejected the credentials.
+
+    Shared by the connection check (:mod:`worsaga.doctor`) and the sync
+    failure classifier (:mod:`worsaga.syncstate`), which have to agree:
+    one reports "your token is not accepted", the other decides whether
+    repeated unattended failures are worth stopping to fix.
+    """
+    code = str(getattr(exc, "errorcode", "") or "").lower()
+    if code in AUTH_ERRORCODES:
+        return True
+    message = str(exc).lower()
+    return "invalid token" in message or "invalidtoken" in message
+
+
 def _is_missing_record_error(exc: BaseException) -> bool:
     """Return True when *exc* is a Moodle "record not found" style failure."""
     code = str(getattr(exc, "errorcode", "") or "").lower()
@@ -424,6 +519,22 @@ def _course_id_set(courses: list[dict]) -> frozenset[int]:
 # skipped with a structured error — never silently truncated.
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
+# Cap on a single *web-service* response body. These carry metadata only —
+# course lists, assignment definitions, gradebook items — so 16 MiB is
+# orders of magnitude above any legitimate payload while still bounding
+# what a misbehaving or hostile endpoint can make this process allocate.
+# File contents come through download_file, which keeps its own 50 MiB cap.
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+# Content types a web-service reply may declare. Moodle sends
+# application/json; a proxy or a hardened site sometimes relabels it
+# text/plain, and some send nothing at all — both are accepted and settled
+# by whether the body actually parses. Anything else (text/html from a
+# login page or a captive portal, an XML error document) is refused
+# outright: it cannot parse as JSON, and saying "the site returned HTML"
+# is far more useful than "Expecting value: line 1 column 1".
+_JSON_CONTENT_HINTS = ("json", "text/plain")
+
 
 class DownloadError(RuntimeError):
     """A categorized, token-free download failure.
@@ -436,6 +547,8 @@ class DownloadError(RuntimeError):
     - ``"oversize"`` — the file exceeds the download size limit.
     - ``"invalid_url"`` — the URL failed Moodle-origin validation.
     - ``"empty"`` — the server returned no data.
+    - ``"rate_limited"`` — the site asked for fewer requests (HTTP
+      429/503) and the retries allowed for one request ran out.
 
     Messages never contain tokens or authenticated URLs.
     """
@@ -455,6 +568,80 @@ def _user_agent() -> str:
     from worsaga import __version__
 
     return f"worsaga/{__version__} (+{PROJECT_URL})"
+
+
+def _header_value(response: Any, name: str) -> str | None:
+    """Return one header from a response (or HTTPError), or None."""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except (AttributeError, TypeError):
+        return None
+    return None if value is None else str(value)
+
+
+def _close_quietly(response: Any) -> None:
+    """Close a response body, ignoring anything that goes wrong.
+
+    An :class:`urllib.error.HTTPError` is also an open response. In the
+    retry loop several of them can pile up, so each is closed as soon as
+    its headers have been read — but a synthetic one (no file object) must
+    not turn a rate-limit into a crash.
+    """
+    if getattr(response, "fp", None) is None:
+        return
+    try:
+        response.close()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _read_json_response(response: Any, wsfunction: str) -> dict | list:
+    """Read a bounded web-service reply and return the parsed JSON.
+
+    Three ways this refuses, all as :class:`MoodleResponseError`:
+
+    - the body exceeds :data:`MAX_RESPONSE_BYTES` (read as ``cap + 1``
+      bytes and length-checked, so an unbounded or lying ``Content-Length``
+      cannot make this allocate more than the cap either way);
+    - the declared content type is not one a web-service reply uses;
+    - the bytes do not parse as JSON.
+
+    None of the messages quote the body — only its size and declared type.
+    """
+    content_type = (_header_value(response, "Content-Type") or "").strip()
+    body = response.read(MAX_RESPONSE_BYTES + 1)
+    if body is None:
+        body = b""
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise MoodleResponseError(
+            f"Moodle's reply to '{wsfunction}' is larger than the "
+            f"{MAX_RESPONSE_BYTES} byte limit for a web-service response, so "
+            "it was discarded unread. Worsaga only ever requests metadata; a "
+            "reply this size means the address is not a Moodle web-service "
+            "endpoint."
+        )
+
+    lowered = content_type.lower()
+    if lowered and not any(hint in lowered for hint in _JSON_CONTENT_HINTS):
+        raise MoodleResponseError(
+            f"Moodle's reply to '{wsfunction}' declared content type "
+            f"'{content_type}' ({len(body)} bytes), not JSON. A sign-in page "
+            "or a proxy/captive-portal page is the usual cause; check the "
+            "configured Moodle URL and that the token is still valid."
+        )
+
+    try:
+        return json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        declared = content_type or "no content type"
+        raise MoodleResponseError(
+            f"Moodle's reply to '{wsfunction}' is not valid JSON "
+            f"({len(body)} bytes, {declared}). The reply body is not "
+            "reproduced here because it can contain anything."
+        ) from None
 
 
 def _download_display_name(fileurl: str) -> str:
@@ -649,6 +836,83 @@ class MoodleClient:
             if _as_course_id(course_id) not in enrolled:
                 raise CourseNotFoundError(course_id)
 
+    def _issue(
+        self,
+        req: urllib.request.Request,
+        *,
+        read_fn: Callable[[Any], Any],
+        what: str,
+        timeout: int = 30,
+    ) -> Any:
+        """Issue one request under this origin's rate coordinator.
+
+        The single place every request Worsaga makes goes through — the
+        web-service dispatcher and :meth:`download_file` both — so the
+        pacing, the two-in-flight ceiling, and the backpressure rules hold
+        for all of them and cannot be forgotten at one call site.
+
+        On HTTP 429/503 the coordinator records a cooldown for the *whole
+        origin* (honouring ``Retry-After`` when the server sent one) and
+        the request is retried by re-entering the slot, which sits that
+        cooldown out. Retries stop at :data:`~worsaga.ratelimit.MAX_ATTEMPTS`
+        attempts or when the origin's shared retry budget is spent —
+        whichever comes first — and then raise
+        :class:`MoodleRateLimitedError`. There is no tight retry: every
+        retry waits.
+
+        **The cooldown is installed before the in-flight slot is given
+        back.** Releasing first left a window in which a queued worker
+        could take the slot, see no cooldown, and go straight onto a wire
+        the server had just asked to be left alone — precisely the
+        stampede the coordinator exists to prevent. Everything that
+        decides whether to *retry* (the shared budget, the attempt count,
+        the wait itself) happens after the slot is released, so a
+        backing-off request never occupies one.
+
+        ``read_fn`` consumes the response *inside* the slot, so the slot is
+        held for exactly as long as the wire is busy. Anything it raises
+        propagates unchanged.
+        """
+        coordinator = coordinator_for(self.base_url)
+        attempt = 0
+        while True:
+            attempt += 1
+            with coordinator.request_slot():
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as response:
+                        return read_fn(response)
+                except urllib.error.HTTPError as exc:
+                    if exc.code not in BACKPRESSURE_STATUSES:
+                        raise
+                    status = exc.code
+                    retry_after = _header_value(exc, "Retry-After")
+                    _close_quietly(exc)
+                    # Still inside the slot: the cooldown exists before any
+                    # waiting worker can be admitted.
+                    delay, source = coordinator.note_backpressure(
+                        retry_after=retry_after, attempt=attempt,
+                    )
+
+            budget_left = coordinator.take_retry_budget()
+            if attempt >= MAX_ATTEMPTS or not budget_left:
+                reason = (
+                    f"{attempt} attempt(s)" if budget_left
+                    else "the shared retry budget for this site"
+                )
+                raise MoodleRateLimitedError(
+                    f"Moodle answered HTTP {status} (rate limited) for "
+                    f"{what} and Worsaga gave up after {reason}. The site "
+                    "is asking for fewer requests; try again later.",
+                    status=status,
+                    retry_after=delay,
+                ) from None
+            logger.warning(
+                "%s answered HTTP %s for %s; waiting %.1fs (%s) before "
+                "attempt %d of %d.",
+                self.base_url, status, what, delay, source,
+                attempt + 1, MAX_ATTEMPTS,
+            )
+
     def call(self, wsfunction: str, **params) -> dict | list:
         """Call a Moodle web-service function (read-only only).
 
@@ -744,7 +1008,7 @@ class MoodleClient:
         if scoped_param is not None:
             params.setdefault(scoped_param, userid)
 
-        # 7. Make the request
+        # 7. Make the request, paced by this origin's rate coordinator.
         params.update({
             "wstoken": self._config.token,
             "moodlewsrestformat": "json",
@@ -755,8 +1019,11 @@ class MoodleClient:
         req = urllib.request.Request(
             url, data=data, headers={"User-Agent": _user_agent()},
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            result = json.load(r)
+        result = self._issue(
+            req,
+            read_fn=lambda response: _read_json_response(response, wsfunction),
+            what=wsfunction,
+        )
 
         if isinstance(result, dict) and "exception" in result:
             raise MoodleRequestError(
@@ -963,8 +1230,8 @@ class MoodleClient:
         ------
         DownloadError
             With a stable ``code`` (``auth``, ``not_found``, ``network``,
-            ``oversize``, ``invalid_url``, ``empty``). Error messages
-            never contain tokens or authenticated URLs.
+            ``oversize``, ``invalid_url``, ``empty``, ``rate_limited``).
+            Error messages never contain tokens or authenticated URLs.
         """
         name = _download_display_name(fileurl)
         try:
@@ -973,30 +1240,43 @@ class MoodleClient:
             raise DownloadError("invalid_url", f"'{name}': {exc}") from None
 
         req = urllib.request.Request(url, headers={"User-Agent": _user_agent()})
+
+        def _read(response) -> bytes:
+            if max_bytes is None:
+                return response.read()
+            declared = _header_value(response, "Content-Length") or ""
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise DownloadError(
+                    "oversize",
+                    f"'{name}' is {int(declared)} bytes, over the "
+                    f"{max_bytes} byte limit; skipped.",
+                )
+            chunk = response.read(max_bytes + 1)
+            if len(chunk) > max_bytes:
+                raise DownloadError(
+                    "oversize",
+                    f"'{name}' exceeds the {max_bytes} byte limit; "
+                    "skipped (no partial file was written).",
+                )
+            return chunk
+
         # Chained exceptions are suppressed (``from None``) throughout:
         # urllib errors carry the authenticated URL, which must never
         # surface in messages or tracebacks.
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                if max_bytes is None:
-                    data = r.read()
-                else:
-                    declared = r.headers.get("Content-Length", "")
-                    if declared.isdigit() and int(declared) > max_bytes:
-                        raise DownloadError(
-                            "oversize",
-                            f"'{name}' is {int(declared)} bytes, over the "
-                            f"{max_bytes} byte limit; skipped.",
-                        )
-                    data = r.read(max_bytes + 1)
-                    if len(data) > max_bytes:
-                        raise DownloadError(
-                            "oversize",
-                            f"'{name}' exceeds the {max_bytes} byte limit; "
-                            "skipped (no partial file was written).",
-                        )
+            # Same rate coordinator as the web-service calls: a bulk
+            # download is exactly the traffic a site notices, so it is
+            # paced and bounded with everything else rather than running
+            # beside the limiter.
+            data = self._issue(req, read_fn=_read, what=f"'{name}'")
         except DownloadError:
             raise
+        except MoodleRateLimitedError:
+            raise DownloadError(
+                "rate_limited",
+                f"Moodle is rate-limiting requests, so '{name}' was not "
+                "downloaded. Try again later.",
+            ) from None
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DownloadError(

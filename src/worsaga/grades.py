@@ -8,6 +8,7 @@ from typing import Any
 from worsaga.client import CourseNotFoundError, MoodleClient, MoodleWriteAttemptError
 from worsaga.concurrency import ProgressCallback, run_parallel
 from worsaga.models import as_bool, as_float, as_int, clean_text, grade_record
+from worsaga.syncstate import classify_failure
 
 
 def _parse_percentage(item: dict[str, Any]) -> float | None:
@@ -152,14 +153,21 @@ def normalize_grade_items(
     return records
 
 
-def _course_targets(client: MoodleClient, course_id: int | None) -> list[dict[str, Any]]:
+def _course_targets(
+    client: MoodleClient,
+    course_id: int | None,
+    courses: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Return the enrolled course records this request covers.
 
     An id outside the enrolment list is a not-found failure, never a
     synthesised target: fabricating one used to send an unknown id to the
     gradebook endpoint and label whatever came back with the bare id.
+
+    *courses* reuses an enrolled-course list the caller already has.
     """
-    courses = client.get_courses()
+    if courses is None:
+        courses = client.get_courses()
     if course_id is None:
         return courses
     for course in courses:
@@ -173,6 +181,7 @@ def collect_grades(
     course_id: int | None = None,
     *,
     on_progress: ProgressCallback | None = None,
+    courses: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return normalized grade records plus non-fatal warnings.
 
@@ -183,10 +192,13 @@ def collect_grades(
     course when *course_id* is not given; for a single named course the
     fetch error still propagates. ``on_progress`` (default silent) reports
     one completed course at a time.
+
+    *courses* reuses an enrolled-course list the caller already fetched
+    (a sync run does) instead of listing them again.
     """
     records: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    targets = _course_targets(client, course_id)
+    targets = _course_targets(client, course_id, courses)
 
     def _fetch_course(course: dict[str, Any]) -> dict[str, Any]:
         cid = as_int(course.get("id"), 0) or 0
@@ -202,6 +214,11 @@ def collect_grades(
                 "course_id": cid,
                 "course_shortname": shortname,
                 "message": str(exc),
+                # Carried alongside the human message so a caller that has
+                # to decide what a run of failures *means* (see
+                # :func:`worsaga.sync.collect_snapshots`) never has to
+                # string-match a localised error.
+                "failure_class": classify_failure(exc),
             }}
         return {"records": normalize_grade_items(
             payload if isinstance(payload, dict) else {},

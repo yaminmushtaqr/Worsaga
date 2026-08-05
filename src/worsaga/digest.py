@@ -39,13 +39,29 @@ def get_digest(
     per-forum concurrency, which is where the time goes). ``on_progress``
     (default silent) reports one completed source at a time so a caller can
     show liveness instead of a multi-second hang.
+
+    The enrolled-course list is fetched **once** for the whole digest and
+    handed to the three sources that need it. Each of them used to list the
+    courses itself, so a digest opened with three identical
+    ``core_enrol_get_users_courses`` requests for a list that has to be the
+    same across the five sources anyway. A failure to list them is not
+    fatal here: the sources fall back to their own lookup and report their
+    own warnings, exactly as before.
     """
     warnings: list[str] = []
+    try:
+        courses: list[dict[str, Any]] | None = client.get_courses()
+    except Exception:
+        courses = None
     sources: list[tuple[str, Callable[[], Any]]] = [
         ("deadlines",
-         lambda: get_upcoming_deadlines(client, lookahead_days=max(1, since_days))),
-        ("assignments", lambda: get_assignments(client)),
-        ("updates", lambda: get_latest_updates(client, since_days=since_days)),
+         lambda: get_upcoming_deadlines(
+             client, lookahead_days=max(1, since_days), courses=courses,
+         )),
+        ("assignments", lambda: get_assignments(client, courses=courses)),
+        ("updates", lambda: get_latest_updates(
+            client, since_days=since_days, courses=courses,
+        )),
         ("notifications", lambda: get_notifications(client)),
         ("messages", lambda: get_messages(client, since_days=since_days)),
     ]

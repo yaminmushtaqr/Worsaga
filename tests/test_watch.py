@@ -146,6 +146,158 @@ class TestRunWatch:
             with pytest.raises(MoodleWriteAttemptError):
                 run_watch(object(), max_cycles=1, sleep_fn=lambda s: None)
 
+    def test_cycles_are_marked_unattended(self):
+        seen = {}
+
+        def fake(client, **kwargs):
+            seen.update(kwargs)
+            return {"outcome": "success", "changes": [], "warnings": [],
+                    "categories": {}, "synced_at": 1, "site": "s"}
+
+        with patch.object(watch_mod, "run_sync", fake):
+            run_watch(object(), max_cycles=1, sleep_fn=lambda s: None)
+        # Watch cycles honour the credential circuit breaker; a
+        # foreground sync does not, because it is the reset path.
+        assert seen["unattended"] is True
+
+
+def _outcome_sync(outcomes):
+    """A run_sync stand-in returning the given outcomes in turn."""
+    values = iter(outcomes)
+
+    def fake(client, **kwargs):
+        outcome = next(values)
+        return {
+            "site": "https://moodle.example.com",
+            "synced_at": 1_800_000_000,
+            "categories": {},
+            "changes": [],
+            "warnings": ["nothing could be fetched"],
+            "outcome": outcome,
+        }
+    return fake
+
+
+class TestOutcomeDrivenCycles:
+    def test_a_failed_outcome_is_not_an_ok_cycle(self):
+        seen = []
+        with patch.object(watch_mod, "run_sync", _outcome_sync(["failed"])):
+            summary = run_watch(
+                object(), max_cycles=1, sleep_fn=lambda s: None,
+                on_cycle=seen.append,
+            )
+        # The known defect: run_sync returned normally, so the cycle used
+        # to be reported ok=True with an empty change list.
+        assert seen[0]["ok"] is False
+        assert seen[0]["outcome"] == "failed"
+        assert summary["failures"] == 1
+
+    def test_a_partial_outcome_is_an_ok_cycle(self):
+        seen = []
+        with patch.object(watch_mod, "run_sync", _outcome_sync(["partial"])):
+            summary = run_watch(
+                object(), max_cycles=1, sleep_fn=lambda s: None,
+                on_cycle=seen.append,
+            )
+        assert seen[0]["ok"] is True
+        assert summary["failures"] == 0
+
+    def test_a_skipped_outcome_is_neither(self):
+        seen = []
+        with patch.object(watch_mod, "run_sync", _outcome_sync(["skipped"])):
+            summary = run_watch(
+                object(), max_cycles=1, sleep_fn=lambda s: None,
+                on_cycle=seen.append,
+            )
+        assert seen[0]["ok"] is True
+        assert summary["failures"] == 0
+        assert summary["skipped"] == 1
+
+    def test_a_skipped_cycle_does_not_reset_a_failure_streak(self):
+        # Intended contract, not an oversight: a skipped cycle means
+        # another process held the sync lock, which says nothing about
+        # whether the site is reachable. Clearing the streak on it would
+        # drop the backoff and resume hammering a site that is still
+        # broken; counting it as a failure would blame this loop for
+        # somebody else's lock. It does neither.
+        seen = []
+        with patch.object(
+            watch_mod, "run_sync",
+            _outcome_sync(["failed", "skipped", "failed"]),
+        ):
+            run_watch(
+                object(), max_cycles=3, sleep_fn=lambda s: None,
+                on_cycle=seen.append, rng=lambda: 0.5,
+            )
+        assert [c["consecutive_failures"] for c in seen] == [1, 1, 2]
+
+
+class TestBackoff:
+    def test_no_failures_keeps_the_base_interval(self):
+        assert watch_mod.backoff_seconds(600, 0, rng=lambda: 0.5) == 600
+
+    def test_interval_doubles_per_consecutive_failure(self):
+        # rng 0.5 is the middle of the jitter band: no adjustment.
+        assert watch_mod.backoff_seconds(600, 1, rng=lambda: 0.5) == 1200
+        assert watch_mod.backoff_seconds(600, 2, rng=lambda: 0.5) == 2400
+        assert watch_mod.backoff_seconds(600, 3, rng=lambda: 0.5) == 3600
+
+    def test_capped_at_eight_intervals_or_an_hour(self):
+        # 300s base: eight intervals (2400s) binds before the hour cap.
+        assert watch_mod.backoff_seconds(300, 20, rng=lambda: 0.5) == 2400
+        # 900s base: the hour cap binds before eight intervals (7200s).
+        assert watch_mod.backoff_seconds(900, 20, rng=lambda: 0.5) == 3600
+        assert watch_mod.backoff_seconds(900, 20, rng=lambda: 1.0) <= 3600 * 1.1
+
+    def test_jitter_is_ten_percent_either_way(self):
+        assert watch_mod.backoff_seconds(600, 1, rng=lambda: 0.0) == 1080
+        assert watch_mod.backoff_seconds(600, 1, rng=lambda: 1.0) == 1320
+
+    def test_never_shorter_than_the_base_interval(self):
+        assert watch_mod.backoff_seconds(600, 1, rng=lambda: 0.0) >= 600
+
+    def test_the_loop_backs_off_then_resets(self):
+        sleeps = []
+        with patch.object(
+            watch_mod, "run_sync",
+            _outcome_sync(["failed", "failed", "success", "failed"]),
+        ):
+            run_watch(
+                object(), interval_seconds=600, max_cycles=4,
+                sleep_fn=sleeps.append, rng=lambda: 0.5,
+            )
+        # 2x, 4x, back to the base interval after the success.
+        assert sleeps == [1200, 2400, 600]
+
+    def test_the_backoff_is_visible_on_the_cycle_result(self):
+        seen = []
+        with patch.object(watch_mod, "run_sync", _outcome_sync(["failed", "failed"])):
+            run_watch(
+                object(), interval_seconds=600, max_cycles=2,
+                sleep_fn=lambda s: None, on_cycle=seen.append,
+                rng=lambda: 0.5,
+            )
+        assert seen[0]["backoff"] is True
+        assert seen[0]["next_cycle_in"] == 1200
+        assert seen[0]["consecutive_failures"] == 1
+        # The last cycle has no next one to describe.
+        assert "next_cycle_in" not in seen[1]
+
+    def test_a_raised_cycle_also_backs_off(self):
+        sleeps = []
+
+        def boom(client, **kwargs):
+            raise OSError("network down")
+
+        with patch.object(watch_mod, "run_sync", boom):
+            summary = run_watch(
+                object(), interval_seconds=600, max_cycles=2,
+                sleep_fn=sleeps.append, rng=lambda: 0.5,
+            )
+        assert sleeps == [1200]
+        assert summary["failures"] == 2
+        assert summary["consecutive_failures"] == 2
+
 
 class TestCliSurface:
     @pytest.fixture(autouse=True)

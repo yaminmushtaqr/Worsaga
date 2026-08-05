@@ -75,13 +75,22 @@ class TestSyncCommand:
     def test_prefers_entry_point(self):
         with patch.object(autosync.shutil, "which",
                           return_value="C:\\bin\\worsaga.exe"):
-            assert sync_command() == ["C:\\bin\\worsaga.exe", "sync", "--quiet"]
+            assert sync_command() == [
+                "C:\\bin\\worsaga.exe", "sync", "--quiet", "--unattended",
+            ]
 
     def test_falls_back_to_interpreter(self):
         with patch.object(autosync.shutil, "which", return_value=None):
             command = sync_command()
         assert command[0] == sys.executable
-        assert command[1:] == ["-m", "worsaga.cli", "sync", "--quiet"]
+        assert command[1:] == [
+            "-m", "worsaga.cli", "sync", "--quiet", "--unattended",
+        ]
+
+    def test_scheduled_run_is_marked_unattended(self):
+        # The scheduled job must honour the credential circuit breaker;
+        # a foreground 'worsaga sync' must not, because it is the reset.
+        assert "--unattended" in sync_command()
 
     def test_never_contains_credentials(self, monkeypatch):
         monkeypatch.setenv("WORSAGA_TOKEN", "supersecret")

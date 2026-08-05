@@ -13,6 +13,8 @@ from worsaga.client import (
     SELF_SCOPED_PARAMS,
     DownloadError,
     MoodleClient,
+    MoodleRateLimitedError,
+    MoodleResponseError,
     MoodleScopeError,
     MoodleWriteAttemptError,
 )
@@ -88,7 +90,10 @@ from worsaga.sync import (
     SYNC_LOOKAHEAD_DAYS,
     get_recent_changes,
     run_sync,
+    sync_outcome,
 )
+from worsaga.synclock import SyncLock
+from worsaga.syncstate import FAILURE_CLASSES, OUTCOMES
 from worsaga.summaries import (
     build_deterministic_summary,
     build_summary,
@@ -103,19 +108,24 @@ __all__ = [
     "BLOCKED_PATTERNS",
     "DEFAULT_CONFIG_PATH",
     "DownloadError",
+    "FAILURE_CLASSES",
     "FILE_PRIORITY",
     "IDENTITY_PARAMS",
     "MAX_DOWNLOAD_BYTES",
     "MaterialSelectionError",
     "MoodleClient",
     "MoodleConfig",
+    "MoodleRateLimitedError",
+    "MoodleResponseError",
     "MoodleScopeError",
     "MoodleWriteAttemptError",
+    "OUTCOMES",
     "PrincipalMismatchError",
     "SELF_SCOPED_PARAMS",
     "SUPPORTED_EXTENSIONS",
     "SYNC_CATEGORIES",
     "SYNC_LOOKAHEAD_DAYS",
+    "SyncLock",
     "CacheStore",
     "TextIndexError",
     "TextIndexStore",
@@ -177,5 +187,6 @@ __all__ = [
     "strip_file_urls",
     "strip_html",
     "summarize_modules",
+    "sync_outcome",
     "test_connection",
 ]

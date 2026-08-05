@@ -161,6 +161,7 @@ def get_latest_updates(
     *,
     since_days: int = 7,
     on_progress: ProgressCallback | None = None,
+    courses: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return recent forum discussions across one or all courses.
 
@@ -171,8 +172,12 @@ def get_latest_updates(
     and the final list is sorted newest-first, so output is deterministic
     regardless of completion order. ``on_progress`` (default silent) reports
     one completed forum at a time.
+
+    *courses* reuses an enrolled-course list the caller already fetched
+    (the digest does) instead of listing them again.
     """
-    courses = client.get_courses()
+    if courses is None:
+        courses = client.get_courses()
     if course_id is not None:
         courses = [
             course for course in courses

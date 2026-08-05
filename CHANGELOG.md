@@ -66,6 +66,85 @@ All notable changes to Worsaga are documented in this file.
   unstructured tool error. The message names both user ids and the file to
   remove.
 
+- **A network etiquette engine.** Worsaga now paces every request it makes
+  to a Moodle site, whatever command or tool asked for it: **never more
+  than 2 requests in flight per site at once**, and **at least 250 ms
+  between request starts**. The fan-outs still use four worker threads,
+  because most of their time is parsing and cache work — the wire is what
+  is limited. Both knobs move in the polite direction only:
+  `WORSAGA_MIN_REQUEST_GAP_MS` can *raise* the gap and `WORSAGA_MAX_IN_FLIGHT`
+  can *lower* the concurrency; smaller gaps and larger concurrency are
+  ignored, and there is no way to switch the limiter off. Demo mode is
+  entirely offline and unthrottled.
+
+- **Server backoff is honoured, and shared across processes.** When a site
+  answers `429 Too Many Requests` or `503 Service Unavailable`, Worsaga
+  reads `Retry-After` in both of its forms (a number of seconds and an
+  HTTP-date), waits that long — capped at two minutes, floored at zero so a
+  skewed clock cannot produce a negative wait — and retries at most three
+  times per request. Without the header it backs off exponentially with
+  full jitter (1s, 2s, 4s ... capped at 60s). The wait applies to the whole
+  site rather than to the one refused request — and is in place before the
+  refused request gives up its slot, so a queued worker cannot slip onto
+  the wire ahead of it. It is also written to a small state file that other
+  Worsaga processes re-read as they go, so a running `worsaga watch` and a
+  `worsaga sync` you start by hand back off together instead of each
+  discovering the limit separately; the recorded deadline only ever moves
+  later, so a short wait cannot cut a long one short. Retries draw on one
+  shared per-site budget, so four workers meeting the same limit cannot
+  multiply it. When the retries run out the command fails with a plain
+  `the site is rate-limiting requests; try again later.`; every MCP tool
+  returns the new `rate_limited` error code; downloads report
+  `DownloadError` code `rate_limited`.
+
+- **Truthful sync outcomes.** `worsaga sync`, `sync_now`, and each `watch`
+  cycle now report an `outcome`: `success` (every category synced),
+  `partial` (some did), `failed` (none did), or `skipped` (another Worsaga
+  process was already syncing this site). Previously a run that reached
+  Moodle and could not fetch a single category returned normally with an
+  empty change list — indistinguishable from a healthy sync that found
+  nothing new. A failed run also carries a coarse `failure_class` (`auth`,
+  `network`, `rate_limited`, `other`).
+
+- **One sync per site at a time.** A sync takes an interprocess lock beside
+  the cache before it fetches anything, so a `watch` loop, the scheduled
+  auto-sync, and a manual run cannot fetch every course two or three times
+  over. A run that finds the lock held returns `outcome: "skipped"` (CLI:
+  one line and exit 0; MCP `sync_now`: `{"error", "error_code":
+  "sync_in_progress"}`) without making a single request. A lock left behind
+  by a crash is recovered immediately when the owning process is provably
+  gone (POSIX), or after two hours of silence where liveness cannot be
+  checked (Windows has no safe standard-library equivalent); a long sync
+  keeps saying it is alive as it goes, so a slow first sync is never
+  interrupted. Each lock carries an ownership token and nothing ever
+  deletes a lock that is not its own.
+
+- **Watch backs off when it keeps failing.** Consecutive failed cycles
+  double the interval, capped at eight intervals or one hour (whichever is
+  smaller) with +/-10% jitter, and print one `Backing off: next cycle in Xs
+  (N consecutive failures).` line to stderr. A successful or partial cycle
+  returns to the base interval. A *skipped* cycle leaves the streak exactly
+  as it was — neither counting against it nor clearing it — because
+  "another process was already syncing" says nothing about whether the site
+  is reachable, and clearing the streak on it would resume hammering a
+  broken site at full rate.
+
+- **A circuit breaker for rejected credentials.** After a sync fails
+  because Moodle rejected the token (or web services are disabled),
+  unattended runs — `watch` cycles and the scheduled auto-sync — stop
+  before making any request and say `circuit open: fix credentials then run
+  'worsaga sync' manually`. Running `worsaga sync` yourself always tries,
+  and any successful sync closes the breaker. `worsaga auto-sync status`
+  now shows the last outcome, the consecutive-failure count and its class,
+  and whether scheduled syncs are paused. Network failures and rate limits
+  never open the breaker; they are temporary and worth retrying.
+
+- Fewer requests for the same answers. `worsaga digest` fetches the
+  enrolled-course list once and shares it with the deadline, assignment,
+  and forum-update sources instead of letting each rediscover it (3
+  requests down to 1); a sync run shares one list across course discovery,
+  grades, files, and forums (4 down to 1).
+
 ### Deprecated
 
 - Passing the token as a command-line argument. `--token VALUE` (global) and
@@ -80,6 +159,22 @@ All notable changes to Worsaga are documented in this file.
   that order of preference.
 
 ### Fixed
+
+- `worsaga watch` no longer reports a cycle that fetched nothing as a
+  successful one. A sync that reached Moodle and failed every category, and
+  a sync refused because the local cache belongs to a different Moodle
+  account, both returned normally — so the cycle was counted `ok`, the
+  failure count stayed at zero, and the run looked exactly like a healthy
+  cycle with no changes. Both are now failed cycles: they count in the
+  summary, print the reason, and drive the new backoff.
+
+- A Moodle reply that is not a web-service response no longer surfaces as a
+  raw JSON decode error. A sign-in page, a captive portal, or a proxy error
+  page in place of the API now raises a typed failure naming the declared
+  content type and the size — never any part of the body, which can contain
+  anything. Web-service replies are also read under a hard 16 MiB cap
+  (downloads keep their own 50 MiB cap), so a misbehaving endpoint cannot
+  make the process allocate without bound.
 
 - CLI `--json`/`--yaml` modes now emit the same structured error dict the
   MCP tools return when a course argument cannot be resolved, instead of
@@ -188,6 +283,25 @@ All notable changes to Worsaga are documented in this file.
 
 ### Changed
 
+- **`worsaga sync` now exits 1 when the sync fetched nothing at all.** It
+  previously exited 0 whatever happened, so a scheduled job or a script had
+  no way to tell a working sync from one that silently reached nothing. A
+  partial sync still exits 0 and prints its warnings exactly as before, and
+  a run skipped because another sync held the lock also exits 0. Scripts
+  that treated `worsaga sync` as always-succeeding need to expect a
+  non-zero exit on total failure. In `--json`/`--yaml` mode the payload
+  carries the same verdict in its new `outcome` field.
+
+- "Last sync" timestamps no longer advance on a run that synced nothing.
+  `worsaga auto-sync status` and the MCP `get_auto_sync_status` report the
+  last run that actually fetched something, so a site that has been failing
+  all day no longer looks freshly synced.
+
+- The scheduled auto-sync command is now `worsaga sync --quiet
+  --unattended`, so it honours the credential circuit breaker. A job
+  registered by an earlier version keeps working unchanged (without the
+  flag) until it is reinstalled.
+
 - The per-course / per-forum metadata fan-outs behind `digest`, `sync`,
   `assignments`, `updates`, and `grades` now run on a small bounded thread
   pool (default 4 workers; `WORSAGA_CONCURRENCY` overrides it, clamped to
@@ -201,8 +315,10 @@ All notable changes to Worsaga are documented in this file.
   connection per request). The bounds are deliberately conservative: Moodle
   core applies no server-side rate limiting to web-service calls and
   ecosystem guidance for well-behaved clients is around two concurrent
-  connections, so until a per-origin limiter lands this clamp is the only
-  thing pacing Worsaga against someone else's server.
+  connections. Since this same release the worker pool is no longer what
+  paces Worsaga at all — the per-origin limiter described above is, and it
+  holds the wire to two concurrent requests however many workers are
+  running.
 - The MCP `list_courses` and `get_course_contents` tools now return
   compact, normalized records through Worsaga's own model layer instead of
   the raw Moodle payloads. `list_courses` returns `id`, `shortname`,

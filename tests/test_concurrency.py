@@ -97,11 +97,20 @@ def test_resolve_max_workers_env_override(monkeypatch):
 
 
 def test_concurrency_ceiling_stays_polite():
-    # Moodle core has no server-side web-service rate limiting, so these
-    # bounds are the only pacing until a per-origin limiter lands.
+    # These bound how much parsing overlaps, not what reaches the wire:
+    # worsaga.ratelimit holds that to two concurrent requests per site
+    # however many workers are running.
     assert DEFAULT_MAX_WORKERS == 4
     assert MAX_ALLOWED_WORKERS == 8
     assert DEFAULT_MAX_WORKERS <= MAX_ALLOWED_WORKERS
+
+
+def test_the_worker_pool_is_not_the_politeness_limit():
+    from worsaga.ratelimit import DEFAULT_MAX_IN_FLIGHT
+
+    # The pool is deliberately wider than the wire allows; that gap is
+    # the design, not an oversight.
+    assert DEFAULT_MAX_WORKERS > DEFAULT_MAX_IN_FLIGHT
 
 
 def test_run_parallel_max_workers_one_is_sequential():
