@@ -299,9 +299,10 @@ capability name is ignored with a warning rather than refusing to start.
 
 Two things hold whatever the profile. Every tool clamps its numeric
 arguments — day windows, result limits, file budgets — into a documented
-range rather than trusting them. And every tool whose result can contain
-text written by other people says so in its own description, so an agent
-reading a forum post or an instructor's feedback is told to treat it as
+range rather than trusting them. And every tool whose result can carry
+other people's writing — a forum post, an instructor's feedback, a
+staff-authored deadline or assignment name, extracted material text —
+says so in its own description, so an agent reading it is told to treat it as
 material to report on, never as instructions to follow.
 
 Every tool that takes a `course_id` accepts either the numeric id or a
@@ -322,8 +323,12 @@ So connect only hosts you trust with your academic record, and treat the
 capability profile as the real boundary: it is what bounds the questions a
 host is able to ask in the first place, since a withheld tool is absent from
 the list rather than present and refusing. The default profile — the
-[capability table](#mcp-server) above — keeps other people's writing and
-file contents out of reach until you deliberately enable them.
+[capability table](#mcp-server) above — keeps wholesale reads of other
+people's writing and all file contents out of reach until you deliberately
+enable them. The one nuance is your own gradebook: `get_grades` is in the
+default profile because it is your own record, and an instructor's feedback
+on your work travels with it — its description carries the third-party
+content warning for exactly that reason.
 
 Worsaga's supported deployment is described in
 [One machine, one user](#one-machine-one-user).
@@ -774,8 +779,12 @@ wrote on your work. Worsaga treats that as a distinct category.
   [What gets collected](#what-gets-collected) — an unattended sync leaves
   forums alone, and instructor feedback is stored as a hash rather than as
   text.
-- **It is not offered to agents by default.** The MCP tools that read it
-  are behind a capability and are absent from the tool list until enabled.
+- **It is mostly not offered to agents by default.** The MCP tools that
+  read it wholesale — forums, messages, notifications, the digest — are
+  behind a capability and absent from the tool list until enabled. The
+  exception is instructor feedback on your own work: `get_grades` is in
+  the default profile because the gradebook is your own record, and its
+  description labels the feedback as third-party content.
 - **The first time a run reads other people's *writing* against a real
   site, Worsaga says so once** on stderr: that a local copy is being kept,
   that it is your personal study material, and that it should be treated

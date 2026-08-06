@@ -5,7 +5,11 @@ local scratch files must stay out of the repository.
 
 ## Current baseline
 
-Version `0.8.0` includes:
+Version `0.8.2` — see `CHANGELOG.md` for the politeness, privacy-default,
+and documentation hardening added in 0.8.2 on top of the feature set
+below.
+
+Version `0.8.0` established:
 
 - CLI and MCP server entrypoints.
 - Read-only Moodle client with a hardcoded allowlist.

@@ -4,7 +4,7 @@ Read-only against Moodle; writes only local files on the user's own
 machine. See "Responsible use" in README.md.
 """
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 from worsaga.assignments import get_assignment_status, get_assignments, normalize_assignment
 from worsaga.calendar import get_calendar_events, normalize_calendar_events

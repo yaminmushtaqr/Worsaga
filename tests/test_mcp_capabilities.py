@@ -226,6 +226,9 @@ class TestThirdPartyDescriptions:
             # Its result carries change titles, and a run that collected
             # forums carries discussion subjects other people wrote.
             "sync_now",
+            # Deadline titles and assignment names/intros are staff-authored
+            # text, the same class as the calendar events they mirror.
+            "get_deadlines", "get_assignments", "get_assignment_status",
         }
 
     def test_each_marked_tool_carries_the_note(self):

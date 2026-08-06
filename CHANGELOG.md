@@ -2,7 +2,7 @@
 
 All notable changes to Worsaga are documented in this file.
 
-## 0.8.2 (unreleased)
+## 0.8.2 (2026-08-06)
 
 ### Changed
 
@@ -171,17 +171,24 @@ All notable changes to Worsaga are documented in this file.
   `get_course_contents`, `get_week_materials`, `search_course_content`,
   `search_text`, `get_changes`, `get_autosync_status`, and
   `get_connection_info`.
-  Everything that reads other people's writing, fetches file contents, or
-  writes to a local store is behind a named capability and is **absent from
-  the tool list** until enabled — not present-and-refusing, because a tool
-  an agent can see is a tool an agent can be talked into calling. The
+  Everything that reads other people's writing wholesale, fetches file
+  contents, or writes to a local store is behind a named capability and is
+  **absent from the tool list** until enabled — not present-and-refusing,
+  because a tool an agent can see is a tool an agent can be talked into
+  calling. (The deliberate nuance is `get_grades`: the gradebook is the
+  user's own record and stays in the default profile, and the instructor
+  feedback it can carry is labelled third-party content in the tool's own
+  description rather than gated away from its owner.) The
   capabilities are `forums`, `messages`, `notifications`, `digest`,
   `sync` (`sync_now`), `materials` (`download_material`,
   `extract_material`, `export_study_pack`, `get_weekly_summary`), and
   `index` (`build_search_index`). `get_changes` stays in the default
-  profile: it makes no request and writes nothing, it replays events from
-  data the user already chose to sync, and forums are outside the
-  unattended collection default, so by default that feed is first-party.
+  profile: it makes no request and replays events from data the user
+  already chose to sync (its only local writes are cache housekeeping —
+  creating the empty cache file on first use, and the one-time feedback
+  scrub below on a cache written before 0.8.2 — never data it did not
+  already have), and forums are outside the unattended collection
+  default, so by default that feed is first-party.
   Set `WORSAGA_MCP_CAPABILITIES` to a comma-separated list or `all`; it is
   read once at start-up and the active profile is printed to stderr. An
   unknown name is ignored with a warning rather than refusing to start.
@@ -225,9 +232,10 @@ All notable changes to Worsaga are documented in this file.
   non-numeric argument falls back to the documented default.
 - **MCP tool annotations** (`readOnlyHint`, `destructiveHint`,
   `idempotentHint`, `openWorldHint`) as advisory metadata, plus a
-  "third-party content" line in the description of all 17 tools whose
-  results can carry text written by other people, telling the reading agent
-  to treat it as data and never as instructions.
+  "third-party content" line in the description of the 21 tools whose
+  results can carry other people's writing — forum posts, messages,
+  instructor feedback, and staff-authored titles alike — telling the
+  reading agent to treat it as data and never as instructions.
 - `others_personal` policy metadata on the allowlisted functions whose
   responses carry other people's personal content
   (`mod_forum_get_forums_by_courses`, `mod_forum_get_forum_discussions`,
@@ -316,8 +324,8 @@ All notable changes to Worsaga are documented in this file.
   answers `429 Too Many Requests` or `503 Service Unavailable`, Worsaga
   reads `Retry-After` in both of its forms (a number of seconds and an
   HTTP-date), waits that long — capped at two minutes, floored at zero so a
-  skewed clock cannot produce a negative wait — and retries at most three
-  times per request. Without the header it backs off exponentially with
+  skewed clock cannot produce a negative wait — and makes at most three
+  attempts per request (the first try plus two retries). Without the header it backs off exponentially with
   full jitter (1s, 2s, 4s ... capped at 60s). The wait applies to the whole
   site rather than to the one refused request — and is in place before the
   refused request gives up its slot, so a queued worker cannot slip onto
@@ -554,7 +562,7 @@ All notable changes to Worsaga are documented in this file.
   carries the same verdict in its new `outcome` field.
 
 - "Last sync" timestamps no longer advance on a run that synced nothing.
-  `worsaga auto-sync status` and the MCP `get_auto_sync_status` report the
+  `worsaga auto-sync status` and the MCP `get_autosync_status` report the
   last run that actually fetched something, so a site that has been failing
   all day no longer looks freshly synced.
 

@@ -620,6 +620,9 @@ def list_courses() -> list[dict[str, Any]]:
 
 
 @tool(
+    # Deadline titles and descriptions are written by course staff — the
+    # same authored-text class as the calendar events they often mirror.
+    third_party=True,
     annotations=_annotations(title="Upcoming deadlines"),
 )
 def get_deadlines(lookahead_days: int = 14) -> list[dict[str, Any]]:
@@ -693,6 +696,8 @@ def get_grade_summary(course_id: int | str | None = None) -> dict[str, Any]:
 
 
 @tool(
+    # Assignment names and intro text are staff-authored.
+    third_party=True,
     annotations=_annotations(title="Own assignment statuses"),
 )
 def get_assignments(
@@ -716,6 +721,8 @@ def get_assignments(
 
 
 @tool(
+    # Assignment names and intro text are staff-authored.
+    third_party=True,
     annotations=_annotations(title="Own assignment status"),
 )
 def get_assignment_status(
@@ -1504,6 +1511,10 @@ def sync_now(
 
 @tool(
     third_party=True,
+    # readOnlyHint stays True: in the steady state this tool only reads.
+    # The one-time feedback scrub that opening a pre-0.8.2 cache triggers
+    # is the store's own self-maintenance (it deletes text, adds nothing),
+    # and the description below discloses it.
     annotations=_annotations(title="Recorded change events", open_world=False),
 )
 def get_changes(
@@ -1527,11 +1538,13 @@ def get_changes(
     and ``feedback_hash``, never as text: whether an instructor's comment
     changed is visible, what it said is not stored here.
 
-    One exception to "makes no request and writes nothing": the first
-    time this opens a cache written by an older Worsaga, that cache is
-    migrated once - instructor feedback text left in stored rows and in
-    recorded events is removed and the file is rebuilt. It is a write to
-    Worsaga's own cache file, never a request, and it only deletes.
+    "Makes no request" is unconditional. "Writes nothing" has two
+    cache-housekeeping exceptions, both confined to Worsaga's own cache
+    file: opening it creates the empty database on first use, and the
+    first open of a cache written by an older Worsaga migrates it once -
+    instructor feedback text left in stored rows and in recorded events
+    is removed and the file is rebuilt. Neither ever adds course data
+    this tool did not already have.
 
     Parameters
     ----------

@@ -2103,7 +2103,7 @@ class TestStructuredCourseErrors:
         client = MagicMock()
         client.get_courses.return_value = [
             {"id": 1, "shortname": "PSY110_2526", "fullname": "Intro Psychology"},
-            {"id": 2, "shortname": "PSY115_2526", "fullname": "Cognitive Psychology"},
+            {"id": 2, "shortname": "PSY110_2425", "fullname": "Intro Psychology (2024/25)"},
         ]
         with patch("worsaga.cli._client", return_value=client):
             with pytest.raises(SystemExit) as exc:
@@ -2112,7 +2112,7 @@ class TestStructuredCourseErrors:
         payload = json.loads(capsys.readouterr().out)
         assert payload["error_code"] == "course_ambiguous"
         shortnames = {c["shortname"] for c in payload["candidates"]}
-        assert shortnames == {"PSY110_2526", "PSY115_2526"}
+        assert shortnames == {"PSY110_2526", "PSY110_2425"}
         assert all({"id", "shortname", "fullname"} <= set(c) for c in payload["candidates"])
 
     def test_human_mode_unchanged_stderr_only(self, capsys):

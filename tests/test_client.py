@@ -457,7 +457,9 @@ class TestServerErrorTokenRedaction:
     """Moodle's own error text becomes a Worsaga error string, and that
     string is printed, logged, and pasted into bug reports."""
 
-    TOKEN = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+    # 32 chars like a real wstoken, but deliberately not hex-shaped, so
+    # the release audit's credential scanner never mistakes it for one.
+    TOKEN = "faketesttokenfaketesttoken000001"
 
     def _client(self) -> MoodleClient:
         return MoodleClient(config=MoodleConfig(

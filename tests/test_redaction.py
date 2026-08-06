@@ -320,11 +320,14 @@ class TestRedactingStream:
     def test_streamed_output_equals_one_shot_for_a_real_token(self):
         """The guarantee, stated as an equality and checked exhaustively.
 
-        A Moodle web-service token is 32 hexadecimal characters: one line,
-        no parameter delimiter. For such a secret the streamed result is
-        the one-shot result, however the writes happen to be chopped up.
+        A Moodle web-service token is 32 characters on one line with no
+        parameter delimiter. For such a secret the streamed result is the
+        one-shot result, however the writes happen to be chopped up. (The
+        fixture keeps the length and shape but is deliberately not
+        hex-shaped, so the release audit's credential scanner never
+        mistakes it for a real token.)
         """
-        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        token = "faketokenfaketokenfaketoken00001"
         remember_secret(token)
         text = (
             "GET https://moodle.example.edu/webservice/rest/server.php"

@@ -65,8 +65,8 @@ def test_get_notifications_filters_unread_locally():
 
 
 def test_sender_prefers_full_name():
-    assert _sender({"userfromfullname": "Dr Avery"}) == "Dr Avery"
-    assert _sender({"fromfullname": "Prof Riley"}) == "Prof Riley"
+    assert _sender({"userfromfullname": "Dr Avery Demo"}) == "Dr Avery Demo"
+    assert _sender({"fromfullname": "Prof Riley Sample"}) == "Prof Riley Sample"
     assert _sender({"userfrom": {"fullname": "Nested Name"}}) == "Nested Name"
 
 
