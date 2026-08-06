@@ -390,7 +390,7 @@ Here is that prompt running against the demo dataset in Claude Code
 (all data shown is fictional):
 
 ![Worsaga MCP demo transcript: an agent lists upcoming deadlines and week 3
-study notes from the fake dataset](docs/demo-mcp-transcript.png)
+study notes from the fake dataset](https://raw.githubusercontent.com/yaminmushtaqr/worsaga/main/docs/demo-mcp-transcript.png)
 
 ## Discovery, download, and extraction
 
@@ -960,23 +960,23 @@ workaround and supports none.
 
 **Reaching the project.** Issues, questions, and reports are welcome at
 <https://github.com/yaminmushtaqr/worsaga/issues>. For anything that should
-not be public, see [SECURITY.md](SECURITY.md).
+not be public, see [SECURITY.md](https://github.com/yaminmushtaqr/worsaga/blob/main/SECURITY.md).
 
 ## Contributing
 
 Bug reports, reproducible issues, documentation corrections, and security
 reports are welcome through GitHub Issues. Worsaga is not accepting unsolicited
-feature pull requests at this stage — see [CONTRIBUTING.md](CONTRIBUTING.md).
+feature pull requests at this stage — see [CONTRIBUTING.md](https://github.com/yaminmushtaqr/worsaga/blob/main/CONTRIBUTING.md).
 
 ## Licence
 
 Worsaga is open-source software licensed under the GNU Affero General Public
-License v3.0. See [LICENSE](LICENSE).
+License v3.0. See [LICENSE](https://github.com/yaminmushtaqr/worsaga/blob/main/LICENSE).
 
 The Worsaga name, logo, and related branding are not licensed under the AGPL.
-See [TRADEMARKS.md](TRADEMARKS.md).
+See [TRADEMARKS.md](https://github.com/yaminmushtaqr/worsaga/blob/main/TRADEMARKS.md).
 
 Worsaga is currently a personal, non-commercial open-source developer project.
 There is no paid offering, hosted service, support contract, subscription,
 advertising, sponsorship, or commercial licence at this time. See
-[COMMERCIAL.md](COMMERCIAL.md).
+[COMMERCIAL.md](https://github.com/yaminmushtaqr/worsaga/blob/main/COMMERCIAL.md).

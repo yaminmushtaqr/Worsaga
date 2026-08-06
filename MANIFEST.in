@@ -2,3 +2,8 @@ include LICENSE
 include README.md
 include pyproject.toml
 recursive-include src *.py
+# The whole test suite, not just what setuptools' default test*.py
+# pattern happens to match: without conftest.py the shipped tests run
+# with no environment isolation and would write into the real user data
+# directories of whoever runs them from the sdist.
+recursive-include tests *.py
