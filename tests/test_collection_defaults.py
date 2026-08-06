@@ -578,8 +578,8 @@ class TestStoredFeedbackScrub:
     OLD_TEXT = "Your third paragraph is lifted from the set reading."
     EVENT_BEFORE = "Marked provisionally, pending moderation."
     EVENT_AFTER = "Confirmed after moderation - do not quote me."
-    #: Marks a payload long enough that scrubbing it leaves the old record
-    #: behind in free space until the file is rebuilt.
+    #: Marks residue an older Worsaga's deletes left in the file's free
+    #: pages, which only the rebuild removes.
     SPILLED = "Left in the free pages until the rebuild runs."
 
     def _write_old_shape(
@@ -674,6 +674,33 @@ class TestStoredFeedbackScrub:
             (SITE, category, item_key, fingerprint, payload,
              NOW - 3600, NOW - 3600, NOW - 3600),
         )
+
+    def _plant_deleted_residue(self, cache_path):
+        """Leave ``SPILLED`` in the file's free pages, then prove it is there.
+
+        An insert-then-delete with ``secure_delete`` explicitly off is
+        what a cache touched by an older Worsaga holds: freed pages that
+        still carry the words. Explicit, because the pragma's default is
+        a build choice — Debian and Ubuntu compile SQLite with it on and
+        zero the record at delete time — and these tests must not depend
+        on either default.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(cache_path, isolation_level=None)
+        try:
+            conn.execute("PRAGMA secure_delete = OFF")
+            self._insert_item(
+                conn, "grades", "101:residue", "d" * 64,
+                (self.SPILLED + " ") * 400,
+            )
+            conn.execute(
+                "DELETE FROM items WHERE category = 'grades'"
+                " AND item_key = '101:residue'"
+            )
+        finally:
+            conn.close()
+        assert self.SPILLED.encode() in cache_path.read_bytes()
 
     def _raw_rows(self, cache_path, category="grades"):
         import sqlite3
@@ -917,6 +944,18 @@ class TestStoredFeedbackScrub:
             pass
         assert self._markers(cache_path) == ("1", "1")
 
+    def test_deletes_are_secure_on_every_build(self, cache_path):
+        """The zeroing must not hang on the platform's compile flags.
+
+        Debian and Ubuntu ship SQLite with ``secure_delete`` already on;
+        the builds bundled on Windows and macOS usually leave it off. The
+        store sets it explicitly, so freed content is zeroed everywhere.
+        """
+        with CacheStore(cache_path) as store:
+            assert store._conn.execute(
+                "PRAGMA secure_delete"
+            ).fetchone()[0] == 1
+
     def test_a_scrubbed_cache_records_both_phases(self, cache_path):
         self._write_old_shape(cache_path, _FakeClient(feedback=self.OLD_TEXT))
         with CacheStore(cache_path):
@@ -993,18 +1032,8 @@ class TestStoredFeedbackScrub:
         """
         import sqlite3
 
-        # A row long enough that the shorter, scrubbed record cannot be
-        # written over it in place: this is the case where the words
-        # survive in the page's free space until the file is rebuilt.
-        spilled = json.dumps({
-            "item_id": 42, "course_id": 101, "grade_display": "70.00",
-            "percentage": "70.00 %", "status": "graded",
-            "feedback": self.SPILLED + " " + "marking detail " * 200,
-        }, sort_keys=True)
-        self._write_old_shape(
-            cache_path, _FakeClient(feedback=self.OLD_TEXT),
-            extra_rows=[("grades", "101:42", "c" * 64, spilled)],
-        )
+        self._write_old_shape(cache_path, _FakeClient(feedback=self.OLD_TEXT))
+        self._plant_deleted_residue(cache_path)
         real_connect = sqlite3.connect
 
         class _RefusesToVacuum:
@@ -1055,15 +1084,8 @@ class TestStoredFeedbackScrub:
         """
         import sqlite3
 
-        spilled = json.dumps({
-            "item_id": 42, "course_id": 101, "grade_display": "70.00",
-            "percentage": "70.00 %", "status": "graded",
-            "feedback": self.SPILLED + " " + "marking detail " * 200,
-        }, sort_keys=True)
-        self._write_old_shape(
-            cache_path, _FakeClient(feedback=self.OLD_TEXT),
-            extra_rows=[("grades", "101:42", "c" * 64, spilled)],
-        )
+        self._write_old_shape(cache_path, _FakeClient(feedback=self.OLD_TEXT))
+        self._plant_deleted_residue(cache_path)
         real_connect = sqlite3.connect
 
         class _RefusesToVacuum:

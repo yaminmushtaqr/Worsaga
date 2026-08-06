@@ -127,6 +127,64 @@ class TestTextIndexStore:
             TextIndexStore(link)
         assert "symbolic link" in str(exc.value)
 
+    def test_deletes_are_secure_on_every_build(self, index_path):
+        """Freed course text is zeroed regardless of SQLite compile flags."""
+        with TextIndexStore(index_path) as store:
+            assert store._conn.execute(
+                "PRAGMA secure_delete"
+            ).fetchone()[0] == 1
+
+    def test_deleted_page_words_do_not_linger_in_the_file(self, index_path):
+        """Removing a document erases its words from the index bytes.
+
+        The core pragma covers what ordinary tables free; FTS5's own
+        secure-delete option is what makes the inverted index erase a
+        deleted page's entries instead of unlinking them behind a
+        marker. The assertion uses a stem-stable prefix, because the
+        porter tokenizer stores stemmed terms.
+        """
+        if sqlite3.sqlite_version_info < (3, 42, 0):
+            pytest.skip("FTS5 secure-delete arrived in SQLite 3.42")
+        with TextIndexStore(index_path) as store:
+            self._put(store, pages=[(1, "the zzyzxmarker appears once")])
+        assert b"zzyzxmark" in index_path.read_bytes()
+
+        with TextIndexStore(index_path) as store:
+            store.delete_missing(SITE, 1, keep_keys=set())
+        assert b"zzyzxmark" not in index_path.read_bytes()
+
+    def test_a_failed_secure_delete_setup_is_not_swallowed(
+        self, index_path, monkeypatch,
+    ):
+        """On SQLite that has the option, failing to set it must surface.
+
+        Swallowing the error would let deletions run with the lazy
+        behaviour while the changelog promises otherwise; only builds
+        without the option (before 3.42) may skip it.
+        """
+        if sqlite3.sqlite_version_info < (3, 42, 0):
+            pytest.skip("FTS5 secure-delete arrived in SQLite 3.42")
+        real_connect = sqlite3.connect
+
+        class _RefusesSecureDelete:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, *args):
+                if "secure-delete" in sql:
+                    raise sqlite3.OperationalError("database is locked")
+                return self._conn.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        monkeypatch.setattr(
+            sqlite3, "connect",
+            lambda *a, **kw: _RefusesSecureDelete(real_connect(*a, **kw)),
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            TextIndexStore(index_path)
+
     def _put(self, store, *, doc_key="1:doc", pages=None, meta=None,
              fingerprint="fp1"):
         store.upsert_document(

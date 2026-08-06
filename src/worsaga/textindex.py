@@ -193,6 +193,11 @@ class TextIndexStore:
         ensure_private_file(self.path)
         self._conn = sqlite3.connect(self.path, isolation_level=None)
         self._conn.execute("PRAGMA busy_timeout = 10000")
+        # Zero freed content at delete and update time on every SQLite
+        # build — re-indexing deletes rows of course text, and those
+        # words must not linger in page free space just because the
+        # platform's SQLite defaults secure_delete off.
+        self._conn.execute("PRAGMA secure_delete = ON")
         self._conn.executescript(_SCHEMA)
         try:
             self._conn.executescript(_FTS_SCHEMA)
@@ -203,6 +208,24 @@ class TextIndexStore:
                 "full-text search requires. Rebuild Python against a "
                 "SQLite with FTS5 enabled (the python.org builds have it)."
             ) from exc
+        # FTS5 removes deleted entries from its shadow tables lazily, so
+        # without this a removed page's words stay recoverable from the
+        # index structures the secure_delete pragma above never touches.
+        # Gated on the library version — the option landed in SQLite
+        # 3.42 — rather than by swallowing the error, because on a build
+        # that has it a failure here (a locked database, say) must
+        # surface instead of quietly downgrading deletes to the lazy
+        # behaviour. Persistent, but set on every open so an index
+        # created by an older Worsaga is covered too.
+        if sqlite3.sqlite_version_info >= (3, 42, 0):
+            try:
+                self._conn.execute(
+                    "INSERT INTO pages(pages, rank)"
+                    " VALUES ('secure-delete', 1)"
+                )
+            except BaseException:
+                self._conn.close()
+                raise
         self._conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
             ("schema_version", str(SCHEMA_VERSION)),

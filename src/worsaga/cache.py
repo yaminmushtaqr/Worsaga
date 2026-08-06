@@ -264,6 +264,13 @@ class CacheStore:
         ensure_private_file(self.path)
         self._conn = sqlite3.connect(self.path, isolation_level=None)
         self._conn.execute("PRAGMA busy_timeout = 10000")
+        # Zero freed content at delete and update time on every SQLite
+        # build. Debian and Ubuntu compile theirs with this already on;
+        # the builds bundled on Windows and macOS usually leave it off,
+        # and what the scrub below frees must not linger in page free
+        # space only on some platforms. Not retroactive: pages an older
+        # Worsaga freed still need the scrub's file rebuild.
+        self._conn.execute("PRAGMA secure_delete = ON")
         self._conn.executescript(_SCHEMA)
         self._conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",

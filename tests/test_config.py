@@ -179,9 +179,14 @@ class TestWriteConfig:
         mode = oct(dest.stat().st_mode & 0o777)
         assert mode == "0o600"
 
-    def test_write_config_does_not_crash_on_windows(self, tmp_path, monkeypatch):
-        """Simulates Windows (os.name == 'nt') — POSIX modes do not apply."""
-        monkeypatch.setattr(os, "name", "nt")
+    @pytest.mark.skipif(os.name != "nt", reason="runs on real Windows only")
+    def test_write_config_does_not_crash_on_windows(self, tmp_path):
+        """POSIX modes do not apply on Windows; the write must still land.
+
+        Runs only on real Windows: patching ``os.name`` on POSIX makes
+        ``pathlib`` pick ``WindowsPath``, which cannot be instantiated
+        there — the simulation crashes, not the code under test.
+        """
         dest = tmp_path / "config.json"
         result = MoodleConfig.write_config(url="https://x.com", token="t", path=dest)
         assert result == dest

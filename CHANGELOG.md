@@ -138,6 +138,22 @@ All notable changes to Worsaga are documented in this file.
   retried on a later open instead of being recorded as done while the
   words are still there.
 
+  The cache and the search index now also open with SQLite's
+  `secure_delete` on, so content a delete or an update frees is zeroed
+  the moment it is freed rather than left in the file's free space.
+  Debian and Ubuntu compile SQLite that way already; the builds bundled
+  on Windows and macOS usually do not, and whether scrubbed words linger
+  should not be a platform detail. The search index needs one step more,
+  because FTS5 removes deleted entries from its shadow tables lazily: on
+  SQLite 3.42 or newer the index also enables FTS5's own `secure-delete`
+  option, so a removed page's words leave the index when the page does.
+  On older SQLite that option does not exist, and deleted index entries
+  are unlinked but not erased until they are merged away — the index is
+  derived data, so deleting the file and running `worsaga index` again
+  rebuilds it clean. None of this is retroactive: it is the *cache's*
+  rebuild described above that clears pages an older Worsaga freed
+  there.
+
   Scrubbed rows are re-fingerprinted to the new shape at the same time, so
   the first sync after upgrading is a straight comparison: an unchanged
   gradebook reports nothing, a grade that moved is reported, and a
