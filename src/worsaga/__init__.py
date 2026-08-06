@@ -11,6 +11,7 @@ from worsaga.client import (
     IDENTITY_PARAMS,
     MAX_DOWNLOAD_BYTES,
     SELF_SCOPED_PARAMS,
+    OTHERS_PERSONAL_FUNCTIONS,
     DownloadError,
     MoodleClient,
     MoodleRateLimitedError,
@@ -88,10 +89,18 @@ from worsaga.textindex import (
 from worsaga.sync import (
     SYNC_CATEGORIES,
     SYNC_LOOKAHEAD_DAYS,
+    UNATTENDED_SYNC_CATEGORIES,
     get_recent_changes,
+    parse_sync_categories,
+    resolve_sync_categories,
     run_sync,
     sync_outcome,
 )
+from worsaga.notices import (
+    THIRD_PARTY_NOTICE,
+    announce_third_party_collection,
+)
+from worsaga.redact import redact_payload, redact_text
 from worsaga.synclock import SyncLock
 from worsaga.syncstate import FAILURE_CLASSES, OUTCOMES
 from worsaga.summaries import (
@@ -126,10 +135,14 @@ __all__ = [
     "SYNC_CATEGORIES",
     "SYNC_LOOKAHEAD_DAYS",
     "SyncLock",
+    "OTHERS_PERSONAL_FUNCTIONS",
+    "THIRD_PARTY_NOTICE",
+    "UNATTENDED_SYNC_CATEGORIES",
     "CacheStore",
     "TextIndexError",
     "TextIndexStore",
     "WeekNotFoundError",
+    "announce_third_party_collection",
     "autosync_status",
     "install_autosync",
     "notification_backend",
@@ -181,6 +194,10 @@ __all__ = [
     "normalize_grade_items",
     "normalize_messages",
     "normalize_notifications",
+    "parse_sync_categories",
+    "redact_payload",
+    "redact_text",
+    "resolve_sync_categories",
     "score_section_match",
     "search_course_content",
     "select_material",

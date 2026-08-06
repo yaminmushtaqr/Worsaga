@@ -95,8 +95,16 @@ from worsaga.autosync import (
     install_autosync,
     remove_autosync,
 )
+from worsaga.notices import announce_third_party_collection
 from worsaga.output import render_structured, truncate_cell, wants_structured
 from worsaga.principal import known_principal
+from worsaga.redact import (
+    RedactingStream,
+    install_log_redaction,
+    redact_payload,
+    remember_secret,
+    remove_log_redaction,
+)
 from worsaga.sections import (
     WeekNotFoundError,
     find_best_section,
@@ -115,7 +123,10 @@ from worsaga.textindex import (
 from worsaga.sync import (
     SYNC_CATEGORIES,
     SYNC_LOOKAHEAD_DAYS,
+    UNATTENDED_SYNC_CATEGORIES,
     get_recent_changes,
+    parse_sync_categories,
+    resolve_sync_categories,
     run_sync,
 )
 from worsaga.messages import get_messages as get_messages_data
@@ -136,6 +147,19 @@ def _non_negative_int(value: str) -> int:
     if number < 0:
         raise argparse.ArgumentTypeError("must be zero or a positive integer")
     return number
+
+
+def _sync_category_list(value: str) -> tuple[str, ...]:
+    """Parse ``--categories`` at argument time, naming the valid values.
+
+    Failing in argparse rather than inside the command means a typo costs
+    a usage message and no requests, instead of a run that quietly
+    collected the wrong thing.
+    """
+    try:
+        return parse_sync_categories(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -601,7 +625,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "grades, forum discussions — never file contents) into the "
             "local SQLite cache and report what changed since the last "
             "sync. The first sync establishes a baseline and reports no "
-            "changes. Tokens and authenticated URLs are never stored."
+            "changes. Tokens and authenticated URLs are never stored, and "
+            "instructor feedback text is reduced to a hash unless "
+            "--store-feedback says otherwise."
         ),
     )
     sy.add_argument(
@@ -611,13 +637,40 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Deadline look-ahead window in days (default: {SYNC_LOOKAHEAD_DAYS})",
     )
     sy.add_argument(
+        "--categories",
+        type=_sync_category_list,
+        default=None,
+        metavar="LIST",
+        help=(
+            "Comma-separated categories to collect, or 'all' "
+            f"({', '.join(SYNC_CATEGORIES)}). Default: all of them for a "
+            "foreground sync, and "
+            f"{','.join(UNATTENDED_SYNC_CATEGORIES)} for --unattended "
+            "(forums are other people's writing, so a run nobody is "
+            "watching leaves them alone). WORSAGA_SYNC_CATEGORIES sets a "
+            "persistent default"
+        ),
+    )
+    sy.add_argument(
+        "--store-feedback",
+        action="store_true",
+        help=(
+            "Also keep the full text of instructor feedback in the local "
+            "cache. Off by default: only whether feedback exists and a "
+            "hash of it are stored, which is enough to detect a change "
+            "without keeping the words. 'worsaga grades' always shows the "
+            "full text - it reads it live"
+        ),
+    )
+    sy.add_argument(
         "--unattended",
         action="store_true",
         help=(
             "Mark this run as one nobody is watching (used by the scheduled "
-            "auto-sync). Such a run stops before making any request while "
-            "the credential circuit breaker is open; a normal foreground "
-            "sync always tries, and a successful one closes the breaker."
+            "auto-sync). Such a run collects the narrower default set and "
+            "stops before making any request while the credential circuit "
+            "breaker is open; a normal foreground sync always tries, and a "
+            "successful one closes the breaker."
         ),
     )
 
@@ -667,6 +720,18 @@ def _build_parser() -> argparse.ArgumentParser:
     wt.add_argument(
         "--days", type=int, default=SYNC_LOOKAHEAD_DAYS,
         help=f"Deadline look-ahead window in days (default: {SYNC_LOOKAHEAD_DAYS})",
+    )
+    wt.add_argument(
+        "--categories", type=_sync_category_list, default=None, metavar="LIST",
+        help=(
+            "Comma-separated categories each cycle collects, or 'all'. "
+            f"Default: {','.join(UNATTENDED_SYNC_CATEGORIES)} - a watch "
+            "loop is unattended, so it leaves forums alone unless asked"
+        ),
+    )
+    wt.add_argument(
+        "--store-feedback", action="store_true",
+        help="Also keep the full text of instructor feedback in the cache",
     )
 
     au = sub.add_parser(
@@ -783,14 +848,22 @@ def _apply_token_source(
     args.token_from_stdin = bool(from_stdin)
     if from_stdin:
         args.token = _read_token_from_stdin()
-        return
-    if in_argv:
+    elif in_argv:
         print(
             "Warning: --token puts your Moodle token in the command line, "
             "where shell history and process listings can expose it. Use "
             "WORSAGA_TOKEN, a credentials file, or --token-stdin instead.",
             file=sys.stderr,
         )
+    # Arm the output redactor from every command-line source, including
+    # the stdin one. Config-supplied tokens register themselves when
+    # MoodleConfig is built, but a token given here may never reach one —
+    # a command that fails before it builds a client still prints an
+    # error, and 'worsaga setup' writes the file without building one at
+    # all. --token-stdin used to return before this loop, which left the
+    # most private input path as the only one whose token could print.
+    for name in ("token", "setup_token"):
+        remember_secret(getattr(args, name, None))
 
 
 def _client(args: argparse.Namespace) -> MoodleClient:
@@ -812,17 +885,38 @@ def _client(args: argparse.Namespace) -> MoodleClient:
 
 
 def _emit_data(args: argparse.Namespace, payload) -> bool:
-    """Print JSON/YAML payload when requested, returning whether it did."""
+    """Print JSON/YAML payload when requested, returning whether it did.
+
+    The payload is redacted on the way out. The stream wrapper installed
+    by :func:`main` would catch a token in the rendered text anyway; doing
+    it to the structure as well means the redaction survives however the
+    renderer decides to escape things — a token inside a JSON string is
+    ``\\u0074...``-escapable, and a wrapper matching raw characters would
+    not see it.
+    """
     if not wants_structured(args):
         return False
     print(
         render_structured(
-            payload,
+            redact_payload(payload),
             json_mode=getattr(args, "json", False),
             yaml_mode=getattr(args, "yaml", False),
         )
     )
     return True
+
+
+def _announce_third_party(args: argparse.Namespace, client: MoodleClient) -> None:
+    """Show the one-time third-party-content notice for this site.
+
+    Called by every command that reads what other people wrote. Demo mode
+    and ``-q`` suppress it; see :mod:`worsaga.notices`.
+    """
+    announce_third_party_collection(
+        client.base_url,
+        is_demo=_demo_mode(args),
+        quiet=bool(getattr(args, "quiet", False)),
+    )
 
 
 def _progress_reporter(args: argparse.Namespace):
@@ -1136,6 +1230,7 @@ def cmd_assignments(args: argparse.Namespace) -> None:
 
 def cmd_forums(args: argparse.Namespace) -> None:
     client = _client(args)
+    _announce_third_party(args, client)
     course_id = _resolve_course_id(client, args.course)
     forums = get_course_forums_data(client, course_id)
     if _emit_data(args, forums):
@@ -1158,6 +1253,7 @@ def cmd_forums(args: argparse.Namespace) -> None:
 
 def cmd_forum(args: argparse.Namespace) -> None:
     client = _client(args)
+    _announce_third_party(args, client)
     course_id = _resolve_course_id(client, args.course)
     if args.action != "latest":
         raise ValueError(f"unknown forum action: {args.action}")
@@ -1184,6 +1280,7 @@ def cmd_forum(args: argparse.Namespace) -> None:
 
 def cmd_updates(args: argparse.Namespace) -> None:
     client = _client(args)
+    _announce_third_party(args, client)
     course_id = _resolve_course_id(client, args.course) if args.course else None
     since_days = _since_to_days(args.since, default_days=7)
     updates = get_latest_updates_data(
@@ -1211,6 +1308,7 @@ def cmd_updates(args: argparse.Namespace) -> None:
 
 def cmd_notifications(args: argparse.Namespace) -> None:
     client = _client(args)
+    _announce_third_party(args, client)
     notifications = get_notifications_data(
         client,
         unread_only=getattr(args, "unread_only", False),
@@ -1235,6 +1333,7 @@ def cmd_notifications(args: argparse.Namespace) -> None:
 
 def cmd_inbox(args: argparse.Namespace) -> None:
     client = _client(args)
+    _announce_third_party(args, client)
     since_days = _since_to_days(args.since, default_days=0) if args.since else None
     messages = get_messages_data(client, since_days=since_days)
     if _emit_data(args, messages):
@@ -1257,6 +1356,9 @@ def cmd_inbox(args: argparse.Namespace) -> None:
 
 def cmd_digest(args: argparse.Namespace) -> None:
     client = _client(args)
+    # The digest folds forum updates, notifications, and messages in with
+    # the user's own deadlines and assignments.
+    _announce_third_party(args, client)
     since_days = _since_to_days(args.since, default_days=1)
     digest = get_digest_data(
         client, since_days=since_days, on_progress=_progress_reporter(args),
@@ -1784,11 +1886,21 @@ def _fail_sync(result: dict) -> None:
 
 def cmd_sync(args: argparse.Namespace) -> None:
     client = _client(args)
+    unattended = bool(getattr(args, "unattended", False))
+    # Resolved here as well as inside run_sync so the notice can be
+    # decided before the run starts. Both calls are pure and agree.
+    selected = resolve_sync_categories(
+        getattr(args, "categories", None), unattended=unattended,
+    )
+    if "forums" in selected:
+        _announce_third_party(args, client)
     if not args.quiet and not wants_structured(args):
         print("Syncing metadata (nothing is downloaded)...", file=sys.stderr)
     result = run_sync(
         client, lookahead_days=args.days, on_progress=_progress_reporter(args),
-        unattended=getattr(args, "unattended", False),
+        unattended=unattended,
+        categories=selected,
+        store_feedback=True if getattr(args, "store_feedback", False) else None,
     )
     outcome = result.get("outcome", "success")
 
@@ -1810,6 +1922,12 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
     print(f"Synced {result['site']}")
     for name, stats in result["categories"].items():
+        if not stats.get("selected", True):
+            # Deliberately not collected. Said plainly so it never reads
+            # as a category that failed: the cached rows for it are
+            # untouched, not stale-and-pretending.
+            print(f"  {name:<10}  (not selected - use --categories to include it)")
+            continue
         if not stats["synced"]:
             print(f"  {name:<10}  (skipped - fetch failed, see warnings)")
             continue
@@ -1822,6 +1940,11 @@ def cmd_sync(args: argparse.Namespace) -> None:
             notes.append(f"{stats['updated']} updated")
         if stats["adopted"]:
             notes.append(f"{stats['adopted']} adopted (newly visible course)")
+        if stats.get("migrated"):
+            notes.append(
+                f"{stats['migrated']} re-fingerprinted (storage format "
+                "changed, not Moodle)"
+            )
         note_text = f"  ({', '.join(notes)})" if notes else ""
         print(f"  {name:<10}  {stats['items']:>4} items{note_text}")
 
@@ -1869,6 +1992,13 @@ def cmd_watch(args: argparse.Namespace) -> None:
     requested = parse_interval(args.interval, default=DEFAULT_WATCH_INTERVAL)
     interval = max(MIN_WATCH_INTERVAL, requested)
     structured = wants_structured(args)
+    # A watch loop is unattended by definition, so it takes the narrower
+    # default; --categories forums,... opts back in for every cycle.
+    selected = resolve_sync_categories(
+        getattr(args, "categories", None), unattended=True,
+    )
+    if "forums" in selected:
+        _announce_third_party(args, client)
 
     if requested < MIN_WATCH_INTERVAL and not structured and not args.quiet:
         # A below-floor request is honoured but clamped; say so rather than
@@ -1963,6 +2093,10 @@ def cmd_watch(args: argparse.Namespace) -> None:
             max_cycles=args.cycles,
             notify=not args.no_notify,
             lookahead_days=args.days,
+            categories=selected,
+            store_feedback=(
+                True if getattr(args, "store_feedback", False) else None
+            ),
             on_cycle=_on_cycle,
             on_cycle_start=_on_cycle_start,
             on_progress=_progress_reporter(args),
@@ -2394,8 +2528,51 @@ def _reconfigure_streams() -> None:
             pass
 
 
+def _redact_streams() -> tuple[tuple, tuple]:
+    """Wrap stdout/stderr so nothing leaves this process carrying a token.
+
+    Returns ``(originals, wrappers)`` — the originals for the caller to
+    restore, the wrappers so it can drain whatever they are still holding
+    (see :class:`worsaga.redact._HoldingRedactor`). Installed for the
+    whole command rather than at each print site, because "the boundary
+    redacts" is a property that survives the next feature and "every
+    print remembered to" is not.
+
+    Also arms the redactor from ``WORSAGA_TOKEN`` and attaches the
+    logging filter, so a warning logged by an orchestrator — which reaches
+    stderr through a handler, not through ``print`` — is covered by the
+    same rule.
+    """
+    remember_secret(os.environ.get("WORSAGA_TOKEN", ""))
+    install_log_redaction()
+    original = (sys.stdout, sys.stderr)
+    wrappers = (RedactingStream(sys.stdout), RedactingStream(sys.stderr))
+    sys.stdout, sys.stderr = wrappers
+    return original, wrappers
+
+
 def main(argv: list[str] | None = None) -> None:
     _reconfigure_streams()
+    original_streams, wrappers = _redact_streams()
+    try:
+        _main(argv)
+    finally:
+        # Runs on the normal path, on SystemExit from every sys.exit
+        # below, and on KeyboardInterrupt. Draining first: the wrappers
+        # hold back a tail that could be half a secret, and output the
+        # command produced must not be lost to that. Restoring after: a
+        # wrapper left installed would outlive the command in any host
+        # that calls main() more than once (the test suite does).
+        for wrapper in wrappers:
+            try:
+                wrapper.flush()
+            except (OSError, ValueError):
+                pass
+        sys.stdout, sys.stderr = original_streams
+        remove_log_redaction()
+
+
+def _main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
 

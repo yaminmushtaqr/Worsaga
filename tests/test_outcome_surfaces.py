@@ -351,8 +351,12 @@ class TestMcpToolsReportRateLimiting:
         import re
         from pathlib import Path
 
+        from worsaga import mcp_server as server
+
         source = Path("src/worsaga/mcp_server.py").read_text(encoding="utf-8")
         # A tool added with a bare @mcp.tool() would silently opt out of
-        # the whole contract, so the shape is asserted, not assumed.
+        # the whole contract — rate-limit shaping, redaction, and the
+        # capability profile — so the shape is asserted, not assumed.
         assert "@mcp.tool()" not in source
-        assert len(re.findall(r"^@tool\(\)$", source, re.M)) == 26
+        assert len(re.findall(r"^@tool\($", source, re.M)) == 26
+        assert len(server.ALL_TOOLS) == 26

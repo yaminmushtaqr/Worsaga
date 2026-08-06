@@ -9,6 +9,7 @@ from typing import Any
 from worsaga.client import MoodleClient
 from worsaga.materials import match_section
 from worsaga.models import as_int, clean_text
+from worsaga.redact import redact_url
 from worsaga.time_utils import timestamp_to_display, timestamp_to_iso
 
 
@@ -26,7 +27,12 @@ _WEEK_EVENT_LABELS = (
 
 
 def normalize_calendar_events(payload: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
-    """Normalize Moodle calendar payloads."""
+    """Normalize Moodle calendar payloads.
+
+    ``view_url`` is Moodle's own event link, copied through verbatim, so
+    it is redacted here: an event action URL is one of the few fields the
+    site can hand back with a credential parameter attached.
+    """
     events = payload.get("events", []) if isinstance(payload, dict) else payload
     records: list[dict[str, Any]] = []
     for event in events if isinstance(events, list) else []:
@@ -44,7 +50,7 @@ def normalize_calendar_events(payload: dict[str, Any] | list[Any]) -> list[dict[
             "start_str": timestamp_to_display(start_at),
             "duration": as_int(event.get("timeduration"), 0) or 0,
             "source": "calendar",
-            "view_url": str(event.get("url") or event.get("viewurl") or ""),
+            "view_url": redact_url(event.get("url") or event.get("viewurl")),
         })
     records.sort(key=lambda r: r["start_at"] or 0)
     return records

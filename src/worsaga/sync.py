@@ -23,19 +23,43 @@ Correctness rules:
   (``last_seen_at`` stops advancing) — removal events are out of scope.
 - The diff/write phase runs inside a ``BEGIN IMMEDIATE`` transaction,
   so concurrent syncs serialize instead of recording duplicate events.
-- Every run reports an ``outcome``: ``success`` (every category synced),
-  ``partial`` (some did), ``failed`` (none did — including the run that is
-  refused before it starts because the cache belongs to another account),
-  or ``skipped`` (another process held the sync lock, so this run made no
-  requests at all). Callers branch on that rather than inferring health
-  from an empty change list: a sync that fetched nothing used to look
-  exactly like a sync that found nothing new.
+- Every run reports an ``outcome``: ``success`` (every *selected*
+  category synced), ``partial`` (some did), ``failed`` (none did —
+  including the run that is refused before it starts because the cache
+  belongs to another account), or ``skipped`` (another process held the
+  sync lock, so this run made no requests at all). Callers branch on that
+  rather than inferring health from an empty change list: a sync that
+  fetched nothing used to look exactly like a sync that found nothing new.
+- A category the run did not *select* is not a category that failed.
+  Unselected categories are reported with ``selected: false``, are left
+  out of the outcome entirely, and have their cached rows, their category
+  state, and their change history left exactly as they were — no
+  tombstones, no "disappeared" events, no reset baseline. Re-enabling one
+  later resumes the diff from where it stopped.
 - One sync per site at a time, enforced across processes by
   :mod:`worsaga.synclock`, so a ``watch`` loop and a scheduled run cannot
   fetch every course twice at once.
 - Unattended runs consult the circuit breaker in :mod:`worsaga.syncstate`
   first: after repeated authentication failures they stop before touching
   the network until a foreground sync succeeds.
+
+What a run collects
+-------------------
+Two data-minimisation defaults sit here rather than at the surfaces, so
+the CLI, the MCP server, ``watch``, and the scheduled auto-sync cannot
+disagree about them:
+
+- **Forums are not collected by an unattended run.** A forum discussion
+  is other people's writing, and a scheduled job accumulating it in the
+  background is a different proposition from a student opening
+  ``worsaga updates``. ``deadlines``, ``files``, and ``grades`` are the
+  unattended default; a foreground ``worsaga sync`` still collects all
+  four. Either way ``--categories`` (``WORSAGA_SYNC_CATEGORIES``) decides.
+- **Instructor feedback text is never persisted** unless it is explicitly
+  asked for. The cache keeps ``feedback_present`` and a truncated
+  ``feedback_hash`` so a feedback-only change is still detected, and the
+  full text stays where it was always fine: the live ``worsaga grades``
+  view, which fetches and prints it without storing anything.
 
 Shared by the CLI (``worsaga sync`` / ``worsaga changes``) and the MCP
 server (``sync_now`` / ``get_changes``). Tokens and authenticated URLs
@@ -47,9 +71,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from worsaga.cache import CacheStore, default_cache_path
 from worsaga.client import MoodleClient, MoodleWriteAttemptError
@@ -73,7 +99,112 @@ logger = logging.getLogger(__name__)
 
 SYNC_LOOKAHEAD_DAYS = 60
 
+#: Every category a sync knows how to collect, in collection order.
 SYNC_CATEGORIES = ("deadlines", "files", "grades", "forums")
+
+#: What a run nobody is watching collects by default — a ``watch`` cycle
+#: or the scheduled auto-sync. ``forums`` is deliberately absent: it is
+#: the one category made of other people's writing, and quietly
+#: accumulating it in the background is not a default anyone asked for.
+#: Opt back in with ``--categories`` or ``WORSAGA_SYNC_CATEGORIES``.
+UNATTENDED_SYNC_CATEGORIES = ("deadlines", "files", "grades")
+
+#: Persistent default for both foreground and unattended runs, overriding
+#: the built-ins above. Comma-separated category names, or ``all``.
+SYNC_CATEGORIES_ENV = "WORSAGA_SYNC_CATEGORIES"
+
+#: Opt in to persisting full instructor feedback text in the local cache.
+#: Off by default everywhere; see :func:`resolve_store_feedback`.
+STORE_FEEDBACK_ENV = "WORSAGA_SYNC_STORE_FEEDBACK"
+
+#: Hex characters kept from the feedback digest. Sixty-four bits is far
+#: more than change detection over one person's gradebook needs, and a
+#: short digest is a worse oracle for confirming a guess at the text than
+#: a full one would be.
+FEEDBACK_HASH_CHARS = 16
+
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _env_flag(name: str) -> bool:
+    """Return whether environment variable *name* is set to a true value."""
+    return os.environ.get(name, "").strip().lower() in _TRUE_VALUES
+
+
+def parse_sync_categories(value: str | Sequence[str]) -> tuple[str, ...]:
+    """Return the validated, canonically ordered categories *value* names.
+
+    Accepts a comma-separated string (``"deadlines,grades"``), a sequence
+    of names, or the literal ``all``. Names are case-insensitive and
+    de-duplicated, and the result is always in :data:`SYNC_CATEGORIES`
+    order so a selection reads the same however it was written.
+
+    Raises :class:`ValueError` naming the valid categories for an unknown
+    name or an empty selection. A privacy control that silently ignores
+    what it was told is worse than one that refuses to start.
+    """
+    if not isinstance(value, str):
+        value = ",".join(str(item) for item in value)
+    text = value.strip()
+    if text.lower() == "all":
+        return SYNC_CATEGORIES
+    names = [part.strip().lower() for part in text.split(",")]
+    names = [name for name in names if name]
+    valid = f"Valid categories: {', '.join(SYNC_CATEGORIES)} (or 'all')."
+    if not names:
+        raise ValueError(f"no sync categories were named. {valid}")
+    unknown = [name for name in names if name not in SYNC_CATEGORIES]
+    if unknown:
+        raise ValueError(
+            f"unknown sync category '{unknown[0]}'. {valid}"
+        )
+    chosen = set(names)
+    return tuple(name for name in SYNC_CATEGORIES if name in chosen)
+
+
+def resolve_sync_categories(
+    categories: str | Sequence[str] | None = None,
+    *,
+    unattended: bool = False,
+) -> tuple[str, ...]:
+    """Return the categories a run should collect.
+
+    Precedence: an explicit *categories* argument (the ``--categories``
+    option, the MCP ``categories`` parameter), then
+    ``WORSAGA_SYNC_CATEGORIES``, then the built-in default —
+    :data:`UNATTENDED_SYNC_CATEGORIES` for a run nobody is watching and
+    :data:`SYNC_CATEGORIES` for a foreground one.
+    """
+    if categories is not None:
+        return parse_sync_categories(categories)
+    from_env = os.environ.get(SYNC_CATEGORIES_ENV, "").strip()
+    if from_env:
+        return parse_sync_categories(from_env)
+    return UNATTENDED_SYNC_CATEGORIES if unattended else SYNC_CATEGORIES
+
+
+def resolve_store_feedback(store_feedback: bool | None = None) -> bool:
+    """Return whether this run may persist full instructor feedback text.
+
+    ``False`` unless explicitly asked for, in every mode — foreground and
+    unattended alike. The brief only requires unattended runs to minimise,
+    but there is no run for which storing the text is *needed*: the live
+    ``worsaga grades`` view fetches and prints it without the cache, and
+    change detection works from the hash. So the opt-in
+    (``--store-feedback`` / ``WORSAGA_SYNC_STORE_FEEDBACK``) is the only
+    way the text reaches disk, and it is honoured wherever it is given —
+    silently ignoring a setting the user deliberately turned on would be
+    its own kind of surprise.
+    """
+    if store_feedback is not None:
+        return bool(store_feedback)
+    return _env_flag(STORE_FEEDBACK_ENV)
+
+
+#: A fingerprint written before the shape was versioned: a bare SHA-256
+#: hex digest and nothing else. Matched exactly, so a truncated, empty, or
+#: differently-tagged value is classified as unknown rather than guessed at.
+_BARE_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _fingerprint(payload: dict[str, Any], fields: tuple[str, ...]) -> str:
@@ -81,6 +212,41 @@ def _fingerprint(payload: dict[str, Any], fields: tuple[str, ...]) -> str:
     data = {field: payload.get(field) for field in fields}
     text = json.dumps(data, sort_keys=True, default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def feedback_hash(feedback: Any) -> str:
+    """Return the stored stand-in for one grade item's feedback text.
+
+    Empty for no feedback, otherwise the leading
+    :data:`FEEDBACK_HASH_CHARS` of its SHA-256. Two runs that see the same
+    words produce the same value, so a feedback-only edit is still a
+    detected grade change — without the words themselves ever reaching the
+    cache, the change log, or a change event replayed to an agent.
+    """
+    text = str(feedback or "")
+    if not text:
+        return ""
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return digest[:FEEDBACK_HASH_CHARS]
+
+
+def _prepare_grade(
+    payload: dict[str, Any], *, store_feedback: bool,
+) -> dict[str, Any]:
+    """Return a grade payload with feedback reduced to presence and a hash.
+
+    The two derived fields are added in *both* modes so the fingerprint
+    means the same thing whichever way a run was invoked: turning the
+    opt-in on or off changes what is stored, never whether every grade
+    suddenly looks changed.
+    """
+    prepared = dict(payload)
+    text = str(payload.get("feedback") or "")
+    prepared["feedback_present"] = bool(text)
+    prepared["feedback_hash"] = feedback_hash(text)
+    if not store_feedback:
+        prepared.pop("feedback", None)
+    return prepared
 
 
 class _Category:
@@ -91,6 +257,8 @@ class _Category:
         name: str,
         *,
         fingerprint_fields: tuple[str, ...],
+        fingerprint_version: int = 1,
+        migration_fields: tuple[str, ...] = (),
         extra_diff_fields: tuple[str, ...] = (),
         new_kind: str,
         updated_kind: str,
@@ -99,9 +267,12 @@ class _Category:
         course_fn: Callable[[dict[str, Any]], tuple[int | None, str]],
         scope_fn: Callable[[dict[str, Any]], Any] | None = None,
         new_item_is_change: Callable[[dict[str, Any]], bool] = lambda payload: True,
+        prepare_fn: Callable[..., dict[str, Any]] | None = None,
     ):
         self.name = name
         self.fingerprint_fields = fingerprint_fields
+        self.fingerprint_version = fingerprint_version
+        self.migration_fields = migration_fields
         # Every fingerprinted field appears in before/after so no change
         # is opaque (e.g. a feedback-only grade change must be visible).
         self.diff_fields = fingerprint_fields + tuple(
@@ -115,9 +286,73 @@ class _Category:
         self.course_fn = course_fn
         self.scope_fn = scope_fn
         self.new_item_is_change = new_item_is_change
+        self.prepare_fn = prepare_fn
+
+    def prepare(
+        self, payload: dict[str, Any], *, store_feedback: bool,
+    ) -> dict[str, Any]:
+        """Return the payload as it should be diffed, stored, and reported."""
+        if self.prepare_fn is None:
+            return payload
+        return self.prepare_fn(payload, store_feedback=store_feedback)
 
     def fingerprint(self, payload: dict[str, Any]) -> str:
-        return _fingerprint(payload, self.fingerprint_fields)
+        """Return the stored fingerprint, tagged when the shape has moved on.
+
+        Version 1 is the original bare hex digest, kept exactly as it was
+        so the three categories that never changed shape do not all look
+        modified. A category that *has* changed which fields it
+        fingerprints carries a ``v<n>:`` prefix, which is what lets
+        :meth:`is_current_fingerprint` recognise a row written by an
+        older Worsaga instead of reporting it as a change.
+        """
+        digest = _fingerprint(payload, self.fingerprint_fields)
+        if self.fingerprint_version <= 1:
+            return digest
+        return f"v{self.fingerprint_version}:{digest}"
+
+    def fingerprint_state(self, value: Any) -> str:
+        """Classify a stored fingerprint: ``current``, ``legacy``, ``unknown``.
+
+        Three states, not two, because "not the current shape" covers two
+        very different situations. A **legacy** value is one this version
+        knows how to reason about — the bare 64-character hex digest every
+        Worsaga wrote before the shape was versioned — so its payload can
+        be compared field by field to see whether anything *actually*
+        changed. An **unknown** value (empty, truncated, or tagged with a
+        version this build has never heard of, such as a row written by a
+        newer Worsaga and then opened by an older one) cannot be reasoned
+        about at all: it is adopted silently, because guessing would mean
+        either a change storm or a fabricated diff.
+        """
+        text = str(value or "")
+        if text.startswith(f"v{self.fingerprint_version}:"):
+            return "current"
+        if self.fingerprint_version <= 1:
+            # This category has never changed shape, so anything stored is
+            # by definition the current shape.
+            return "current"
+        if _BARE_DIGEST_RE.fullmatch(text):
+            return "legacy"
+        return "unknown"
+
+    def migration_changed(
+        self, before: dict[str, Any] | None, after: dict[str, Any],
+    ) -> bool:
+        """Whether a migrating item also changed in a way worth reporting.
+
+        Compares only :attr:`migration_fields` — the fields whose meaning
+        did not move between fingerprint versions. Migration and a real
+        change are not mutually exclusive: a grade that went from 70 to 80
+        on the same run that re-fingerprinted it is still news, and
+        adopting the whole row silently would swallow it.
+        """
+        if not self.migration_fields or before is None:
+            return False
+        return any(
+            before.get(field) != after.get(field)
+            for field in self.migration_fields
+        )
 
     def diff_view(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
         if payload is None:
@@ -148,7 +383,25 @@ _CATEGORIES = {
     ),
     "grades": _Category(
         "grades",
-        fingerprint_fields=("grade_display", "percentage", "status", "feedback"),
+        # ``feedback_hash`` stands in for the instructor's words: a
+        # feedback-only edit still changes the fingerprint, but neither the
+        # items table nor a change event ever holds the text. Bumping the
+        # version is what stops the field swap from reporting every grade
+        # in an existing cache as updated exactly once.
+        fingerprint_fields=(
+            "grade_display", "percentage", "status", "feedback_hash",
+        ),
+        fingerprint_version=2,
+        # The fields whose meaning is identical either side of the shape
+        # change, so a migrating row can still be judged. Deliberately
+        # excludes anything feedback-derived: the old row has the text and
+        # the new one has a hash, which are not comparable and would make
+        # every migration look like a change.
+        migration_fields=(
+            "grade_display", "percentage", "status", "graded", "graded_at",
+        ),
+        extra_diff_fields=("feedback_present",),
+        prepare_fn=_prepare_grade,
         new_kind="grade_updated",
         updated_kind="grade_updated",
         key_fn=lambda g: f"{g.get('course_id')}:{g.get('item_id') or g.get('item_name')}",
@@ -296,18 +549,24 @@ def collect_snapshots(
     *,
     lookahead_days: int = SYNC_LOOKAHEAD_DAYS,
     on_progress: ProgressCallback | None = None,
+    categories: Sequence[str] | None = None,
 ) -> tuple[
     dict[str, list[dict[str, Any]] | None],
     dict[str, list[Any] | None],
     list[str],
 ]:
-    """Fetch the metadata-only snapshot for every sync category.
+    """Fetch the metadata-only snapshot for every selected sync category.
 
     Returns ``(snapshots, scopes, warnings)``. A category whose fetch
     failed is ``None`` in *snapshots* with a matching entry in
-    *warnings*. ``scopes`` records per-category coverage where partial
-    success is tolerated (grades: the course ids whose gradebooks were
-    actually readable); ``None`` scope means full coverage.
+    *warnings*; a category that was not selected is **absent** from
+    *snapshots* altogether, because ``None`` already means "tried and
+    failed" and the two must never be confused. *categories* defaults to
+    all of them.
+
+    ``scopes`` records per-category coverage where partial success is
+    tolerated (grades: the course ids whose gradebooks were actually
+    readable); ``None`` scope means full coverage.
 
     ``on_progress`` (default silent) receives per-course/per-forum progress
     from the grades, files, and forums fan-outs, each label prefixed with
@@ -315,6 +574,7 @@ def collect_snapshots(
     """
     snapshots, scopes, warnings, _ = _collect_snapshots(
         client, lookahead_days=lookahead_days, on_progress=on_progress,
+        categories=categories,
     )
     return snapshots, scopes, warnings
 
@@ -325,6 +585,7 @@ def _collect_snapshots(
     lookahead_days: int = SYNC_LOOKAHEAD_DAYS,
     on_progress: ProgressCallback | None = None,
     heartbeat: Callable[[], None] | None = None,
+    categories: Sequence[str] | None = None,
 ) -> tuple[
     dict[str, list[dict[str, Any]] | None],
     dict[str, list[Any] | None],
@@ -349,10 +610,17 @@ def _collect_snapshots(
     ``heartbeat`` (when given) is called at each category boundary. It is
     how :class:`worsaga.synclock.SyncLock` says the owner is still working
     on a platform that can only judge abandonment by age.
+
+    An unselected category costs nothing here: its fetch is not attempted,
+    so no request is made for it and it contributes no warning and no
+    failure class.
     """
+    selected = tuple(
+        SYNC_CATEGORIES if categories is None else categories
+    )
     warnings: list[str] = []
     failures: list[str] = []
-    scopes: dict[str, list[Any] | None] = {name: None for name in SYNC_CATEGORIES}
+    scopes: dict[str, list[Any] | None] = {name: None for name in selected}
 
     def _phase(name: str) -> ProgressCallback | None:
         if on_progress is None:
@@ -374,7 +642,7 @@ def _collect_snapshots(
         warnings.append(f"courses: {exc}")
         failures.append(classify_failure(exc))
         return (
-            {name: None for name in SYNC_CATEGORIES}, scopes, warnings, failures,
+            {name: None for name in selected}, scopes, warnings, failures,
         )
 
     course_ids = [c["id"] for c in courses if c.get("id")]
@@ -386,7 +654,7 @@ def _collect_snapshots(
             client, courses=courses, on_progress=_phase("grades"),
         ),
         failures,
-    )
+    ) if "grades" in selected else None
     grades_snapshot: list[dict[str, Any]] | None = None
     if grades_result is not None:
         grades_snapshot = grades_result["grades"]
@@ -430,7 +698,7 @@ def _collect_snapshots(
             courses=courses,
         ),
         failures,
-    )
+    ) if "deadlines" in selected else None
     _beat()
     files_snapshot = _safe_fetch(
         "files", warnings,
@@ -438,7 +706,7 @@ def _collect_snapshots(
             client, courses=courses, on_progress=_phase("files"),
         ),
         failures,
-    )
+    ) if "files" in selected else None
     _beat()
     forums_snapshot = _safe_fetch(
         "forums", warnings,
@@ -446,19 +714,25 @@ def _collect_snapshots(
             client, courses=courses, on_progress=_phase("forums"),
         ),
         failures,
-    )
+    ) if "forums" in selected else None
     _beat()
 
     # files and forums are deliberately strict inside their fan-outs: one
     # failed course or forum propagates and lands the whole category in
     # _safe_fetch as None. There is no "swallowed every unit" edge to
     # guard there the way there is for grades.
-    snapshots: dict[str, list[dict[str, Any]] | None] = {
+    #
+    # Keyed on the selection, not on SYNC_CATEGORIES: an unselected
+    # category must be absent rather than None, or the caller would read
+    # "not collected" as "collection failed".
+    collected: dict[str, list[dict[str, Any]] | None] = {
         "deadlines": deadlines_snapshot,
         "files": files_snapshot,
         "grades": grades_snapshot,
         "forums": forums_snapshot,
     }
+    snapshots = {name: collected[name] for name in SYNC_CATEGORIES
+                 if name in selected}
     return snapshots, scopes, warnings, failures
 
 
@@ -469,19 +743,35 @@ def sync_outcome(categories: dict[str, Any]) -> str:
     a success, some is partial, none is a failure. A run that fetched
     nothing must never be reported the same way as a run that found
     nothing new.
+
+    Only *selected* categories count. A category the run deliberately did
+    not collect is not evidence about whether the site was reachable, so
+    counting it would turn every minimised run into a permanent
+    ``partial`` — and a permanent ``partial`` is a non-zero exit code, a
+    failed scheduled task, and eventually an ignored one. Entries without
+    a ``selected`` key are treated as selected, so a category map from an
+    older Worsaga (or a hand-built one in a test) reads exactly as before.
     """
-    if not categories:
+    considered = [
+        stats for stats in categories.values() if stats.get("selected", True)
+    ]
+    if not considered:
         return "failed"
-    synced = sum(1 for stats in categories.values() if stats.get("synced"))
-    if synced == len(categories):
+    synced = sum(1 for stats in considered if stats.get("synced"))
+    if synced == len(considered):
         return "success"
     return "partial" if synced else "failed"
 
 
-def _empty_categories() -> dict[str, Any]:
+def _empty_categories(
+    categories: Sequence[str] = SYNC_CATEGORIES,
+) -> dict[str, Any]:
+    """Return the per-category stats for a run that collected nothing."""
+    selected = set(categories)
     return {
-        name: {"synced": False, "items": 0, "new": 0, "updated": 0,
-               "adopted": 0, "baseline": False}
+        name: {"synced": False, "selected": name in selected, "items": 0,
+               "new": 0, "updated": 0, "adopted": 0, "migrated": 0,
+               "baseline": False}
         for name in SYNC_CATEGORIES
     }
 
@@ -504,6 +794,7 @@ def _no_run_result(
     cache_path: str | Path | None,
     outcome: str,
     warning: str,
+    categories: Sequence[str] = SYNC_CATEGORIES,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the result shape for a run that did not (or could not) go."""
@@ -511,7 +802,8 @@ def _no_run_result(
         "site": site,
         "synced_at": started_at,
         "outcome": outcome,
-        "categories": _empty_categories(),
+        "categories": _empty_categories(categories),
+        "selected_categories": list(categories),
         "changes": [],
         "warnings": [warning],
         "cache_path": _resolved_cache_path(cache_path),
@@ -529,6 +821,8 @@ def run_sync(
     now: int | None = None,
     on_progress: ProgressCallback | None = None,
     unattended: bool = False,
+    categories: str | Sequence[str] | None = None,
+    store_feedback: bool | None = None,
 ) -> dict[str, Any]:
     """Sync metadata into the local cache and return detected changes.
 
@@ -539,16 +833,28 @@ def run_sync(
 
     ``unattended=True`` marks a run nobody is watching — a ``watch`` cycle
     or the scheduled auto-sync. Those consult the credential circuit
-    breaker first and refuse to touch the network while it is open.
-    Foreground runs always attempt, because a successful one is what
-    closes the circuit.
+    breaker first and refuse to touch the network while it is open,
+    *and* collect the narrower :data:`UNATTENDED_SYNC_CATEGORIES` by
+    default. Foreground runs always attempt, because a successful one is
+    what closes the circuit.
+
+    ``categories`` overrides that default either way — a comma-separated
+    string or a sequence of names, validated by
+    :func:`parse_sync_categories`. ``store_feedback`` overrides
+    ``WORSAGA_SYNC_STORE_FEEDBACK``; see :func:`resolve_store_feedback`.
 
     The result always carries an ``outcome``: ``success``, ``partial``,
     ``failed``, or ``skipped`` (another process was already syncing this
-    site). ``skipped`` and circuit-refused runs make no requests at all.
+    site), plus ``selected_categories``. ``skipped`` and circuit-refused
+    runs make no requests at all.
     """
     started_at = int(time.time()) if now is None else int(now)
     site = client.base_url
+    # Resolved before anything else: an unusable selection is a
+    # configuration error, and one that has to surface before a run makes
+    # requests it may not have been allowed to make.
+    selected = resolve_sync_categories(categories, unattended=unattended)
+    keep_feedback = resolve_store_feedback(store_feedback)
     # Demo mode is offline and single-purpose: no lock file, no
     # cross-process state, nothing left behind on the user's machine.
     is_demo = bool(getattr(client, "is_demo", False))
@@ -566,6 +872,7 @@ def run_sync(
                 cache_path=cache_path,
                 outcome="failed",
                 warning=circuit_message(blocked),
+                categories=selected,
                 extra={
                     "circuit_open": True,
                     "failure_class": str(blocked.get("failure_class") or "auth"),
@@ -581,6 +888,7 @@ def run_sync(
             cache_path=cache_path,
             outcome="skipped",
             warning=lock.busy_message(),
+            categories=selected,
             extra={"skipped_reason": "sync_in_progress"},
         )
         record_outcome(site, "skipped", now=started_at)
@@ -597,6 +905,8 @@ def run_sync(
             on_progress=on_progress,
             is_demo=is_demo,
             heartbeat=None if lock is None else lock.touch,
+            selected=selected,
+            store_feedback=keep_feedback,
         )
     finally:
         # Always, including on MoodleWriteAttemptError and KeyboardInterrupt:
@@ -617,11 +927,13 @@ def _run_sync_locked(
     on_progress: ProgressCallback | None,
     is_demo: bool,
     heartbeat: Callable[[], None] | None = None,
+    selected: Sequence[str] = SYNC_CATEGORIES,
+    store_feedback: bool = False,
 ) -> dict[str, Any]:
     """Collect, diff, and write one sync run. The lock is already held."""
     snapshots, scopes, warnings, failures = _collect_snapshots(
         client, lookahead_days=lookahead_days, on_progress=on_progress,
-        heartbeat=heartbeat,
+        heartbeat=heartbeat, categories=selected,
     )
 
     def _finish(result: dict[str, Any]) -> dict[str, Any]:
@@ -673,16 +985,30 @@ def _run_sync_locked(
             return _finish({
                 "site": site,
                 "synced_at": started_at,
-                "categories": _empty_categories(),
+                "categories": _empty_categories(selected),
+                "selected_categories": list(selected),
                 "changes": [],
                 "warnings": warnings,
                 "cache_path": str(cache.path),
             })
         for name in SYNC_CATEGORIES:
+            if name not in snapshots:
+                # Not selected. Nothing is fetched, diffed, written, or
+                # expired: the cached rows, the category state, and the
+                # change history stay exactly as the last run that did
+                # collect this category left them, so re-enabling it later
+                # resumes from that baseline rather than re-reporting
+                # everything.
+                categories[name] = {"synced": False, "selected": False,
+                                    "items": 0, "new": 0, "updated": 0,
+                                    "adopted": 0, "migrated": 0,
+                                    "baseline": False}
+                continue
             snapshot = snapshots[name]
             if snapshot is None:
-                categories[name] = {"synced": False, "items": 0, "new": 0,
-                                    "updated": 0, "adopted": 0,
+                categories[name] = {"synced": False, "selected": True,
+                                    "items": 0, "new": 0, "updated": 0,
+                                    "adopted": 0, "migrated": 0,
                                     "baseline": False}
                 continue
 
@@ -692,9 +1018,12 @@ def _run_sync_locked(
             prior_scope = None if prior_state is None else prior_state["scope"]
             prior_scope_set = None if prior_scope is None else set(prior_scope)
             prior = cache.get_items(site, name)
-            new_count = updated_count = adopted_count = 0
+            new_count = updated_count = adopted_count = migrated_count = 0
 
-            for payload in snapshot:
+            for raw_payload in snapshot:
+                payload = spec.prepare(
+                    raw_payload, store_feedback=store_feedback,
+                )
                 item_key = spec.key_fn(payload)
                 fingerprint = spec.fingerprint(payload)
                 old = prior.get(item_key)
@@ -719,11 +1048,46 @@ def _run_sync_locked(
                         # reporting a spurious change.
                         adopted_count += 1
                 elif old is not None and old["fingerprint"] != fingerprint:
-                    updated_count += 1
-                    change = _build_change(
-                        spec, spec.updated_kind, payload,
-                        before=old["payload"], detected_at=started_at,
-                    )
+                    state = spec.fingerprint_state(old["fingerprint"])
+                    if state == "current":
+                        updated_count += 1
+                        change = _build_change(
+                            spec, spec.updated_kind, payload,
+                            before=old["payload"], detected_at=started_at,
+                        )
+                    elif state == "legacy":
+                        # The row was written by a Worsaga that
+                        # fingerprinted different fields, so the two hashes
+                        # are not comparable and the difference between
+                        # them says nothing about Moodle. Adopt the new
+                        # shape rather than announcing that every grade
+                        # changed the day the user upgraded — a report like
+                        # that teaches people to ignore reports.
+                        #
+                        # But adopt it *without* going blind: the fields
+                        # that mean the same thing either side of the
+                        # change are still comparable, so a grade that
+                        # really did move is reported on this run as well.
+                        # Migration and a real change are not alternatives.
+                        migrated_count += 1
+                        if spec.migration_changed(old["payload"], payload):
+                            updated_count += 1
+                            change = _build_change(
+                                spec, spec.updated_kind, payload,
+                                before=old["payload"], detected_at=started_at,
+                            )
+                    else:
+                        # Empty, truncated, or tagged with a version this
+                        # build does not know (a row written by a newer
+                        # Worsaga). Nothing about it can be compared, so it
+                        # is adopted quietly and noted for a debug log
+                        # rather than turned into a diff nobody can trust.
+                        migrated_count += 1
+                        logger.debug(
+                            "adopting an unrecognised %s fingerprint for %s "
+                            "on %s without reporting a change",
+                            name, item_key, site,
+                        )
 
                 if change is not None:
                     changes.append({**change, "category": name, "item_key": item_key})
@@ -738,10 +1102,12 @@ def _run_sync_locked(
             )
             categories[name] = {
                 "synced": True,
+                "selected": True,
                 "items": len(snapshot),
                 "new": new_count,
                 "updated": updated_count,
                 "adopted": adopted_count,
+                "migrated": migrated_count,
                 "baseline": baseline,
             }
 
@@ -755,6 +1121,7 @@ def _run_sync_locked(
         if outcome != "failed":
             cache.record_sync_run(site, started_at, finished_at, {
                 "categories": categories,
+                "selected_categories": list(selected),
                 "changes": len(changes),
                 "warnings": warnings,
                 "outcome": outcome,
@@ -766,6 +1133,7 @@ def _run_sync_locked(
         "site": site,
         "synced_at": started_at,
         "categories": categories,
+        "selected_categories": list(selected),
         "changes": changes,
         "warnings": warnings,
         "cache_path": resolved_path,
@@ -828,12 +1196,20 @@ def last_sync_at(
 
 
 __all__ = [
+    "FEEDBACK_HASH_CHARS",
+    "STORE_FEEDBACK_ENV",
     "SYNC_CATEGORIES",
+    "SYNC_CATEGORIES_ENV",
     "SYNC_LOOKAHEAD_DAYS",
+    "UNATTENDED_SYNC_CATEGORIES",
     "collect_snapshots",
     "default_cache_path",
+    "feedback_hash",
     "get_recent_changes",
     "last_sync_at",
+    "parse_sync_categories",
+    "resolve_store_feedback",
+    "resolve_sync_categories",
     "run_sync",
     "sync_outcome",
 ]

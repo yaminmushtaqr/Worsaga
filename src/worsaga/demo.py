@@ -507,10 +507,18 @@ def build_demo_dataset(now: int | None = None) -> dict:
 
     grades = {
         101: {"usergrades": [{"courseid": 101, "gradeitems": [
+            # Two items carry instructor feedback so the demo exercises the
+            # one piece of somebody else's writing that lives inside the
+            # user's own gradebook: shown in full by 'worsaga grades',
+            # reduced to a hash by the sync that caches it.
             grade_item(9101, "Problem Set 1", "68.00", "68.00 %",
-                       gradedategraded=at(-10, 14)),
+                       gradedategraded=at(-10, 14),
+                       feedback="Good use of the elasticity formula; "
+                                "show your working in Q3 next time."),
             grade_item(9102, "Problem Set 2", "72.00", "72.00 %",
-                       gradedategraded=at(-5, 16)),
+                       gradedategraded=at(-5, 16),
+                       feedback="Much clearer than the last set. "
+                                "Watch the units on the supply curve."),
             grade_item(9103, "Problem Set 3", "-", None),
             grade_item(9104, "Course total", "70.00", "70.00 %",
                        itemtype="course", itemmodule=None,

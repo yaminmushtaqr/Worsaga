@@ -16,6 +16,7 @@ from worsaga.textindex import (
     material_fingerprint,
     search_text_index,
 )
+from worsaga.redact import REDACTED
 
 SITE = "https://moodle.example.com"
 
@@ -213,7 +214,7 @@ class TestTextIndexStore:
         finally:
             conn.close()
         assert "SECRETVALUE" not in page_text
-        assert "token=REDACTED" in page_text
+        assert f"token={REDACTED}" in page_text
         assert "SECRETVALUE" not in view_url
 
     def test_stats(self, index_path):
@@ -391,7 +392,7 @@ class TestSafetyInvariants:
         result = build_text_index(client, index_path=index_path)
         text = json.dumps(result)
         assert "SECRET1234" not in text
-        assert "token=REDACTED" in text
+        assert f"token={REDACTED}" in text
 
 
 class TestCliSurface:

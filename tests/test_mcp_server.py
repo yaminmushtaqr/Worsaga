@@ -673,8 +673,25 @@ class TestFastMCPRegistration:
         )
 
     @pytest.mark.parametrize("name", TOOL_NAMES)
-    def test_tool_is_registered_with_fastmcp(self, name):
-        assert name in mcp_server.mcp._tool_manager._tools
+    def test_tool_is_registered_exactly_when_its_capability_is(self, name):
+        """Registration follows the capability profile, and nothing else.
+
+        A tool with no capability is always registered; a gated one is
+        registered if and only if its capability is active. The plain
+        Python function stays importable either way — the profile
+        controls the MCP surface, not this module's namespace.
+        """
+        gated_by = {
+            tool_name: capability
+            for capability, tool_names in mcp_server.MCP_CAPABILITIES.items()
+            for tool_name in tool_names
+        }
+        capability = gated_by.get(name)
+        expected = (
+            capability is None or capability in mcp_server.ACTIVE_CAPABILITIES
+        )
+        assert (name in mcp_server.mcp._tool_manager._tools) is expected
+        assert callable(getattr(mcp_server, name))
 
 
 # ── Week-not-found structured errors (MCP) ─────────────────────────
@@ -1264,13 +1281,26 @@ class TestGetConnectionInfo:
         assert "configured" in result["error"]
 
 
-def test_module_docstring_lists_every_registered_tool():
-    """The module docstring's tool enumeration must match tools/list exactly,
-    so the documented surface never drifts from the registered one."""
+def test_module_docstring_lists_the_default_profile():
+    """The docstring's default-profile list must match the tools that have
+    no capability, so the documented surface never drifts from the real one.
+
+    Asserted against the capability map rather than the live registry:
+    the registry depends on ``WORSAGA_MCP_CAPABILITIES`` in the
+    environment the suite happens to run in, and this invariant does not.
+    """
     import re
 
-    registered = set(mcp_server.mcp._tool_manager._tools)
+    gated = {
+        name
+        for names in mcp_server.MCP_CAPABILITIES.values()
+        for name in names
+    }
+    default_profile = {
+        name for name in mcp_server.ALL_TOOLS if name not in gated
+    }
     listed = set(re.findall(r"^ {4}- (\w+)$", mcp_server.__doc__ or "", re.M))
-    assert listed == registered
-    assert "get_connection_info" in registered
-    assert len(registered) == 26
+    assert listed == default_profile
+    assert "get_connection_info" in default_profile
+    assert len(mcp_server.ALL_TOOLS) == 26
+    assert len(default_profile) == 14

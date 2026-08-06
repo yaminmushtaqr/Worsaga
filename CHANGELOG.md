@@ -4,7 +4,129 @@ All notable changes to Worsaga are documented in this file.
 
 ## 0.8.2 (unreleased)
 
+### Changed
+
+- **Unattended syncs no longer collect forum discussions.** A forum
+  discussion is other people's writing, and a scheduled job accumulating it
+  in the background is a different proposition from a student opening
+  `worsaga updates`. `worsaga watch`, the scheduled auto-sync
+  (`worsaga sync --unattended`), and the MCP `sync_now()` now collect
+  `deadlines`, `files`, and `grades`. A foreground `worsaga sync` you typed
+  yourself still collects all four. New `--categories` (on `sync` and
+  `watch`, comma-separated or `all`) and `WORSAGA_SYNC_CATEGORIES` override
+  the default in either direction; `sync_now()` takes the same selector as a
+  `categories` string. An unknown name is refused before any request, naming
+  the valid values.
+
+  A category that was not selected is **not** a category that failed: it is
+  reported with `"selected": false` (printed as `(not selected)`), produces
+  no change events and no tombstones, leaves its cached rows and its
+  baseline untouched, and is excluded from the run's `outcome` — so a
+  minimised sync is a `success`, not a permanent `partial`. Re-enabling a
+  category later resumes the diff from where it stopped.
+- **Instructor feedback text is no longer written to the local cache.** The
+  sync stores `feedback_present` (a bool) and `feedback_hash` (a truncated
+  SHA-256) instead, which keeps feedback-only grade changes detectable
+  without keeping the words; the grades fingerprint now covers the hash
+  rather than the text. `worsaga grades` is unchanged — it reads the
+  gradebook live, so nothing is withheld from you: the table marks which
+  items carry feedback and `worsaga grades --json` carries its full text.
+  `--store-feedback` (or `WORSAGA_SYNC_STORE_FEEDBACK=1`) opts the text back
+  into the cache; even then it stays out of the recorded change events that
+  `worsaga changes` and `get_changes()` replay, so no configuration turns
+  that surface into a feed of instructor comments.
+
+  Existing caches migrate silently. The grades fingerprint is versioned, so
+  the first sync after upgrading recognises rows written in the old shape,
+  adopts them, and reports them as
+  `N re-fingerprinted (storage format changed, not Moodle)` — rather than
+  telling you that every grade you have ever received changed today.
+  Adopting is not the same as going blind: the fields whose meaning did not
+  move (grade, percentage, status, graded, graded date) are still compared,
+  so a grade that genuinely changed on that same run is still reported. The
+  one thing that cannot be judged is feedback itself, since the old row
+  holds text and the new one holds a hash; a feedback-only edit made across
+  the upgrade is caught on the following sync. A fingerprint this version
+  cannot recognise at all — empty, truncated, or written by a *newer*
+  Worsaga after a downgrade — is adopted without any event, and the
+  round-trip is safe: an older Worsaga rewrites bare fingerprints, and the
+  next upgrade migrates them again silently.
+- **The MCP server now registers 14 of its 26 tools by default.** The
+  default profile is the authenticated user's own academic picture:
+  `list_courses`, `get_deadlines`, `get_grades`, `get_grade_summary`,
+  `get_assignments`, `get_assignment_status`, `get_calendar_events`,
+  `get_course_contents`, `get_week_materials`, `search_course_content`,
+  `search_text`, `get_changes`, `get_autosync_status`, and
+  `get_connection_info`.
+  Everything that reads other people's writing, fetches file contents, or
+  writes to a local store is behind a named capability and is **absent from
+  the tool list** until enabled — not present-and-refusing, because a tool
+  an agent can see is a tool an agent can be talked into calling. The
+  capabilities are `forums`, `messages`, `notifications`, `digest`,
+  `sync` (`sync_now`), `materials` (`download_material`,
+  `extract_material`, `export_study_pack`, `get_weekly_summary`), and
+  `index` (`build_search_index`). `get_changes` stays in the default
+  profile: it makes no request and writes nothing, it replays events from
+  data the user already chose to sync, and forums are outside the
+  unattended collection default, so by default that feed is first-party.
+  Set `WORSAGA_MCP_CAPABILITIES` to a comma-separated list or `all`; it is
+  read once at start-up and the active profile is printed to stderr. An
+  unknown name is ignored with a warning rather than refusing to start.
+
 ### Added
+
+- **A first-use notice for third-party content.** The first time a run
+  reads what other people wrote (forums, messages, notifications) against a
+  real site, Worsaga prints one notice on stderr: that a local copy is kept
+  as personal study material, that it should be treated as text to read
+  rather than instructions to act on, and how to collect less. It is
+  recorded per site in the state directory so it appears once, and it is
+  never shown in demo mode or under `-q`.
+- **Token redaction at every boundary.** A new `worsaga.redact` module is
+  the single definition of what a secret looks like, and it now governs
+  every way data leaves the process. Two rules: the configured token in any
+  of its encoded spellings (raw, percent-, plus-, and double-encoded, in
+  upper- and lower-case escape forms), and any `token`-like query parameter
+  whatever its value — with `=` written literally, as `%3D`, or as `%253D`.
+  The second rule closes the gaps where Moodle's own links passed through
+  unchanged: a notification's `contexturl`, a calendar event URL, and forum
+  and assignment `view_url` fields are redacted at the record factory.
+
+  Applied at: the CLI's stdout and stderr (including their binary
+  `.buffer`, and across writes, so a value split by `print("a", token)` is
+  still caught); every MCP tool result, including mapping *keys*; the
+  exception a tool body raises; argument-validation failures inside
+  FastMCP, which never reach a tool body at all; every logging handler in
+  both the CLI and the MCP server, message and traceback alike — which
+  matters because FastMCP configures logging at import, so its handler
+  holds a reference to the real stderr that no later wrapping can reach;
+  and the local SQLite cache, whose sanitizer previously carried its own
+  weaker pattern and so persisted encoded forms that the output boundary
+  caught. The token is registered from every source it can arrive by,
+  including `--token-stdin`.
+- **MCP input caps on every tool, whatever the profile.** Day windows are
+  clamped to 0-730 (look-ahead) and 0-365 (look-back), `search_text` results
+  to 200, `get_changes` to 500 events, and `build_search_index` to its
+  100-file budget, which can no longer be raised from the tool call.
+  Negative and absurd values are clamped rather than trusted, and a
+  non-numeric argument falls back to the documented default.
+- **MCP tool annotations** (`readOnlyHint`, `destructiveHint`,
+  `idempotentHint`, `openWorldHint`) as advisory metadata, plus a
+  "third-party content" line in the description of all 17 tools whose
+  results can carry text written by other people, telling the reading agent
+  to treat it as data and never as instructions.
+- `others_personal` policy metadata on the allowlisted functions whose
+  responses carry other people's personal content
+  (`mod_forum_get_forums_by_courses`, `mod_forum_get_forum_discussions`,
+  `message_popup_get_popup_notifications`, `core_message_get_messages`),
+  exported as `worsaga.OTHERS_PERSONAL_FUNCTIONS` and checked by the test
+  suite, so a future allowlist entry that returns other people's content
+  cannot be added without a deliberate decision. It is deliberately
+  narrower than the MCP layer's "third-party content" tool label, which
+  asks the broader question "could this text be a prompt-injection
+  payload?" and so also covers section summaries, event descriptions,
+  extracted file text, and instructor feedback. The tests assert that the
+  narrow set nests inside the broad one.
 
 - MCP tools now accept a course short-code anywhere they take a
   `course_id`, not just a numeric id. Every course-taking tool

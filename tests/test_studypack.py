@@ -17,6 +17,7 @@ from worsaga.studypack import (
     study_pack_filename,
     write_study_pack,
 )
+from worsaga.redact import REDACTED
 
 
 def _econ_course_id():
@@ -154,7 +155,7 @@ class TestBuildStudyPack:
         result = build_study_pack(client, 1, 1)
         text = json.dumps(result)
         assert "SECRET1234" not in text
-        assert "token=REDACTED" in result["course_fullname"]
+        assert f"token={REDACTED}" in result["course_fullname"]
 
 
 class TestWriteStudyPack:

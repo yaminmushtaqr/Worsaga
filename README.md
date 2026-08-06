@@ -229,18 +229,55 @@ extra, then run:
 worsaga-mcp
 ```
 
-The server runs over stdio. Tools: `list_courses`, `get_deadlines`,
-`get_grades`, `get_grade_summary`, `get_assignments`, `get_assignment_status`,
-`get_course_forums`, `get_forum_discussions`, `get_latest_updates`,
-`get_notifications`, `get_messages`, `get_digest`, `get_calendar_events`,
+The server runs over stdio. **By default it offers 14 of its 26 tools** —
+the ones that describe your own academic picture:
+
+`list_courses`, `get_deadlines`, `get_grades`, `get_grade_summary`,
+`get_assignments`, `get_assignment_status`, `get_calendar_events`,
 `get_course_contents`, `get_week_materials` (discovery),
-`search_course_content`, `get_weekly_summary`, `download_material`
-(authenticated fetch), `extract_material` (per-page text, in memory),
-`sync_now` (metadata sync + change detection), `get_changes` (recorded
-changes, no network), `build_search_index` (local full-text index),
-`search_text` (offline full-text search), `export_study_pack` (Markdown
-study pack for a week), `get_autosync_status` (read-only scheduled-sync
-check), and `get_connection_info` (read-only auth/site/user check).
+`search_course_content`, `search_text` (offline full-text search),
+`get_changes` (replay what earlier syncs recorded, no network),
+`get_autosync_status` (read-only scheduled-sync check), and
+`get_connection_info` (read-only auth/site/user check).
+
+The other 12 read other people's writing, fetch file *contents*, or write
+to Worsaga's local stores, so they are behind a named capability and are
+**not listed at all** until you enable them — an agent cannot see a tool
+it has not been given:
+
+| Capability | Tools |
+|---|---|
+| `forums` | `get_course_forums`, `get_forum_discussions`, `get_latest_updates` |
+| `messages` | `get_messages` |
+| `notifications` | `get_notifications` |
+| `digest` | `get_digest` |
+| `sync` | `sync_now` |
+| `materials` | `download_material`, `extract_material`, `export_study_pack`, `get_weekly_summary` |
+| `index` | `build_search_index` |
+
+Enable them with `WORSAGA_MCP_CAPABILITIES`, comma-separated, or `all`:
+
+```json
+{
+  "mcpServers": {
+    "worsaga": {
+      "command": "worsaga-mcp",
+      "env": { "WORSAGA_MCP_CAPABILITIES": "materials,index,sync" }
+    }
+  }
+}
+```
+
+The value is read once at start-up, and the server prints the active
+profile to stderr so you can see what a session was given. An unknown
+capability name is ignored with a warning rather than refusing to start.
+
+Two things hold whatever the profile. Every tool clamps its numeric
+arguments — day windows, result limits, file budgets — into a documented
+range rather than trusting them. And every tool whose result can contain
+text written by other people says so in its own description, so an agent
+reading a forum post or an instructor's feedback is told to treat it as
+material to report on, never as instructions to follow.
 
 Every tool that takes a `course_id` accepts either the numeric id or a
 course short-code — an exact match or an unambiguous prefix, e.g.
@@ -276,8 +313,23 @@ To try the MCP server without Moodle credentials, use demo mode instead:
 }
 ```
 
-All tools then serve the built-in fictional dataset — ask your agent to
-"summarise my study week" to see it in action.
+The default profile then serves the built-in fictional dataset. The
+walkthrough below reads a week's materials, so give the demo server the
+`materials` capability as well:
+
+```json
+{
+  "mcpServers": {
+    "worsaga-demo": {
+      "command": "worsaga-mcp",
+      "env": {
+        "WORSAGA_DEMO": "1",
+        "WORSAGA_MCP_CAPABILITIES": "materials"
+      }
+    }
+  }
+}
+```
 
 Example prompt once connected:
 
@@ -342,6 +394,46 @@ worsaga changes --since 7d       # replay recorded changes (no network)
 worsaga changes --category grades
 ```
 
+### What gets collected
+
+Forum discussions are other people's writing, so a sync **nobody is
+watching** leaves them alone: `worsaga watch`, the scheduled auto-sync, and
+the MCP `sync_now()` collect deadlines, files, and grades. A foreground
+`worsaga sync` you typed yourself still collects all four.
+
+`--categories` overrides that in either direction, and
+`WORSAGA_SYNC_CATEGORIES` sets a persistent default for both:
+
+```bash
+worsaga sync --categories deadlines,grades   # collect less
+worsaga watch --categories all               # opt forums back in
+export WORSAGA_SYNC_CATEGORIES=deadlines,files,grades
+```
+
+A category you did not select is reported as `(not selected)` and is *not*
+treated as a failed one: it produces no change events, its cached rows and
+its baseline are left exactly as they were, and it does not count towards
+the run's `outcome`. Switching it back on later resumes from where it
+stopped rather than re-reporting everything.
+
+### What gets stored
+
+Instructor feedback is the other piece of somebody else's writing a sync
+would otherwise keep. The cache stores whether feedback exists
+(`feedback_present`) and a truncated hash of it (`feedback_hash`) — enough
+that editing feedback still shows up as a grade change — but not the words.
+`worsaga grades` is unaffected: it reads the gradebook live, so nothing is
+withheld from you. The table marks which items have feedback;
+`worsaga grades --json` carries the full text of each one.
+
+Pass `--store-feedback` (or set `WORSAGA_SYNC_STORE_FEEDBACK=1`) if you do
+want the text cached. Even then it stays out of the recorded change events
+that `worsaga changes` and the MCP `get_changes()` replay.
+
+The first sync after upgrading to this behaviour reports the affected grade
+items as `re-fingerprinted (storage format changed, not Moodle)` and emits
+no change events for them — a storage change is not news about your course.
+
 `worsaga sync` exits **1** when it could not fetch a single category, so a
 script or a scheduled job can tell a working sync from one that silently
 reached nothing; a partial sync prints its warnings and exits 0. With
@@ -365,7 +457,12 @@ Ctrl+C.
 ```bash
 worsaga watch                    # sync every 15 minutes until Ctrl+C
 worsaga watch --interval 1h --no-notify
+worsaga watch --categories all   # include forums in every cycle
 ```
+
+Each cycle is an unattended sync, so it takes the narrower collection
+default described above — deadlines, files, and grades — unless
+`--categories` or `WORSAGA_SYNC_CATEGORIES` says otherwise.
 
 If cycles start failing — the network is down, the site is unreachable —
 the interval backs off: it doubles per consecutive failure, up to eight
@@ -458,6 +555,38 @@ may send, so a call cannot be widened beyond what the feature needs.
 - Treat your API token like a password: never commit it, never share it, use
   HTTPS only.
 - Respect your institution's acceptable-use policy for web-service access.
+
+### Other people's content
+
+Some of what Moodle will hand you was written by somebody else: forum
+posts, private messages, notifications, and the feedback an instructor
+wrote on your work. Worsaga treats that as a distinct category.
+
+- **It is not collected in the background by default.** See
+  [What gets collected](#what-gets-collected) — an unattended sync leaves
+  forums alone, and instructor feedback is stored as a hash rather than as
+  text.
+- **It is not offered to agents by default.** The MCP tools that read it
+  are behind a capability and are absent from the tool list until enabled.
+- **The first time a run reads it against a real site, Worsaga says so
+  once** on stderr: that a local copy is being kept, that it is your
+  personal study material, and that it should be treated as text to read
+  rather than instructions to act on. The notice is recorded per site (in
+  the state directory) so it appears once, never in demo mode, and never
+  under `-q`.
+- Allowlist entries whose responses carry it are marked `third_party` in
+  `worsaga.client.ALLOWED_FUNCTION_POLICIES`, so the boundary is checked by
+  the test suite rather than by memory.
+
+### Token hygiene at the output boundary
+
+The Moodle token is redacted from everything Worsaga prints or returns. The
+CLI wraps its own stdout and stderr, and every MCP tool result (and any
+exception message) passes through the same filter. Two rules apply: the
+configured token in any of its encoded spellings, and any `token`-like
+query parameter whatever its value — which is what catches the credentials
+Moodle mints into the links it hands back, such as a notification's
+`contexturl` or a calendar event URL.
 
 Worsaga is read-only, but read-only LMS data can still be sensitive. Course
 materials, grades, messages, notifications, and Moodle URLs may contain private

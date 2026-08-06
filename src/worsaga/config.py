@@ -23,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import platformdirs
 
+from worsaga.redact import remember_secret
 from worsaga.secureio import write_private_file
 
 _APP_NAME = "worsaga"
@@ -208,6 +209,11 @@ class MoodleConfig:
             # on this string (cache rows, sync history, the download-origin
             # check) sees one canonical spelling of the site.
             object.__setattr__(self, "url", canonical_moodle_url(self.url))
+        # Arm the output-boundary redactor from the one place every token
+        # arrives, whatever its source (argument, environment, or file).
+        # Doing it here rather than at each boundary means a token can
+        # never be in use without also being redactable.
+        remember_secret(self.token)
 
     @classmethod
     def load(

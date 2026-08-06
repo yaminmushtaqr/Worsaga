@@ -30,6 +30,11 @@ interval. Cycles refused by the credential circuit breaker
 failures, so a revoked token costs an ever-shrinking number of wake-ups
 rather than a fixed drumbeat forever.
 
+Every cycle is an unattended sync, so it inherits the unattended
+collection default in :mod:`worsaga.sync`: deadlines, files, and grades,
+but not forums. Pass ``categories`` (``worsaga watch --categories ...``,
+or ``WORSAGA_SYNC_CATEGORIES``) to change that.
+
 Notification content is course metadata only (change kinds and titles)
 — never tokens, URLs, or file contents.
 """
@@ -39,7 +44,7 @@ from __future__ import annotations
 import random
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from worsaga.client import MoodleWriteAttemptError
 from worsaga.concurrency import ProgressCallback
@@ -122,6 +127,8 @@ def run_watch(
     notify: bool = True,
     lookahead_days: int = SYNC_LOOKAHEAD_DAYS,
     cache_path: str | Path | None = None,
+    categories: str | Sequence[str] | None = None,
+    store_feedback: bool | None = None,
     on_cycle: Callable[[dict[str, Any]], None] | None = None,
     on_cycle_start: Callable[[int], None] | None = None,
     on_progress: ProgressCallback | None = None,
@@ -142,6 +149,14 @@ def run_watch(
         Stop after this many cycles (None = run until interrupted).
     notify : bool
         Raise a desktop notification when a cycle detects changes.
+    categories : str | sequence of str, optional
+        Which sync categories each cycle collects. ``None`` (default)
+        takes the unattended default — no forums. Forwarded verbatim to
+        :func:`worsaga.sync.run_sync`, which validates it.
+    store_feedback : bool, optional
+        Opt in to persisting full instructor feedback text. ``None``
+        (default) leaves it to ``WORSAGA_SYNC_STORE_FEEDBACK``, which is
+        off unless it was deliberately set.
     on_cycle : callable, optional
         Invoked with each cycle's result dict as it completes — the
         sync result plus ``cycle`` (1-based), ``ok``, ``outcome``,
@@ -191,6 +206,7 @@ def run_watch(
             result = run_sync(
                 client, cache_path=cache_path, lookahead_days=lookahead_days,
                 on_progress=on_progress, unattended=True,
+                categories=categories, store_feedback=store_feedback,
             )
             # The sync's own verdict, not "it returned without raising":
             # a run that fetched nothing is a failed cycle even though it

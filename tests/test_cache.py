@@ -11,6 +11,7 @@ from worsaga.cache import (
     read_last_sync_at,
     sanitize_payload,
 )
+from worsaga.redact import REDACTED
 
 
 class TestDefaultCachePath:
@@ -115,7 +116,9 @@ class TestSanitizePayload:
         })
         text = json.dumps(cleaned)
         assert "SECRET_IN_VALUE" not in text
-        assert "REDACTED" in cleaned["url"]
+        # The marker is the shared one: storage and output must not
+        # disagree about what a redacted value looks like.
+        assert REDACTED in cleaned["url"]
         assert "&x=1" in cleaned["url"]
 
     def test_tuples_and_sets_are_walked(self):
@@ -123,7 +126,7 @@ class TestSanitizePayload:
             "pair": ("keep", "url?token=SECRETVAL"),
             "bag": {"plain"},
         })
-        assert cleaned["pair"] == ["keep", "url?token=REDACTED"]
+        assert cleaned["pair"] == ["keep", f"url?token={REDACTED}"]
         assert cleaned["bag"] == ["plain"]
 
 

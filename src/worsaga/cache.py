@@ -12,8 +12,11 @@ sanitized before every write —
 - keys whose name contains ``token`` (``token``, ``wstoken``,
   ``access_token``, ...) and the keys ``file_url``/``fileurl``/``sesskey``
   are dropped recursively;
-- ``token=``/``wstoken=``/``sesskey=`` values embedded in string values
-  (query strings, URLs) are redacted;
+- string values go through :func:`worsaga.redact.redact_text`, the same
+  rule the CLI and MCP output boundaries apply — the configured token in
+  any of its encoded spellings, and any ``token``-ish query parameter
+  whatever its value, with ``=`` written literally, as ``%3D``, or as
+  ``%253D``;
 - tuples and sets are converted to sanitized lists.
 
 On POSIX the cache file is created owner-only (0600) *before* SQLite
@@ -32,7 +35,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import time
 from pathlib import Path
@@ -46,6 +48,7 @@ from worsaga.principal import (
 from worsaga.principal import (
     principal_meta_key,
 )
+from worsaga.redact import redact_text
 from worsaga.secureio import ensure_private_file
 
 _APP_NAME = "worsaga"
@@ -60,13 +63,6 @@ _CACHE_REMEDY = (
 # Keys that must never be persisted, at any nesting depth. Any key whose
 # lowercased name *contains* "token" is dropped as well.
 _BANNED_KEYS = {"file_url", "fileurl", "sesskey"}
-
-# token-bearing query parameters embedded in string *values*: any
-# parameter name ending in "token" or "sesskey" (token, wstoken,
-# access_token, ...).
-_TOKEN_VALUE_RE = re.compile(
-    r"(?i)([A-Za-z0-9_-]*(?:token|sesskey))=([^&#\s\"']+)"
-)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -128,9 +124,20 @@ def _is_banned_key(key: Any) -> bool:
 def sanitize_payload(value: Any) -> Any:
     """Return *value* safe to persist: no token keys, no token values.
 
-    Token-bearing keys are removed at every depth, ``token=``-style
-    query parameters inside string values are redacted, and tuples and
-    sets become sanitized lists so nothing bypasses the walk.
+    Token-bearing keys are removed at every depth, and tuples and sets
+    become sanitized lists so nothing bypasses the walk. String values go
+    through :func:`worsaga.redact.redact_text`, the same definition of
+    "what a secret looks like" that the CLI and MCP output boundaries use.
+
+    Sharing it matters: this used to carry its own pattern, which matched
+    only a literal ``token=value``. A percent-encoded ``token%3D...`` (a
+    Moodle link nested inside another link's query) and the configured
+    token appearing on its own both slipped past it and were written to
+    disk — while the output boundary caught both. Storage and output now
+    cannot disagree about what a secret is.
+
+    Keys are dropped rather than rewritten, so ``redact_keys`` stays off:
+    rewriting a key named after a token would put it back in the payload.
     """
     if isinstance(value, dict):
         return {
@@ -141,7 +148,7 @@ def sanitize_payload(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [sanitize_payload(item) for item in value]
     if isinstance(value, str):
-        return _TOKEN_VALUE_RE.sub(r"\1=REDACTED", value)
+        return redact_text(value)
     return value
 
 

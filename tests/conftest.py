@@ -17,7 +17,9 @@ So every test gets, automatically:
 - a `urlopen` that raises instead of reaching the network;
 - a fresh set of per-origin rate coordinators whose pacing sleeps do
   nothing, so wire-level tests neither wait 250 ms per request nor inherit
-  a cooldown or a spent retry budget from the test before them.
+  a cooldown or a spent retry budget from the test before them;
+- an empty output-redaction registry, so a token registered by one test
+  cannot silently rewrite another test's expected output.
 
 Tests that legitimately fake transport patch `urlopen` themselves and so
 override the guard for their own scope; demo-mode tests never reach it.
@@ -31,6 +33,7 @@ import worsaga as worsaga_package
 from worsaga import cli as cli_module
 from worsaga import config as config_module
 from worsaga import ratelimit as ratelimit_module
+from worsaga import redact as redact_module
 
 #: Deliberately unroutable (RFC 6761 reserves ``.invalid``) and obviously
 #: fake, so a value that escapes into an assertion message is recognisable.
@@ -71,9 +74,16 @@ def isolate_worsaga_environment(tmp_path, monkeypatch):
     # their own clock.
     ratelimit_module.for_testing_reset(sleep_fn=lambda _seconds: None)
 
+    # The redaction registry is module-level for the same reason the
+    # coordinators are: it has to be reachable from every output
+    # boundary. Cleared around each test so one test's token never
+    # rewrites another's assertions.
+    redact_module.forget_secrets()
+
     def _blocked(*args, **kwargs):
         raise AssertionError("unmocked network call in test")
 
     monkeypatch.setattr(urllib.request, "urlopen", _blocked)
     yield
     ratelimit_module.for_testing_reset()
+    redact_module.forget_secrets()

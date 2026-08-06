@@ -43,6 +43,7 @@ import urllib.request
 from typing import Any, Callable
 
 from worsaga.config import MoodleConfig
+from worsaga.redact import redact_text
 from worsaga.ratelimit import (
     BACKPRESSURE_STATUSES,
     MAX_ATTEMPTS,
@@ -70,15 +71,40 @@ logger = logging.getLogger(__name__)
 #   array arguments (``courseids[0]``, ``events[courseids][0]``) are listed
 #   once under their base name; see :func:`_param_base_name`.
 #
-# Two optional keys carry the scope rules:
+# Three optional keys carry the scope and data-class rules:
 #
 # - ``injects`` — the identity parameter filled in when a caller omits it
 #   (see SELF_SCOPED_PARAMS below).
 # - ``course_params`` — the parameters whose values are course ids. Every
 #   such value is checked against the enrolment set before the request, so
 #   course scope holds at the dispatcher and not only in the wrappers.
+# - ``others_personal`` — True marks a function whose *response* carries
+#   other people's personal content: their forum posts, their private
+#   messages, notifications addressed to this user by staff or classmates.
+#   It is a **privacy** marker, and it is deliberately narrow. It is what
+#   the collection defaults and the MCP capability gating are checked
+#   against (:data:`OTHERS_PERSONAL_FUNCTIONS`), so those two decisions
+#   read from one machine-checkable list instead of two hand-maintained
+#   ones, and a new allowlist entry that returns such content and forgets
+#   the key fails that test.
 #
-# Both are always a subset of ``params``; functions with neither omit them.
+#   Grade feedback is deliberately *not* marked: the gradebook is the
+#   authenticated user's own record, read through a self-scoped function,
+#   and withholding it from its owner would be absurd. The instructor's
+#   words inside it are handled where they are actually a risk — see the
+#   feedback minimisation in :mod:`worsaga.sync`.
+#
+#   Do not confuse this with the MCP layer's ``third_party`` tool label
+#   (:data:`worsaga.mcp_server.THIRD_PARTY_TOOLS`), which answers a
+#   different and broader question — "could this result contain free-form
+#   prose somebody else wrote, and therefore a prompt-injection payload?"
+#   — and so also covers section summaries, event descriptions, extracted
+#   file text, and instructor feedback. Every function marked here is
+#   necessarily covered there; the reverse is not true, and the tests
+#   assert exactly that containment.
+#
+# ``injects`` and ``course_params`` are always a subset of ``params``;
+# functions with none of the three omit them.
 # ─────────────────────────────────────────────────────────────────
 ALLOWED_FUNCTION_POLICIES = {
     "core_webservice_get_site_info": {
@@ -167,12 +193,14 @@ ALLOWED_FUNCTION_POLICIES = {
         "exposed": True,
         "params": frozenset({"courseids"}),
         "course_params": frozenset({"courseids"}),
+        "others_personal": True,
     },
     "mod_forum_get_forum_discussions": {
         "purpose": "read forum discussion metadata without marking views",
         "changes_user_state": False,
         "exposed": True,
         "params": frozenset({"forumid"}),
+        "others_personal": True,
     },
     "mod_quiz_get_quizzes_by_courses": {
         "purpose": "read quiz due dates for deadline aggregation",
@@ -187,6 +215,7 @@ ALLOWED_FUNCTION_POLICIES = {
         "exposed": True,
         "params": frozenset({"useridto", "newestfirst", "limit", "offset"}),
         "injects": "useridto",
+        "others_personal": True,
     },
     "core_message_get_messages": {
         "purpose": "read messages visible to the authenticated user",
@@ -197,10 +226,22 @@ ALLOWED_FUNCTION_POLICIES = {
             "limitfrom", "limitnum",
         }),
         "injects": "useridto",
+        "others_personal": True,
     },
 }
 
 ALLOWED_FUNCTIONS = frozenset(ALLOWED_FUNCTION_POLICIES)
+
+#: The allowlisted functions whose responses carry other people's
+#: personal content. Derived from the policies so there is one place to
+#: declare it and no second list to fall out of step — the collection
+#: defaults (:mod:`worsaga.sync`) and the MCP capability profile
+#: (:mod:`worsaga.mcp_server`) are tested against this set.
+OTHERS_PERSONAL_FUNCTIONS = frozenset(
+    wsfunction
+    for wsfunction, policy in ALLOWED_FUNCTION_POLICIES.items()
+    if policy.get("others_personal")
+)
 
 #: Moodle takes list arguments as ``courseids[0]``, ``courseids[1]``, ...
 #: (and nested, as ``events[courseids][0]``). The parameter policy lists
@@ -732,25 +773,14 @@ class MoodleClient:
         """Replace this client's token with ``***`` in server-supplied text.
 
         Applied where a Moodle error payload becomes an exception
-        message. The token travels through ``urlencode`` on the way out,
-        so a server quoting the request back can echo either the raw
-        value or a percent-encoded one; both forms are matched.
-
-        Deliberately narrow: this covers the one place server text
-        crosses into Worsaga's own error strings. Redaction at every
-        output boundary is separate, later work — this is not a claim
-        that no other path could ever carry the value.
+        message. Delegates to :func:`worsaga.redact.redact_text`, which
+        is the same implementation the CLI and MCP output boundaries use,
+        so all three agree on what a secret looks like: this client's
+        token in any of its encoded spellings, *and* any ``token``-ish
+        query parameter regardless of whose credential it is — a proxy
+        quoting the request back can echo either.
         """
-        token = self._config.token
-        if not token:
-            return text
-        cleaned = text.replace(token, "***")
-        for encoded in (
-            urllib.parse.quote_plus(token), urllib.parse.quote(token),
-        ):
-            if encoded != token:
-                cleaned = cleaned.replace(encoded, "***")
-        return cleaned
+        return redact_text(text, secrets=(self._config.token,))
 
     @property
     def verified_userid(self) -> int | None:

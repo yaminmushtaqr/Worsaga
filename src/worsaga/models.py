@@ -6,6 +6,7 @@ import html
 import re
 from typing import Any
 
+from worsaga.redact import redact_url
 from worsaga.time_utils import timestamp_to_display, timestamp_to_iso
 
 
@@ -186,7 +187,7 @@ def assignment_record(
         "graded": graded,
         "feedback_available": feedback_available,
         "days_left": days_left,
-        "view_url": view_url,
+        "view_url": redact_url(view_url),
     }
 
 
@@ -278,7 +279,7 @@ def forum_discussion_record(
         "unread_count": unread_count,
         "pinned": pinned,
         "locked": locked,
-        "view_url": view_url,
+        "view_url": redact_url(view_url),
     }
 
 
@@ -300,6 +301,11 @@ def notification_record(
     ``created_iso`` (UTC ISO-8601) and ``created_str`` (local display) are
     derived alongside it, mirroring the ``due_*`` / ``start_*`` fields on
     deadlines and calendar events.
+
+    ``view_url`` is Moodle's own ``contexturl``, copied through from the
+    notification payload, so it is one of the few fields that can arrive
+    carrying a credential parameter. It is redacted here, at the record
+    factory, rather than at each of the surfaces that print it.
     """
     return {
         "id": notification_id,
@@ -312,7 +318,7 @@ def notification_record(
         "created_iso": timestamp_to_iso(created_at),
         "created_str": timestamp_to_display(created_at),
         "read": read,
-        "view_url": view_url,
+        "view_url": redact_url(view_url),
     }
 
 
