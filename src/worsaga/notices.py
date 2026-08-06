@@ -29,6 +29,13 @@ for a *different* site. Best effort in the same sense as everywhere else
 here — if the lock cannot be had, the notice is still shown, because a
 contended lock file must never turn ``worsaga updates`` into a failure.
 
+What an uncontended lock changes is only the *write*. Showing a notice
+twice costs a repeated four lines; writing the record without the lock
+can drop a different site's entry from the file, silently un-recording a
+notice that was given. So a run that could not take the lock prints and
+does not record, and is shown the notice again later — the direction
+where the failure repairs itself.
+
 Notices go to **stderr**. stdout is a data channel — piped JSON, and the
 MCP stdio protocol itself.
 """
@@ -98,9 +105,18 @@ def notices_lock_path(path: Path | None = None) -> Path:
 def _serialised(path: Path | None = None):
     """Hold the process mutex and, if it can be had quickly, the file lock.
 
-    The file lock is advisory in the strictest sense: it makes concurrent
-    writers take turns when it is available, and changes nothing when it
-    is not. A duplicated notice is not worth failing a command over.
+    Yields whether the body may write. The body runs either way — a
+    duplicated notice is not worth failing a command over — but it needs
+    to know, because the read-modify-write that records a notice is only
+    safe serialised, while printing is safe always.
+
+    ``False`` means *another process holds the lock*, which is the only
+    case where an unserialised write can lose somebody else's record. A
+    lock file that cannot be created at all (a read-only state directory)
+    yields ``True`` and runs unlocked, exactly as
+    :class:`~worsaga.synclock.SyncLock` does everywhere else: there is no
+    contender to lose a race against, and the write fails harmlessly on
+    its own if the directory really is unwritable.
     """
     with _process_lock:
         lock = SyncLock(
@@ -121,7 +137,7 @@ def _serialised(path: Path | None = None):
             if attempt < _LOCK_ATTEMPTS - 1:
                 time.sleep(_LOCK_RETRY_SECONDS)
         try:
-            yield
+            yield taken
         finally:
             if taken:
                 lock.release()
@@ -191,6 +207,13 @@ def announce_third_party_collection(
     The re-read happens *inside* the lock, so a process that waited for
     another one sees what that one recorded rather than the snapshot it
     took before waiting.
+
+    When the file lock could not be had, the notice is still shown but
+    deliberately **not** recorded: recording means rewriting the whole
+    file from a snapshot of it, and doing that unserialised can drop the
+    entry another process just wrote for a different site. Showing this
+    notice again on a later run is a repeat; dropping a record makes a
+    notice that was already given look as though it never was.
     """
     if is_demo or quiet or not site:
         return False
@@ -199,11 +222,12 @@ def announce_third_party_collection(
     # forever would be a poor trade for a one-off notice.
     if notice_shown(site, path=path):
         return False
-    with _serialised(path):
+    with _serialised(path) as locked:
         if notice_shown(site, path=path):
             return False
         print(THIRD_PARTY_NOTICE, file=stream or sys.stderr)
-        record_notice(site, path=path)
+        if locked:
+            record_notice(site, path=path)
     return True
 
 

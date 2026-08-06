@@ -36,6 +36,24 @@ Redaction is deliberately blunt. It can flatten an innocent
 ``token=value`` in extracted lecture text, which is the right way round:
 a printed secret cannot be un-printed.
 
+What the streamed form guarantees
+---------------------------------
+:class:`RedactingStream` redacts a stream arriving in arbitrary pieces,
+and its result is identical to redacting the whole text at once **for a
+single-line secret containing no parameter delimiter** — whitespace,
+``&``, ``#``, or a quote. That covers every real credential: a Moodle
+web-service token is 32 hexadecimal characters, and
+:func:`remember_secret` refuses a value containing a line break outright.
+
+For a *registered* secret that does contain a delimiter, the two rules
+can interact at a buffer edge: the parameter rule collapses an unfinished
+``name=value`` as soon as it is seen, which can remove the prefix the
+exact-secret rule was going to match, so such a secret is reliably caught
+only when it arrives within one buffered stretch. Stated rather than
+hidden, and deliberately not designed around: making the holder track
+parameter state would complicate the one piece of code that must never
+be subtly wrong, to protect a value no Moodle issues.
+
 The secret registry is process-local and holds nothing that is not
 already in memory in a :class:`~worsaga.config.MoodleConfig`.
 """
@@ -61,9 +79,16 @@ MIN_SECRET_LENGTH = 8
 
 #: How much of a character stream is held back when a write does not end
 #: at a line boundary, so a secret split across two ``write`` calls is
-#: still matched (see :class:`_HoldingRedactor`). Also the longest
-#: ``token=`` *value* that can be caught across such a split; a longer one
-#: is caught whenever it arrives in one piece, which is every real case.
+#: still matched (see :class:`_HoldingRedactor`).
+#:
+#: It bounds only how much of an *incomplete* occurrence can be waiting at
+#: the end of the buffer, because the buffer is redacted before any of it
+#: is emitted: a complete secret, and a ``token=`` value of any length at
+#: all, is already replaced by the time the cut is chosen. What has to fit
+#: in the hold is a partial secret (covered explicitly — the hold is never
+#: smaller than the longest registered spelling plus one) or a half-written
+#: parameter *name*, which :data:`_PARAM_PREFIX_MAX` bounds to a few dozen
+#: characters. This number is the floor for both.
 STREAM_HOLD_CHARS = 512
 
 #: Longest identifier prefix allowed before ``token``/``sesskey``. Bounded
@@ -127,16 +152,31 @@ def _secret_forms(secret: str) -> tuple[str, ...]:
 def remember_secret(value: Any) -> bool:
     """Register *value* as a secret to strip from every boundary.
 
-    Returns whether it was registered. Empty, non-string, and implausibly
-    short values are ignored (see :data:`MIN_SECRET_LENGTH`) rather than
-    raising: this is called from a constructor and from argument parsing,
-    and a configuration problem must surface as a configuration error, not
-    as a crash inside the redactor.
+    Returns whether it was registered. Empty, non-string, implausibly
+    short (see :data:`MIN_SECRET_LENGTH`), and multi-line values are
+    ignored rather than raising: this is called from a constructor and
+    from argument parsing, and a configuration problem must surface as a
+    configuration error, not as a crash inside the redactor.
+
+    Precisely, in this order: **surrounding whitespace is stripped**, and
+    what is left is refused if it contains a line break. Both halves are
+    deliberate. A token arrives with a trailing newline constantly — read
+    from a file, piped through ``--token-stdin``, pasted into an
+    environment variable — and refusing those would leave a real
+    credential unregistered for no gain at all, so they are trimmed and
+    kept. An *internal* line break is another matter: no Moodle issues
+    such a token, and accepting one would break the stream wrapper's
+    newline shortcut, which is what lets a completed line be emitted
+    immediately (see :class:`_HoldingRedactor`). Checking after the strip
+    gives exactly the invariant that shortcut needs — no registered secret
+    contains a line break — while keeping the everyday case working.
     """
     if not isinstance(value, str):
         return False
     secret = value.strip()
     if len(secret) < MIN_SECRET_LENGTH:
+        return False
+    if "\n" in secret or "\r" in secret:
         return False
     with _lock:
         if secret not in _secrets:
@@ -257,13 +297,30 @@ class _HoldingRedactor:
     each write in isolation would let ``SENTINEL`` written as ``SENT`` +
     ``INEL`` through untouched.
 
-    So a tail is held back:
+    So a tail is held back, and — this is the load-bearing part — the
+    whole buffer is **redacted before it is cut**:
 
     - everything up to and including the last newline is safe to emit,
       because no match can span one (the parameter pattern excludes
       whitespace, and a Moodle token is a single line);
     - failing that, all but the last :data:`STREAM_HOLD_CHARS` characters
       go out and the rest waits for the next write.
+
+    Cutting first and redacting the two halves separately is what this
+    class used to do, and it leaked: a value straddling the cut was
+    scanned as two fragments, neither of which matched, and the fragments
+    reassembled in the reader's terminal. Redacting first makes the cut
+    position irrelevant, because by then every complete occurrence has
+    already collapsed to :data:`REDACTED` — and re-scanning the held tail
+    on the next write is harmless, since redaction is idempotent on its
+    own output (``***`` matches nothing, and ``name=***AAAA`` collapses
+    back to ``name=***``).
+
+    What can still be mid-arrival at the cut is bounded by the hold: a
+    partial secret is at most one spelling long, and a partial parameter
+    *name* at most :data:`_PARAM_PREFIX_MAX` plus the keyword. A partial
+    parameter *value* cannot straddle at all — the pattern's terminator
+    accepts end-of-input, so an unfinished value has already been replaced.
 
     The held tail is bounded, so a caller streaming megabytes without a
     newline does not accumulate them here. :meth:`drain` returns whatever
@@ -281,31 +338,41 @@ class _HoldingRedactor:
         return max(STREAM_HOLD_CHARS, longest + 1)
 
     def _newline_is_a_boundary(self) -> bool:
-        """Whether no registered secret can contain a line break.
+        """Whether no secret in play can contain a line break.
 
-        True in every real case — a web-service token is one line — and
-        checked rather than assumed, because a secret that did contain one
-        would make the newline shortcut unsound.
+        Always true for the registry: :func:`remember_secret` refuses a
+        multi-line value. It is still checked rather than assumed, because
+        a caller may pass its own *secrets* sequence to this class, and
+        :func:`_forms` filters those on length alone — a secret spanning a
+        line break would make the newline shortcut unsound.
         """
         return not any(
             "\n" in form or "\r" in form for form in _forms(self._secrets)
         )
 
     def feed(self, text: str) -> str:
-        """Return the redacted text that is safe to emit now."""
-        buffered = self._pending + text
+        """Return the redacted text that is safe to emit now.
+
+        Redaction runs on the whole buffer first and the cut is chosen on
+        the *cleaned* text, so nothing that matched can be split by it.
+        """
+        cleaned = redact_text(self._pending + text, secrets=self._secrets)
         cut = 0
         if self._newline_is_a_boundary():
-            cut = buffered.rfind("\n") + 1
+            cut = cleaned.rfind("\n") + 1
         hold = self._hold_size()
-        if len(buffered) - cut > hold:
-            cut = len(buffered) - hold
-        self._pending = buffered[cut:]
-        head = buffered[:cut]
-        return redact_text(head, secrets=self._secrets) if head else ""
+        if len(cleaned) - cut > hold:
+            cut = len(cleaned) - hold
+        self._pending = cleaned[cut:]
+        return cleaned[:cut]
 
     def drain(self) -> str:
-        """Return everything still held, redacted, and forget it."""
+        """Return everything still held, redacted, and forget it.
+
+        The held text has already been through :func:`redact_text` in
+        :meth:`feed`; running it again costs nothing and keeps this method
+        correct on its own terms rather than on its caller's.
+        """
         pending, self._pending = self._pending, ""
         return redact_text(pending, secrets=self._secrets) if pending else ""
 

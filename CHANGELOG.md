@@ -119,21 +119,51 @@ All notable changes to Worsaga are documented in this file.
   `worsaga changes` and `get_changes()` replay, so no configuration turns
   that surface into a feed of instructor comments.
 
-  Existing caches migrate silently. The grades fingerprint is versioned, so
-  the first sync after upgrading recognises rows written in the old shape,
-  adopts them, and reports them as
-  `N re-fingerprinted (storage format changed, not Moodle)` — rather than
-  telling you that every grade you have ever received changed today.
-  Adopting is not the same as going blind: the fields whose meaning did not
-  move (grade, percentage, status, graded, graded date) are still compared,
-  so a grade that genuinely changed on that same run is still reported. The
-  one thing that cannot be judged is feedback itself, since the old row
-  holds text and the new one holds a hash; a feedback-only edit made across
-  the upgrade is caught on the following sync. A fingerprint this version
-  cannot recognise at all — empty, truncated, or written by a *newer*
-  Worsaga after a downgrade — is adopted without any event, and the
-  round-trip is safe: an older Worsaga rewrites bare fingerprints, and the
-  next upgrade migrates them again silently.
+  **The text already in your cache is removed, not just the text from now
+  on.** Changing what a sync writes would have left every existing cache
+  exactly as it was: a grade row for an item that never turns up in another
+  snapshot is never rewritten, and every grade change event ever recorded
+  holds the before-and-after feedback it was recorded with, which
+  `worsaga changes` replays for as long as the cache exists. So the first
+  time this version opens an older cache it scrubs both — the stored grade
+  rows and the recorded change events — replacing the words with the same
+  presence flag and hash a new sync writes, and then rebuilds the database
+  file, because SQLite otherwise leaves the old, longer record sitting in
+  free space where anything reading the file as bytes would still find it.
+  It runs once. The row rewrite is a single transaction, so a cache it
+  cannot finish is left untouched and retried the next time rather than
+  failing to open; the file rebuild cannot be part of that transaction
+  (SQLite will not rebuild a database inside one) and is tracked on its
+  own, so a rebuild that could not run — a busy database, a full disk — is
+  retried on a later open instead of being recorded as done while the
+  words are still there.
+
+  Scrubbed rows are re-fingerprinted to the new shape at the same time, so
+  the first sync after upgrading is a straight comparison: an unchanged
+  gradebook reports nothing, a grade that moved is reported, and a
+  feedback-only edit made across the upgrade is caught on that first sync
+  rather than a sync later. Each row is re-fingerprinted only once it has
+  been *checked*: an older Worsaga hashed the gradebook item it fetched
+  and then wrote a sanitized copy of it, so recomputing that old hash from
+  the stored row says whether the two still correspond. Where they do not
+  — the sanitizer edited something that looked like a credential inside
+  the feedback — the cached words are not the words Moodle sent, and
+  hashing them would report a feedback change nobody made, so that row
+  keeps its old fingerprint and is adopted quietly on the next sync
+  instead. It gives up first-sync detection for that rare row rather than
+  inventing an event, and it costs nothing for every other row, including
+  feedback that merely happens to contain `***` or the word REDACTED. Rows the scrub did not reach — a cache written
+  by a *newer* Worsaga and then opened by an older one, which rewrites bare
+  fingerprints on its way past — are still recognised as an older shape by
+  the versioned grades fingerprint, adopted rather than reported, and
+  counted as `N re-fingerprinted (storage format changed, not Moodle)`:
+  never as "every grade you have ever received changed today". Adopting is
+  not going blind, either — the fields whose meaning did not move (grade,
+  percentage, status, graded, graded date) are still compared, so a real
+  change on that same run is still reported. A fingerprint this version
+  cannot recognise at all (empty, truncated, or tagged with a version it
+  has never heard of) is adopted with no event, because a value nothing can
+  be inferred from must not be turned into a diff nobody can trust.
 - **The MCP server now registers 14 of its 26 tools by default.** The
   default profile is the authenticated user's own academic picture:
   `list_courses`, `get_deadlines`, `get_grades`, `get_grade_summary`,

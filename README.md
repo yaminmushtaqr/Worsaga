@@ -491,9 +491,23 @@ Pass `--store-feedback` (or set `WORSAGA_SYNC_STORE_FEEDBACK=1`) if you do
 want the text cached. Even then it stays out of the recorded change events
 that `worsaga changes` and the MCP `get_changes()` replay.
 
-The first sync after upgrading to this behaviour reports the affected grade
-items as `re-fingerprinted (storage format changed, not Moodle)` and emits
-no change events for them — a storage change is not news about your course.
+Upgrading also removes the feedback an earlier version already cached. The
+first time this version opens an older cache it scrubs the stored grade
+rows *and* the change events `worsaga changes` replays, then rebuilds the
+database file so the words are not left behind in freed pages. Those rows
+are re-fingerprinted to the new shape at the same time, so the first sync
+afterwards is an ordinary comparison: nothing is reported for a gradebook
+that did not change, and an edit made across the upgrade is reported once.
+A row the scrub did not reach — a cache shared with an older Worsaga, which
+rewrites fingerprints on its way past — is still recognised as an older
+shape and counted as `re-fingerprinted (storage format changed, not
+Moodle)` with no change event, because a storage change is not news about
+your course. The same applies to a row whose cached feedback an older
+Worsaga had already rewritten to hide something that looked like a
+credential — detected by rechecking that row's old fingerprint against
+what is stored, not by guessing from the words: those stored words are not
+the words Moodle sent, so the row is adopted quietly rather than compared
+and reported as a change nobody made.
 
 `worsaga sync` exits **1** when it could not fetch a single category, so a
 script or a scheduled job can tell a working sync from one that silently

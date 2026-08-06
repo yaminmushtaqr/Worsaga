@@ -100,7 +100,12 @@ from worsaga.client import (
     MoodleClient,
     MoodleRateLimitedError,
 )
-from worsaga.config import MoodleConfig, default_downloads_dir
+from worsaga.config import (
+    MoodleConfig,
+    _find_config_file,
+    _load_config_file,
+    default_downloads_dir,
+)
 from worsaga.courses import (
     CourseAmbiguousError,
     CourseResolutionError,
@@ -142,6 +147,7 @@ from worsaga.redact import (
     install_log_redaction,
     redact_payload,
     redact_text,
+    remember_secret,
 )
 from worsaga.studypack import build_study_pack as _build_study_pack
 from worsaga.studypack import write_study_pack as _write_study_pack
@@ -309,12 +315,14 @@ MCP_CAPABILITIES: dict[str, tuple[str, ...]] = {
     # Writes the local sync cache, and can collect from Moodle.
     #
     # ``get_changes`` is deliberately *not* here. It makes no request and
-    # writes nothing: it replays events from data the user already chose
+    # collects nothing: it replays events from data the user already chose
     # to sync, and forums are outside the unattended collection default,
     # so by default the feed it replays is the user's own deadlines,
     # files, and grades. Gating a local, read-only view of the user's own
     # material behind the capability that triggers collection would price
-    # the two very differently from what they cost.
+    # the two very differently from what they cost. (Opening the cache can
+    # write to it once, when a database an older Worsaga wrote is migrated
+    # to remove stored feedback text. That write only ever deletes.)
     "sync": ("sync_now",),
     # Fetches file *contents* from Moodle and (mostly) writes them to
     # disk. get_weekly_summary belongs here despite its name: it is not a
@@ -1519,6 +1527,12 @@ def get_changes(
     and ``feedback_hash``, never as text: whether an instructor's comment
     changed is visible, what it said is not stored here.
 
+    One exception to "makes no request and writes nothing": the first
+    time this opens a cache written by an older Worsaga, that cache is
+    migrated once - instructor feedback text left in stored rows and in
+    recorded events is removed and the file is rebuilt. It is a write to
+    Worsaga's own cache file, never a request, and it only deletes.
+
     Parameters
     ----------
     since_days : int
@@ -1847,6 +1861,50 @@ def profile_summary() -> str:
     )
 
 
+def _arm_redaction() -> None:
+    """Register the token before the server can be asked anything.
+
+    Every other redaction surface here depends on the secret registry, and
+    until this ran the registry was armed only as a side effect of the
+    first tool body building a :class:`~worsaga.config.MoodleConfig`. An
+    argument-validation failure happens *before* any tool body, so on a
+    freshly started server the very first call — a token pasted into a
+    mistyped argument by an agent that misread the schema — came back as a
+    ``ToolError`` quoting it verbatim, with nothing registered to strip.
+
+    Three sources, all best effort, none of which may stop the server: an
+    unconfigured install, demo mode, and an unreadable credentials file
+    are all normal ways to run this process.
+
+    The *raw* credentials file is read before the config is built, and on
+    purpose. :meth:`MoodleConfig.load` validates as it goes, so a file
+    holding a perfectly real token beside a malformed URL or user id
+    raises before anything is registered — and that file is exactly the
+    one whose owner then sees a startup error quoting their settings back.
+    Taking the token out of the JSON first means a configuration mistake
+    cannot cost the redactor its secret.
+    """
+    remember_secret(os.environ.get("WORSAGA_TOKEN", ""))
+    try:
+        path = _find_config_file()
+        if path is not None:
+            raw = _load_config_file(path)
+            if isinstance(raw, dict):
+                remember_secret(raw.get("token"))
+    except Exception:
+        # Missing, unreadable, or not JSON at all. The full load below
+        # reports configuration problems; this one only ever arms.
+        pass
+    try:
+        # Building the config registers its own token; the explicit call
+        # says so at the call site rather than relying on a side effect.
+        remember_secret(MoodleConfig.load().token)
+    except Exception:
+        # No credentials to arm from. The sources above still stand, and a
+        # tool that does reach MoodleConfig later arms the registry itself.
+        pass
+
+
 def main() -> None:
     """Entry point when running ``python -m worsaga.mcp_server``.
 
@@ -1866,9 +1924,14 @@ def main() -> None:
       handler captured ``sys.stderr`` then, so wrapping the stream now
       would not reach it.
 
+    All three strip *registered* secrets, so :func:`_arm_redaction` runs
+    first: a redactor that has not been told the token yet is a redactor
+    that prints it.
+
     ``sys.stderr`` is wrapped as well, for anything that writes to it
     directly and for handlers installed later.
     """
+    _arm_redaction()
     install_log_redaction()
     sys.stderr = RedactingStream(sys.stderr)
     print(profile_summary(), file=sys.stderr, flush=True)

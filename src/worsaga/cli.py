@@ -41,6 +41,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 import urllib.error
 from pathlib import Path
@@ -2687,7 +2688,70 @@ def _reconfigure_streams() -> None:
             pass
 
 
-def _redact_streams() -> tuple[tuple, tuple]:
+#: A command-line flag that takes a credential as its *next* argument:
+#: ``--token``, and any other option whose name ends in ``token``
+#: (``--setup-token``). Matched in full, so ``--token-stdin`` — which
+#: takes no value — is not one of them.
+_TOKEN_FLAG_RE = re.compile(r"--[A-Za-z0-9-]*token")
+
+
+def _remember_argv_tokens(argv: list[str] | None) -> None:
+    """Register a token written on the command line, before parsing it.
+
+    ``_apply_token_source`` registers ``--token`` too, but only after
+    ``parse_args`` has *succeeded*. Argparse quotes what it could not
+    parse — ``unrecognized arguments: --token SECRET``, ``invalid int
+    value: 'SECRET'``, ``ignored explicit argument 'SECRET'`` — and writes
+    it to stderr on its way to exiting, so every failing invocation
+    printed the value the stream wrapper had not yet been told about.
+    Reading argv directly needs no parser and cannot fail: an item that
+    looks like a token option arms the redactor whether or not the rest of
+    the command line makes sense.
+
+    The two forms are treated differently, and deliberately so:
+
+    - ``--NAME=VALUE`` registers ``VALUE`` whenever *NAME* contains
+      "token" at all, value-less flags included. ``--token-stdin=SECRET``
+      is always an error, and the value is precisely what argparse echoes
+      back. Over-registering here can only make this process redact more
+      of its own output.
+    - ``--NAME VALUE`` registers the next item only for a flag whose name
+      *ends* in "token", which is the shape of a flag that takes one.
+      Registering whatever follows a bare ``--token-stdin`` would register
+      the *subcommand* — and then ``notifications`` would be struck out of
+      every line this run printed.
+
+    The second rule accepts flags this CLI does not define, and that is
+    the intended trade rather than an oversight. Somebody typing
+    ``--wstoken`` or ``--api-token`` has typed a credential after it far
+    more often than not, and the command has already failed by the time
+    it matters: the whole cost is one starred word in the error message of
+    an invocation that exits 2. Restricting the rule to the two known
+    flags would print a real token in exchange for tidier wording on a
+    command that did not run.
+
+    That leaves one gap: ``--token-stdin SECRET``, written with a space,
+    is a value argparse reports as an unrecognised argument, and this
+    cannot tell it from a subcommand. Accepted, because guessing wrong in
+    the other direction corrupts ordinary output.
+
+    Values too short to be a token are ignored by
+    :func:`~worsaga.redact.remember_secret`, so an accidental match on
+    something harmless costs nothing.
+    """
+    items = list(sys.argv[1:] if argv is None else argv)
+    for index, item in enumerate(items):
+        if not isinstance(item, str) or not item.startswith("--"):
+            continue
+        name, separator, value = item.partition("=")
+        if separator:
+            if "token" in name.lower():
+                remember_secret(value)
+        elif _TOKEN_FLAG_RE.fullmatch(name) and index + 1 < len(items):
+            remember_secret(items[index + 1])
+
+
+def _redact_streams(argv: list[str] | None = None) -> tuple[tuple, tuple]:
     """Wrap stdout/stderr so nothing leaves this process carrying a token.
 
     Returns ``(originals, wrappers)`` — the originals for the caller to
@@ -2697,12 +2761,14 @@ def _redact_streams() -> tuple[tuple, tuple]:
     redacts" is a property that survives the next feature and "every
     print remembered to" is not.
 
-    Also arms the redactor from ``WORSAGA_TOKEN`` and attaches the
-    logging filter, so a warning logged by an orchestrator — which reaches
-    stderr through a handler, not through ``print`` — is covered by the
-    same rule.
+    Also arms the redactor from ``WORSAGA_TOKEN`` and from *argv*, and
+    attaches the logging filter — so a warning logged by an orchestrator
+    (which reaches stderr through a handler, not through ``print``) and a
+    parse failure quoting the command line back are covered by the same
+    rule.
     """
     remember_secret(os.environ.get("WORSAGA_TOKEN", ""))
+    _remember_argv_tokens(argv)
     install_log_redaction()
     original = (sys.stdout, sys.stderr)
     wrappers = (RedactingStream(sys.stdout), RedactingStream(sys.stderr))
@@ -2712,7 +2778,7 @@ def _redact_streams() -> tuple[tuple, tuple]:
 
 def main(argv: list[str] | None = None) -> None:
     _reconfigure_streams()
-    original_streams, wrappers = _redact_streams()
+    original_streams, wrappers = _redact_streams(argv)
     try:
         _main(argv)
     finally:

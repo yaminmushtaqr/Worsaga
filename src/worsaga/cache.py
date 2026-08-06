@@ -19,6 +19,14 @@ sanitized before every write —
   ``%253D``;
 - tuples and sets are converted to sanitized lists.
 
+Opening a store also runs any one-time migration the database has not
+had yet. There is one: :meth:`CacheStore._scrub_stored_feedback` removes
+instructor feedback text from grade rows and from recorded grade change
+events written before the sync stopped storing it. A privacy default
+that only applies to data collected *after* the upgrade would leave the
+text sitting in the cache of everybody who already had one, and the
+change history is replayed by ``worsaga changes`` indefinitely.
+
 On POSIX the cache file is created owner-only (0600) *before* SQLite
 opens it, so the database and its rollback journal are private from the
 first byte, matching the credential file treatment. Set
@@ -34,6 +42,7 @@ are deliberately unguarded — see :mod:`worsaga.principal` for why.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -43,6 +52,11 @@ from typing import Any
 import platformdirs
 
 from worsaga.config import _absolute_override
+from worsaga.grademeta import (
+    grade_fingerprint,
+    legacy_grade_fingerprint,
+    scrub_feedback,
+)
 from worsaga.principal import (
     bind_principal as _bind_principal,
 )
@@ -52,8 +66,29 @@ from worsaga.principal import (
 from worsaga.redact import redact_text
 from worsaga.secureio import ensure_private_file
 
+logger = logging.getLogger(__name__)
+
 _APP_NAME = "worsaga"
 SCHEMA_VERSION = 1
+
+#: Meta keys recording how far the one-time feedback scrub got, in two
+#: phases, because the two halves of it can fail independently: the rows
+#: are rewritten inside a transaction, and the free space they used to
+#: occupy is reclaimed afterwards by ``VACUUM``, which is not
+#: transactional and can fail on its own (a busy database, a full disk).
+#: One marker for both would either claim a reclaim that never happened —
+#: leaving the words recoverable from the file with nothing left to retry
+#: — or redo the whole scrub to retry a rebuild.
+FEEDBACK_SCRUB_META_KEY = "grades_feedback_scrubbed"
+FEEDBACK_RECLAIM_META_KEY = "grades_feedback_reclaimed"
+
+#: Revision of the scrub. Both markers hold it as an integer: a stored
+#: value below this reruns the migration (a corrected revision must reach
+#: caches the old one already touched), a value above it means a newer
+#: Worsaga has been here and nothing is touched, and anything that is not
+#: an integer at all is treated as never-run — the scrub is idempotent,
+#: so rerunning it on a corrupt marker costs one pass and no risk.
+FEEDBACK_SCRUB_VERSION = 1
 
 #: What to tell a user whose cache belongs to another account.
 _CACHE_REMEDY = (
@@ -234,6 +269,7 @@ class CacheStore:
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
             ("schema_version", str(SCHEMA_VERSION)),
         )
+        self._scrub_stored_feedback()
 
     def __enter__(self) -> CacheStore:
         return self
@@ -255,6 +291,284 @@ class CacheStore:
     def commit(self) -> None:
         if self._conn.in_transaction:
             self._conn.execute("COMMIT")
+
+    # ── One-time migrations ───────────────────────────────────────
+
+    def _meta_version(self, key: str) -> int | None:
+        """Return *key* as an integer, or None if absent or not one.
+
+        "Not an integer" and "not there" are answered the same way on
+        purpose: a marker nobody can read says nothing about what has
+        been done to the database, and the migration it guards is safe to
+        repeat.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return int(str(row[0]).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _set_meta(self, key: str, value: Any) -> None:
+        self._conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)"
+            " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+
+    def _scrub_stored_feedback(self) -> None:
+        """Remove instructor feedback text left in rows written earlier.
+
+        The sync stopped persisting feedback text, but that only governs
+        what is written from then on. Two places keep the old text
+        indefinitely without this:
+
+        - a cached grade row for an item that never appears in another
+          snapshot (a finished module, a course the user is no longer
+          enrolled on) is never rewritten, so it keeps its text forever;
+        - every recorded ``grade_updated`` event holds a before/after
+          diff view that carried the feedback *field* when it was
+          recorded, and ``worsaga changes`` replays that history to a
+          person or an agent for as long as the cache exists.
+
+        So both tables are scrubbed once, here, when a database that has
+        not had it is opened. Grade rows are also re-fingerprinted to the
+        current shape from the scrubbed payload, which is what makes the
+        next sync a straight comparison: a feedback-only edit made across
+        the upgrade is detected on the first sync afterwards rather than
+        adopted as an unreadable older shape.
+
+        **Two phases, two markers.** Rewriting the rows and reclaiming the
+        space they used are separate promises that fail separately, so
+        each records itself (see :data:`FEEDBACK_SCRUB_META_KEY`). Phase
+        one is the row rewrite, and its marker is written *inside* the
+        same transaction, so it can never claim a scrub that did not land.
+        Phase two is ``VACUUM``, and its marker is written only after that
+        succeeded — a rebuild that failed is retried on a later open,
+        on its own, rather than being remembered as done. That matters
+        because ``VACUUM`` here is not housekeeping: SQLite leaves the
+        *old*, longer record in the free space of its page, so until the
+        file is rebuilt the instructor's words are still in it, findable
+        by anything that reads it as bytes.
+
+        Nothing here may stop a cache from opening. Any failure — a busy
+        database, an unreadable row, a full disk — rolls back, is logged
+        at debug level, and leaves the markers saying what is genuinely
+        still outstanding.
+
+        It deliberately runs before :meth:`bind_principal`, so a cache
+        that belongs to another account is scrubbed too. The migration
+        only ever *deletes* somebody's text; it reads nothing out, writes
+        nothing new, and doing it for a person whose account does not
+        match this run is exactly what that person would want done with
+        their gradebook comments.
+        """
+        try:
+            scrubbed = self._meta_version(FEEDBACK_SCRUB_META_KEY)
+            reclaimed = self._meta_version(FEEDBACK_RECLAIM_META_KEY)
+        except sqlite3.Error as exc:  # pragma: no cover - unreadable meta
+            logger.debug("could not read the cache migration markers: %s", exc)
+            return
+        if scrubbed is not None and scrubbed > FEEDBACK_SCRUB_VERSION:
+            # Written by a newer Worsaga. It knows things this build does
+            # not; leave its work alone.
+            return
+        if scrubbed == FEEDBACK_SCRUB_VERSION:
+            if reclaimed is None or reclaimed < FEEDBACK_SCRUB_VERSION:
+                self._reclaim_scrubbed_space()
+            return
+        self._run_feedback_scrub()
+
+    def _run_feedback_scrub(self) -> None:
+        """Phase one: rewrite the rows, in one transaction with its marker.
+
+        The markers are read **again** here, inside the write lock. The
+        check that sent us here was unlocked, and between the two another
+        process may have scrubbed this cache and had its rebuild fail — in
+        which case this transaction finds nothing left carrying feedback
+        and must not read that as "a clean cache, nothing to reclaim".
+        Doing so would record a reclaim nobody performed and leave the old
+        records in free space with nothing left to retry them. Only a
+        transaction that itself finds no phase-one marker *and* no
+        feedback-bearing row may claim that.
+        """
+        items = events = 0
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            scrubbed = self._meta_version(FEEDBACK_SCRUB_META_KEY)
+            reclaimed = self._meta_version(FEEDBACK_RECLAIM_META_KEY)
+            if scrubbed is not None and scrubbed > FEEDBACK_SCRUB_VERSION:
+                # A newer Worsaga got here while we were looking.
+                self._conn.execute("COMMIT")
+                return
+            first = scrubbed is None
+            if scrubbed != FEEDBACK_SCRUB_VERSION:
+                items = self._scrub_feedback_from_items()
+                events = self._scrub_feedback_from_changes()
+                self._set_meta(FEEDBACK_SCRUB_META_KEY, FEEDBACK_SCRUB_VERSION)
+                if first and not (items or events):
+                    # This transaction found an unscrubbed cache with
+                    # nothing to scrub, so there is no free space holding
+                    # anything: phase two is finished before it starts, and
+                    # recording that keeps a clean cache from rebuilding
+                    # itself on every open forever.
+                    self._set_meta(
+                        FEEDBACK_RECLAIM_META_KEY, FEEDBACK_SCRUB_VERSION,
+                    )
+                    self._conn.execute("COMMIT")
+                    return
+            self._conn.execute("COMMIT")
+        except Exception as exc:
+            # Broad on purpose. A pathological row can raise things SQLite
+            # never would (``RecursionError`` out of ``json``), and a
+            # migration that let one of those escape would abort the
+            # constructor with a transaction still open.
+            logger.debug("deferred the stored-feedback scrub: %s", exc)
+            self._rollback_quietly()
+            return
+        if items or events:
+            logger.debug(
+                "removed stored feedback text from %d grade rows and %d "
+                "change events in %s", items, events, self.path,
+            )
+        if reclaimed is None or reclaimed < FEEDBACK_SCRUB_VERSION:
+            self._reclaim_scrubbed_space()
+
+    def _reclaim_scrubbed_space(self) -> None:
+        """Phase two: rebuild the file, then record that it was rebuilt.
+
+        Retried on a later open if it fails, which is why its marker is
+        separate. If the rebuild succeeds and the marker write does not,
+        the next open rebuilds an already-clean file: wasted work once,
+        never a false claim.
+        """
+        try:
+            self._conn.execute("VACUUM")
+            self._set_meta(FEEDBACK_RECLAIM_META_KEY, FEEDBACK_SCRUB_VERSION)
+        except Exception as exc:
+            logger.debug(
+                "could not rebuild %s after scrubbing; will retry on the "
+                "next open: %s", self.path, exc,
+            )
+
+    def _rollback_quietly(self) -> None:
+        try:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+        except sqlite3.Error:  # pragma: no cover - nothing left to do
+            pass
+
+    def _decode_row(self, stored: Any) -> Any:
+        """Return one stored JSON column, or None when it cannot be read.
+
+        ``RecursionError`` is caught alongside the parse errors because
+        deeply nested JSON raises it rather than a ``ValueError``, and one
+        pathological row must cost that row, not the migration.
+        """
+        try:
+            return json.loads(stored)
+        except (TypeError, ValueError, RecursionError) as exc:
+            logger.debug("skipped an unreadable row during migration: %s", exc)
+            return None
+
+    def _encode_row(self, value: Any) -> str | None:
+        """Return the JSON to store, or None when it will not encode."""
+        try:
+            return json.dumps(value, sort_keys=True, default=str)
+        except (TypeError, ValueError, RecursionError) as exc:
+            logger.debug("skipped a row that would not re-encode: %s", exc)
+            return None
+
+    def _scrub_feedback_from_items(self) -> int:
+        """Scrub cached grade payloads; returns how many were rewritten.
+
+        Only the ``grades`` category, only rows that actually carry a
+        ``feedback`` key, and only the payload and the fingerprint: the
+        timestamps are left alone because nothing about the item changed
+        in Moodle. A row that will not parse is skipped rather than
+        deleted — an unreadable row is already inert, and the next sync
+        overwrites it.
+
+        The fingerprint is rewritten to the current shape only when the
+        stored payload can be *proved* to be the one its fingerprint was
+        computed from. An older Worsaga fingerprinted the record it
+        fetched and then stored a sanitized copy, so where the sanitizer
+        edited the feedback the cached words are not the words Moodle
+        sent, and a hash of them can never equal the hash the next sync
+        computes from the live text — re-fingerprinting such a row would
+        announce a feedback change nobody made. Recomputing the legacy
+        fingerprint over the stored payload
+        (:func:`worsaga.grademeta.legacy_grade_fingerprint`) settles it
+        exactly: equal means faithful, and anything else keeps its stored
+        fingerprint and takes the sync's existing migration path instead —
+        adopted quietly, still judged on the fields that did not move.
+        Guessing from the text itself was the alternative, and it
+        mistook honest feedback containing ``***`` for an edited row.
+        """
+        rows = self._conn.execute(
+            "SELECT site, item_key, fingerprint, payload FROM items"
+            " WHERE category = 'grades'"
+        ).fetchall()
+        rewritten = 0
+        for site, item_key, fingerprint, stored in rows:
+            payload = self._decode_row(stored)
+            if not isinstance(payload, dict) or "feedback" not in payload:
+                continue
+            faithful = fingerprint == legacy_grade_fingerprint(payload)
+            scrubbed = scrub_feedback(payload)
+            text = self._encode_row(scrubbed)
+            if text is None:
+                continue
+            self._conn.execute(
+                "UPDATE items SET payload = ?, fingerprint = ?"
+                " WHERE site = ? AND category = 'grades' AND item_key = ?",
+                (
+                    text,
+                    grade_fingerprint(scrubbed) if faithful else fingerprint,
+                    site,
+                    item_key,
+                ),
+            )
+            rewritten += 1
+        return rewritten
+
+    def _scrub_feedback_from_changes(self) -> int:
+        """Scrub recorded grade events; returns how many were rewritten.
+
+        The feedback field lives inside the ``before``/``after`` diff
+        views, and is replaced there by the same presence flag and hash a
+        current event carries — so a replayed old event has the shape an
+        agent reads today, minus the words.
+        """
+        rows = self._conn.execute(
+            "SELECT id, detail FROM changes"
+            " WHERE category = 'grades' OR kind = 'grade_updated'"
+        ).fetchall()
+        rewritten = 0
+        for row_id, stored in rows:
+            detail = self._decode_row(stored)
+            if not isinstance(detail, dict):
+                continue
+            scrubbed = dict(detail)
+            touched = False
+            for side in ("before", "after"):
+                view = scrubbed.get(side)
+                if isinstance(view, dict) and "feedback" in view:
+                    scrubbed[side] = scrub_feedback(view)
+                    touched = True
+            if not touched:
+                continue
+            text = self._encode_row(scrubbed)
+            if text is None:
+                continue
+            self._conn.execute(
+                "UPDATE changes SET detail = ? WHERE id = ?", (text, row_id),
+            )
+            rewritten += 1
+        return rewritten
 
     # ── Account binding ───────────────────────────────────────────
 

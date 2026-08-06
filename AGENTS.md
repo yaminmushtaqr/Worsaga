@@ -131,6 +131,14 @@ Cache invariants:
   never as text, unless `--store-feedback` /
   `WORSAGA_SYNC_STORE_FEEDBACK=1` says otherwise. Change events never
   carry the text in any configuration.
+- Opening a cache runs any one-time migration it has not had, marked in
+  `meta` as an integer version. There is one: feedback text is scrubbed
+  out of grade rows and recorded change events written before the rule
+  above, those rows are re-fingerprinted, and the file is rebuilt (SQLite
+  leaves the old record in free space otherwise). The rewrite and the
+  rebuild are marked separately, because a rebuild that fails must be
+  retried on a later open rather than remembered as done. It must never
+  make opening a cache fail, whatever a row contains.
 - A failed category fetch is a warning + skip (`"synced": false`), never an
   empty snapshot. A category that was not *selected* is a different thing:
   `"selected": false`, no events, cached rows untouched, and excluded from

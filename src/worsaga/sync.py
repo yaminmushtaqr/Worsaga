@@ -59,7 +59,9 @@ disagree about them:
   asked for. The cache keeps ``feedback_present`` and a truncated
   ``feedback_hash`` so a feedback-only change is still detected, and the
   full text stays where it was always fine: the live ``worsaga grades``
-  view, which fetches and prints it without storing anything.
+  view, which fetches and prints it without storing anything. Text an
+  earlier version already wrote is removed when the cache is opened —
+  see :meth:`worsaga.cache.CacheStore._scrub_stored_feedback`.
 
 Shared by the CLI (``worsaga sync`` / ``worsaga changes``) and the MCP
 server (``sync_now`` / ``get_changes``). Tokens and authenticated URLs
@@ -68,8 +70,6 @@ never reach the cache — see :mod:`worsaga.cache`.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import re
@@ -82,6 +82,15 @@ from worsaga.client import MoodleClient, MoodleWriteAttemptError
 from worsaga.concurrency import ProgressCallback, run_parallel
 from worsaga.deadlines import get_upcoming_deadlines
 from worsaga.forums import normalize_forum_discussions, normalize_forums
+from worsaga.grademeta import (
+    FEEDBACK_HASH_CHARS,
+    GRADE_FINGERPRINT_FIELDS,
+    GRADE_FINGERPRINT_VERSION,
+    feedback_fields,
+    feedback_hash,
+    fingerprint_digest,
+    tag_fingerprint,
+)
 from worsaga.grades import collect_grades
 from worsaga.materials import extract_materials, strip_file_urls
 from worsaga.models import change_record
@@ -116,12 +125,6 @@ SYNC_CATEGORIES_ENV = "WORSAGA_SYNC_CATEGORIES"
 #: Opt in to persisting full instructor feedback text in the local cache.
 #: Off by default everywhere; see :func:`resolve_store_feedback`.
 STORE_FEEDBACK_ENV = "WORSAGA_SYNC_STORE_FEEDBACK"
-
-#: Hex characters kept from the feedback digest. Sixty-four bits is far
-#: more than change detection over one person's gradebook needs, and a
-#: short digest is a worse oracle for confirming a guess at the text than
-#: a full one would be.
-FEEDBACK_HASH_CHARS = 16
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -203,31 +206,10 @@ def resolve_store_feedback(store_feedback: bool | None = None) -> bool:
 
 #: A fingerprint written before the shape was versioned: a bare SHA-256
 #: hex digest and nothing else. Matched exactly, so a truncated, empty, or
-#: differently-tagged value is classified as unknown rather than guessed at.
+#: differently-tagged value is classified as unknown rather than guessed
+#: at. It is also what has to follow a ``v<n>:`` tag before the tagged
+#: form counts as the current shape.
 _BARE_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
-
-
-def _fingerprint(payload: dict[str, Any], fields: tuple[str, ...]) -> str:
-    """Return a stable hash over the change-relevant fields of *payload*."""
-    data = {field: payload.get(field) for field in fields}
-    text = json.dumps(data, sort_keys=True, default=str)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def feedback_hash(feedback: Any) -> str:
-    """Return the stored stand-in for one grade item's feedback text.
-
-    Empty for no feedback, otherwise the leading
-    :data:`FEEDBACK_HASH_CHARS` of its SHA-256. Two runs that see the same
-    words produce the same value, so a feedback-only edit is still a
-    detected grade change — without the words themselves ever reaching the
-    cache, the change log, or a change event replayed to an agent.
-    """
-    text = str(feedback or "")
-    if not text:
-        return ""
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    return digest[:FEEDBACK_HASH_CHARS]
 
 
 def _prepare_grade(
@@ -241,9 +223,7 @@ def _prepare_grade(
     suddenly looks changed.
     """
     prepared = dict(payload)
-    text = str(payload.get("feedback") or "")
-    prepared["feedback_present"] = bool(text)
-    prepared["feedback_hash"] = feedback_hash(text)
+    prepared.update(feedback_fields(payload))
     if not store_feedback:
         prepared.pop("feedback", None)
     return prepared
@@ -303,13 +283,17 @@ class _Category:
         so the three categories that never changed shape do not all look
         modified. A category that *has* changed which fields it
         fingerprints carries a ``v<n>:`` prefix, which is what lets
-        :meth:`is_current_fingerprint` recognise a row written by an
-        older Worsaga instead of reporting it as a change.
+        :meth:`fingerprint_state` recognise a row written by an older
+        Worsaga instead of reporting it as a change.
+
+        The computation lives in :mod:`worsaga.grademeta` because the
+        cache's one-time feedback scrub has to write exactly the same
+        value for a grade row it rewrites.
         """
-        digest = _fingerprint(payload, self.fingerprint_fields)
-        if self.fingerprint_version <= 1:
-            return digest
-        return f"v{self.fingerprint_version}:{digest}"
+        return tag_fingerprint(
+            fingerprint_digest(payload, self.fingerprint_fields),
+            self.fingerprint_version,
+        )
 
     def fingerprint_state(self, value: Any) -> str:
         """Classify a stored fingerprint: ``current``, ``legacy``, ``unknown``.
@@ -324,9 +308,19 @@ class _Category:
         newer Worsaga and then opened by an older one) cannot be reasoned
         about at all: it is adopted silently, because guessing would mean
         either a change storm or a fabricated diff.
+
+        Both recognised shapes are matched in full. A ``v2:`` prefix on
+        its own used to be enough to call a value current, so a truncated
+        or corrupt row (``v2:``, ``v2:deadbeef``) was compared against a
+        real digest, never matched it, and produced a change event for a
+        grade nobody had touched — the exact fabricated diff the paragraph
+        above says is not allowed.
         """
         text = str(value or "")
-        if text.startswith(f"v{self.fingerprint_version}:"):
+        prefix = f"v{self.fingerprint_version}:"
+        if text.startswith(prefix) and _BARE_DIGEST_RE.fullmatch(
+            text[len(prefix):]
+        ):
             return "current"
         if self.fingerprint_version <= 1:
             # This category has never changed shape, so anything stored is
@@ -387,11 +381,10 @@ _CATEGORIES = {
         # feedback-only edit still changes the fingerprint, but neither the
         # items table nor a change event ever holds the text. Bumping the
         # version is what stops the field swap from reporting every grade
-        # in an existing cache as updated exactly once.
-        fingerprint_fields=(
-            "grade_display", "percentage", "status", "feedback_hash",
-        ),
-        fingerprint_version=2,
+        # in an existing cache as updated exactly once. Both come from
+        # worsaga.grademeta, which the cache migration reads as well.
+        fingerprint_fields=GRADE_FINGERPRINT_FIELDS,
+        fingerprint_version=GRADE_FINGERPRINT_VERSION,
         # The fields whose meaning is identical either side of the shape
         # change, so a migrating row can still be judged. Deliberately
         # excludes anything feedback-derived: the old row has the text and
@@ -1160,6 +1153,26 @@ def _build_change(
     )
 
 
+def _without_feedback_text(change: dict[str, Any]) -> dict[str, Any]:
+    """Return *change* with any feedback text dropped from its diff views.
+
+    Belt over the migration's braces. Recorded events are written without
+    feedback text and the cache scrubs the ones an older Worsaga wrote,
+    but this is the surface an agent reads, and it is worth one dict
+    comprehension to make "a change event never carries the words" true of
+    the replay itself rather than only of everything that writes to it.
+    """
+    cleaned = dict(change)
+    for side in ("before", "after"):
+        view = cleaned.get(side)
+        if isinstance(view, dict) and "feedback" in view:
+            cleaned[side] = {
+                field: value for field, value in view.items()
+                if field != "feedback"
+            }
+    return cleaned
+
+
 def get_recent_changes(
     site: str,
     *,
@@ -1173,6 +1186,12 @@ def get_recent_changes(
 
     ``since_ts`` (a Unix timestamp) takes precedence over ``since_days``
     so callers with sub-day windows are not rounded up to whole days.
+
+    Reads the local cache and makes no request. Opening the cache can
+    still *write* to it: the first open of a database an older Worsaga
+    wrote runs the one-time feedback scrub (see
+    :meth:`worsaga.cache.CacheStore._scrub_stored_feedback`), which
+    removes text rather than collecting any.
     """
     if category is not None and category not in SYNC_CATEGORIES:
         raise ValueError(
@@ -1182,9 +1201,10 @@ def get_recent_changes(
     if since_ts is None:
         since_ts = int(time.time()) - max(0, since_days) * 86400
     with CacheStore(cache_path) as cache:
-        return cache.get_changes(
+        events = cache.get_changes(
             site, since_ts=int(since_ts), category=category, limit=limit,
         )
+    return [_without_feedback_text(event) for event in events]
 
 
 def last_sync_at(

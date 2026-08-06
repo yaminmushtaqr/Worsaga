@@ -155,6 +155,30 @@ class TestRedactText:
         assert remember_secret("") is False
         assert remember_secret(None) is False
 
+    def test_a_value_with_an_internal_line_break_is_never_registered(self):
+        """No token spans a line, and the stream wrapper relies on that.
+
+        Its newline shortcut — emit a completed line at once — is only
+        sound while no registered secret can contain one, so the registry
+        refuses such a value rather than leaving it to be noticed later.
+        """
+        assert remember_secret("first line\nsecond line here") is False
+        assert remember_secret("carriage\rreturn value") is False
+        assert known_secrets() == ()
+
+    def test_surrounding_whitespace_is_stripped_not_refused(self):
+        """A trailing newline is how a token normally arrives.
+
+        Piped through ``--token-stdin``, read from a file, pasted into an
+        environment variable: refusing those would leave a real credential
+        unregistered for no security gain. The invariant the stream
+        wrapper needs is only that no *registered* secret contains a line
+        break, and stripping first gives exactly that.
+        """
+        assert remember_secret("\n  TOKENVALUE123 \n") is True
+        assert known_secrets() == ("TOKENVALUE123",)
+        assert redact_text("using TOKENVALUE123 now") == f"using {REDACTED} now"
+
     def test_an_empty_configured_token_redacts_nothing(self):
         redact.forget_secrets()
         assert redact_text("plain text") == "plain text"
@@ -248,6 +272,90 @@ class TestRedactingStream:
         stream = RedactingStream(sink)
         stream.write("x" * 100_000)
         assert len(sink.getvalue()) >= 100_000 - redact.STREAM_HOLD_CHARS - 64
+
+    def test_a_value_longer_than_the_hold_does_not_survive_the_cut(self, armed):
+        """The bounded hold used to be a hole, not just a bound.
+
+        One write of a ``token=`` parameter whose value is longer than
+        :data:`redact.STREAM_HOLD_CHARS` was cut before it was scanned:
+        the head matched and printed ``access_token=***``, and the tail —
+        the last 512 characters of the raw value — went out on the next
+        flush as ordinary text.
+        """
+        value = "A" * 600
+        sink = self._sink()
+        stream = RedactingStream(sink)
+        stream.write(f"?access_token={value}")
+        stream.flush()
+        output = sink.getvalue()
+        assert "A" * 10 not in output
+        assert output == f"?access_token={REDACTED}"
+
+    def test_a_secret_is_not_split_by_the_overflow_cut(self, armed):
+        """The same hole, reassembling a *registered* secret in the output.
+
+        A secret followed by enough characters to overflow the hold put
+        the front of it in the emitted head and the rest in the tail. The
+        two fragments arrive contiguously, so the complete token appears
+        in the reader's terminal even though neither half matched.
+        """
+        sink = self._sink()
+        stream = RedactingStream(sink)
+        stream.write(SENTINEL + "z" * 500)
+        stream.flush()
+        output = sink.getvalue()
+        assert SENTINEL not in output
+        for start in range(len(SENTINEL) - 10 + 1):
+            assert SENTINEL[start:start + 10] not in output
+        assert output == REDACTED + "z" * 500
+
+    def test_a_parameter_name_split_across_writes_is_still_caught(self, armed):
+        sink = self._sink()
+        stream = RedactingStream(sink)
+        stream.write("?access_tok")
+        stream.write("en=SECRETVALUE12345&x=1\n")
+        assert "SECRETVALUE" not in sink.getvalue()
+        assert sink.getvalue() == f"?access_token={REDACTED}&x=1\n"
+
+    def test_streamed_output_equals_one_shot_for_a_real_token(self):
+        """The guarantee, stated as an equality and checked exhaustively.
+
+        A Moodle web-service token is 32 hexadecimal characters: one line,
+        no parameter delimiter. For such a secret the streamed result is
+        the one-shot result, however the writes happen to be chopped up.
+        """
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        remember_secret(token)
+        text = (
+            "GET https://moodle.example.edu/webservice/rest/server.php"
+            f"?wstoken={token}&wsfunction=core_webservice_get_site_info\n"
+            f"retrying with {token}\n"
+        )
+        expected = redact_text(text)
+        assert token not in expected
+        for size in range(1, len(text) + 1):
+            sink = self._sink()
+            stream = RedactingStream(sink)
+            for start in range(0, len(text), size):
+                stream.write(text[start:start + size])
+            stream.flush()
+            assert sink.getvalue() == expected, f"chunk size {size}"
+
+    def test_rescanning_already_redacted_text_changes_nothing(self, armed):
+        """The held tail is scanned again on the next write.
+
+        That is only safe because redaction is idempotent on its own
+        output: ``***`` matches nothing, and a re-scanned ``name=***``
+        collapses to itself rather than growing.
+        """
+        text = f"a {REDACTED} b ?wstoken={REDACTED} c\n"
+        assert redact_text(text) == text
+        sink = self._sink()
+        stream = RedactingStream(sink)
+        for char in text:
+            stream.write(char)
+        stream.flush()
+        assert sink.getvalue() == text
 
     def test_reports_the_length_the_caller_wrote(self, armed):
         text = f"x{SENTINEL}"
@@ -786,6 +894,75 @@ def test_a_failing_command_still_restores_the_streams(monkeypatch):
     assert (sys.stdout, sys.stderr) == before
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sync", "--token", SENTINEL],
+        ["--token", SENTINEL, "sync", "--days", SENTINEL],
+        [f"--token={SENTINEL}", "sync", "--days", "not-a-number"],
+        [f"--token-stdin={SENTINEL}", "sync"],
+        [f"--setup-token={SENTINEL}", "sync"],
+        ["--wstoken", SENTINEL, "sync"],
+    ],
+    ids=["unrecognized-argument", "invalid-int", "joined-form",
+         "value-less-flag-given-a-value", "unknown-joined-flag",
+         "invented-token-flag"],
+)
+def test_a_token_in_a_failing_command_line_is_not_echoed(
+    capsys, monkeypatch, argv,
+):
+    """Argparse quotes what it could not parse — including the token.
+
+    ``_apply_token_source`` registers ``--token`` only after a successful
+    parse, so every *failing* invocation printed the value: "unrecognized
+    arguments: --token SECRET", "invalid int value: 'SECRET'". argv is
+    now scanned before the parser runs.
+
+    ``--wstoken`` is in the list deliberately: a flag Worsaga does not
+    define, whose value the user plainly meant as a credential. The scan
+    covers it, and the price is one starred word in the error message of a
+    command that was never going to run.
+    """
+    from worsaga import cli
+
+    redact.forget_secrets()
+    monkeypatch.delenv("WORSAGA_TOKEN", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(argv)
+    assert excinfo.value.code != 0
+    captured = capsys.readouterr()
+    assert SENTINEL not in captured.out
+    assert SENTINEL not in captured.err
+
+
+def test_the_argv_scan_ignores_flags_that_take_no_value(monkeypatch):
+    """``--token-stdin`` names no secret; the item after it is a command.
+
+    Registering it would strike the *subcommand* out of everything this
+    run printed — which is why the separated form is restricted to flags
+    that genuinely take a value, and the joined form is not.
+    """
+    from worsaga import cli
+
+    redact.forget_secrets()
+    cli._remember_argv_tokens(["--token-stdin", "notifications"])
+    assert known_secrets() == ()
+
+
+def test_a_stdin_run_redacts_the_token_and_nothing_else(capsys, monkeypatch):
+    """The other half of that trade, end to end through a real command."""
+    from worsaga import cli
+
+    redact.forget_secrets()
+    monkeypatch.delenv("WORSAGA_TOKEN", raising=False)
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{SENTINEL}\n"))
+    cli.main(["--demo", "--token-stdin", "notifications"])
+    captured = capsys.readouterr()
+    assert SENTINEL not in captured.out
+    assert REDACTED not in captured.out
+    assert "notifications" not in known_secrets()
+
+
 def test_output_held_by_the_wrapper_is_not_lost_at_exit(capsys, monkeypatch):
     """A command whose last line has no newline must still be printed."""
     from worsaga import cli
@@ -936,6 +1113,102 @@ def test_an_argument_validation_failure_is_redacted(leaky_mcp):
         )
     assert SENTINEL not in str(excinfo.value)
     assert REDACTED in str(excinfo.value)
+
+
+def test_a_fresh_server_is_armed_before_the_first_call(monkeypatch):
+    """The registry used to be armed only by the first tool body.
+
+    Argument validation runs *before* any tool body, so on a server that
+    had not answered a call yet there was nothing registered to strip: a
+    token pasted into a mistyped argument came back verbatim in the
+    ToolError. Start-up arms it instead.
+    """
+    pytest.importorskip("mcp")
+    from worsaga import mcp_server
+
+    redact.forget_secrets()
+    monkeypatch.setenv("WORSAGA_DEMO", "1")
+    monkeypatch.setenv("WORSAGA_TOKEN", SENTINEL)
+    assert known_secrets() == ()
+
+    mcp_server._arm_redaction()
+    assert SENTINEL in known_secrets()
+
+    with pytest.raises(Exception) as excinfo:
+        asyncio.run(
+            mcp_server.mcp.call_tool(
+                "get_deadlines", {"lookahead_days": SENTINEL},
+            )
+        )
+    assert SENTINEL not in str(excinfo.value)
+    assert REDACTED in str(excinfo.value)
+
+
+def test_arming_an_unconfigured_server_does_not_raise(monkeypatch):
+    """No credentials is a normal way to start; it must not stop the server."""
+    pytest.importorskip("mcp")
+    from worsaga import mcp_server
+
+    redact.forget_secrets()
+    monkeypatch.delenv("WORSAGA_TOKEN", raising=False)
+    monkeypatch.delenv("WORSAGA_URL", raising=False)
+    mcp_server._arm_redaction()
+    assert known_secrets() == ()
+
+
+@pytest.mark.parametrize(
+    "creds",
+    [
+        {"url": "http://not-https.example.edu", "token": SENTINEL, "userid": 7},
+        {"url": "https://moodle.example.edu", "token": SENTINEL,
+         "userid": "not-a-number"},
+        {"url": "", "token": SENTINEL},
+    ],
+    ids=["invalid-url", "invalid-userid", "missing-url"],
+)
+def test_a_malformed_config_still_arms_the_token(monkeypatch, tmp_path, creds):
+    """The token is real even when the rest of the file is not.
+
+    ``MoodleConfig.load`` validates as it goes, so a bad URL or user id
+    raises before anything registers — and that file's owner is exactly
+    who then sees a startup error quoting their settings back. The raw
+    JSON is read for the token first, so a configuration mistake cannot
+    cost the redactor its secret.
+    """
+    pytest.importorskip("mcp")
+    from worsaga import mcp_server
+
+    redact.forget_secrets()
+    for name in ("WORSAGA_TOKEN", "WORSAGA_URL", "WORSAGA_USERID"):
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / "creds.json"
+    path.write_text(json.dumps(creds), encoding="utf-8")
+    monkeypatch.setenv("WORSAGA_CREDS_PATH", str(path))
+
+    mcp_server._arm_redaction()
+
+    assert SENTINEL in known_secrets()
+
+
+@pytest.mark.parametrize(
+    "contents", ["not json at all", "[]", ""], ids=["garbage", "list", "empty"],
+)
+def test_an_unusable_config_file_arms_nothing_and_raises_nothing(
+    monkeypatch, tmp_path, contents,
+):
+    pytest.importorskip("mcp")
+    from worsaga import mcp_server
+
+    redact.forget_secrets()
+    for name in ("WORSAGA_TOKEN", "WORSAGA_URL", "WORSAGA_USERID"):
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / "creds.json"
+    path.write_text(contents, encoding="utf-8")
+    monkeypatch.setenv("WORSAGA_CREDS_PATH", str(path))
+
+    mcp_server._arm_redaction()
+
+    assert known_secrets() == ()
 
 
 def test_a_valid_call_through_the_server_still_works(leaky_mcp):
