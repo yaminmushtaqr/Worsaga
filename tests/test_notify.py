@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from worsaga import notify
 from worsaga.notify import notification_backend, send_notification
+from worsaga.redact import REDACTED, remember_secret
 
 
 def _ok(args=()):
@@ -116,6 +117,77 @@ class TestSendNotification:
             result = send_notification("t", "b")
         assert result["sent"] is False
         assert result["error"] == "gone"
+
+
+class TestRedactionAtTheNotificationBoundary:
+    """The title and body are redacted here, not at the call sites.
+
+    Notification text does not leave the process through stdout: it
+    leaves as subprocess argv, or escaped into a PowerShell payload. The
+    CLI's redacting stream wrappers never see it, so redacting at each
+    place a notification is composed would be a rule to remember rather
+    than a boundary that holds. This is the one function every
+    notification goes through.
+    """
+
+    SECRET = "s3cret-token-value-1234"
+
+    def _argv(self, title, body):
+        with patch.object(notify, "notification_backend",
+                          return_value="linux-notify-send"), \
+             patch.object(notify, "_run", return_value=_ok()) as run:
+            result = send_notification(title, body)
+        assert result["sent"] is True
+        return run.call_args[0][0]
+
+    def test_a_registered_secret_is_stripped_from_both_strings(self):
+        remember_secret(self.SECRET)
+        title, body = self._argv(
+            f"Worsaga: {self.SECRET}",
+            f"ECON101: new file - {self.SECRET}",
+        )[-2:]
+        assert self.SECRET not in title
+        assert self.SECRET not in body
+        assert REDACTED in title
+        assert REDACTED in body
+
+    def test_a_token_parameter_goes_whatever_its_value(self):
+        # Not a configured secret: a link Moodle minted, arriving inside
+        # somebody's discussion title.
+        body = self._argv(
+            "Worsaga: 1 change",
+            "CS210: new discussion - "
+            "See https://site.example/x?token=abcdef1234567890",
+        )[-1]
+        assert "abcdef1234567890" not in body
+        # The parameter name survives; only its value is taken, so the
+        # reader can still see what kind of link it was.
+        assert f"token={REDACTED}" in body
+
+    def test_the_windows_toast_payload_is_redacted_too(self):
+        # This backend never puts content in argv at all: it escapes it
+        # into a PowerShell script. Redacting per-backend would have
+        # missed one of the three.
+        remember_secret(self.SECRET)
+        with patch.object(notify, "notification_backend",
+                          return_value="windows-toast"), \
+             patch.object(notify, "_run", return_value=_ok()) as run:
+            send_notification("Worsaga: 1 change", self.SECRET)
+        args = run.call_args[0][0]
+        script = base64.b64decode(
+            args[args.index("-EncodedCommand") + 1]
+        ).decode("utf-16-le")
+        assert self.SECRET not in script
+        assert REDACTED in script
+
+    def test_ordinary_text_is_untouched(self):
+        # Redaction that mangled a normal notification would be worse
+        # than none: nobody would leave it on.
+        title, body = self._argv(
+            "Worsaga: 3 changes", "2 in ECON101, 1 in CS210",
+        )[-2:]
+        assert title == "Worsaga: 3 changes"
+        assert body == "2 in ECON101, 1 in CS210"
 
 
 class TestWindowsToast:

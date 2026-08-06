@@ -20,10 +20,12 @@ import urllib.error
 from typing import Any
 
 from worsaga.client import (
+    SERVICE_DISABLED_MESSAGE,
     MoodleRateLimitedError,
     MoodleRequestError,
     MoodleWriteAttemptError,
     is_auth_error,
+    is_service_disabled_error,
 )
 from worsaga.config import _find_config_file
 from worsaga.models import as_int
@@ -33,9 +35,10 @@ class ConnectionCheckError(RuntimeError):
     """A connection check failed for an expected auth/network reason.
 
     ``code`` is ``"auth"`` (credentials rejected), ``"network"`` (site
-    unreachable), or ``"rate_limited"`` (the site asked for fewer
-    requests) — the same vocabulary as ``DownloadError.code`` — so the
-    MCP tool can surface a structured ``{"error", "error_code"}`` dict. The
+    unreachable), ``"rate_limited"`` (the site asked for fewer requests),
+    or ``"service_disabled"`` (the site does not offer web-service access
+    at all) — the same vocabulary as ``DownloadError.code`` — so the MCP
+    tool can surface a structured ``{"error", "error_code"}`` dict. The
     message never contains a token or an authenticated URL.
     """
 
@@ -77,6 +80,16 @@ def fetch_site_info(client: Any) -> dict[str, Any]:
         # re-checking a token that is perfectly fine.
         raise ConnectionCheckError("rate_limited", str(exc)) from exc
     except MoodleRequestError as exc:
+        if is_service_disabled_error(exc):
+            # Not an auth failure: the site is not rejecting these
+            # credentials, it is not offering the interface to anybody.
+            # Telling a student to check their token would send them to
+            # re-issue one that was never the problem. The message is the
+            # fixed one, not the site's own text, which may be a
+            # localised or proxy-mangled version of the same thing.
+            raise ConnectionCheckError(
+                "service_disabled", SERVICE_DISABLED_MESSAGE,
+            ) from exc
         code = "auth" if is_auth_error(exc) else "network"
         raise ConnectionCheckError(code, str(exc)) from exc
     except (TimeoutError, OSError) as exc:

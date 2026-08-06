@@ -85,7 +85,7 @@ def fallback_bullets(section_type: str) -> list[str]:
         ]
     # Generic no-material fallback
     return [
-        "Materials not yet available \u2014 check Moodle closer to class",
+        "Materials not yet available - check Moodle closer to class",
     ]
 
 
@@ -210,8 +210,16 @@ def build_summary(
     }
 
 
-def format_bullets(bullets: list[str], *, marker: str = "\u2022") -> str:
-    """Format bullet strings into a display-ready multi-line string."""
+def format_bullets(bullets: list[str], *, marker: str = "-") -> str:
+    """Format bullet strings into a display-ready multi-line string.
+
+    The default marker is an ASCII hyphen rather than a typographic
+    bullet: this text is printed to a terminal, and a Windows console
+    using cp437 cannot encode U+2022 at all, while one using cp1252
+    emits a byte that a UTF-8 terminal emulator then renders as a
+    replacement character. Pass *marker* for anything nicer when the
+    destination is known to cope.
+    """
     return "\n".join(f"  {marker} {b}" for b in bullets)
 
 

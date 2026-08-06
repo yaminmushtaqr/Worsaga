@@ -19,7 +19,9 @@ So every test gets, automatically:
   nothing, so wire-level tests neither wait 250 ms per request nor inherit
   a cooldown or a spent retry budget from the test before them;
 - an empty output-redaction registry, so a token registered by one test
-  cannot silently rewrite another test's expected output.
+  cannot silently rewrite another test's expected output;
+- an empty record of already-reported relative-override refusals, which
+  are warned about once per process.
 
 Tests that legitimately fake transport patch `urlopen` themselves and so
 override the guard for their own scope; demo-mode tests never reach it.
@@ -64,6 +66,11 @@ def isolate_worsaga_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("WORSAGA_CACHE_PATH", str(tmp_path / "cache.db"))
     monkeypatch.setenv("WORSAGA_INDEX_PATH", str(tmp_path / "search.db"))
     monkeypatch.setenv("WORSAGA_STATE_DIR", str(tmp_path / "state"))
+    # Downloads and study packs default here now, so without this a test
+    # that exercises the default destination writes real files into the
+    # developer's own downloads directory — which is exactly what happened
+    # the first time the default moved off the working directory.
+    monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", str(tmp_path / "downloads"))
     monkeypatch.delenv("WORSAGA_MIN_REQUEST_GAP_MS", raising=False)
     monkeypatch.delenv("WORSAGA_MAX_IN_FLIGHT", raising=False)
 
@@ -80,6 +87,11 @@ def isolate_worsaga_environment(tmp_path, monkeypatch):
     # rewrites another's assertions.
     redact_module.forget_secrets()
 
+    # A refused relative override is reported once per process, so without
+    # this the second test to try the same bad value would see no warning
+    # and fail for a reason that has nothing to do with what it tests.
+    config_module._forget_override_warnings()
+
     def _blocked(*args, **kwargs):
         raise AssertionError("unmocked network call in test")
 
@@ -87,3 +99,4 @@ def isolate_worsaga_environment(tmp_path, monkeypatch):
     yield
     ratelimit_module.for_testing_reset()
     redact_module.forget_secrets()
+    config_module._forget_override_warnings()

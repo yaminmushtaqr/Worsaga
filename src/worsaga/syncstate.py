@@ -12,17 +12,38 @@ So each run records its outcome here:
 - ``success`` / ``partial`` — the failure streak resets and any open
   circuit closes. **Any** successful sync closes it, which makes a manual
   ``worsaga sync`` the documented way back.
-- ``failed`` — the streak grows and the failure is filed under one of four
-  coarse classes (``auth``, ``network``, ``rate_limited``, ``other``).
+- ``failed`` — the streak grows and the failure is filed under one of five
+  coarse classes (``auth``, ``network``, ``rate_limited``,
+  ``service_disabled``, ``other``).
 - ``skipped`` — another process held the sync lock. Neither a success nor
   a failure: the counters are left exactly as they were.
 
-An ``auth``-class failure opens the **circuit**: unattended runs (watch
-cycles, the scheduled auto-sync) stop before touching the network and say
-what to do instead. Foreground runs always attempt, because they are the
-reset path — a user who has just fixed their token must be able to prove
-it. Only ``auth`` opens the circuit; a network outage or a rate limit is
-temporary and retrying it is the right behaviour.
+Two of those classes open the **circuit**: unattended runs (watch cycles,
+the scheduled auto-sync) then stop before touching the network and say
+what the situation is. Foreground runs always attempt, because they are
+the reset path — a user who has just fixed their token must be able to
+prove it.
+
+- ``auth`` — the credentials were rejected. The circuit opens on the
+  **first** such sync, with no threshold: one rejection is almost always a
+  revoked or expired token, retrying changes nothing until the user fixes
+  it, and a run of failed authentications is exactly what a site's security
+  monitoring counts. Waiting for a third one would only produce two more of
+  them.
+- ``service_disabled`` — the site does not offer web-service access at
+  all. It opens the circuit for the opposite reason to ``auth``: not
+  because it needs attention, but because there is none to give. Nothing
+  the user does will change the answer, so a scheduled job that keeps
+  asking is load nobody asked for. A manual sync is *not* the way out of
+  this one; only the institution enabling the service is.
+
+Everything else — a network outage, a rate limit — is temporary, and
+retrying it is the right behaviour.
+
+Because the two circuits call for different things, the explanation is
+per-class (:data:`CIRCUIT_REMEDIES`, rendered by :func:`circuit_message`)
+rather than one string: telling somebody to fix credentials that were
+never rejected is worse than saying nothing.
 
 The state lives in one small owner-only JSON file in
 :func:`worsaga.config.default_state_dir` (``WORSAGA_STATE_DIR`` relocates
@@ -58,6 +79,7 @@ from worsaga.client import (
     MoodleRateLimitedError,
     MoodleRequestError,
     is_auth_error,
+    is_service_disabled_error,
 )
 from worsaga.config import default_state_dir
 from worsaga.secureio import write_private_file
@@ -72,18 +94,44 @@ SYNC_STATE_VERSION = 1
 #: much as the absence of one — another process was already syncing.
 OUTCOMES = ("success", "partial", "failed", "skipped")
 
-#: Coarse failure classes. Deliberately four: enough to decide whether to
+#: Coarse failure classes. Deliberately few: enough to decide whether to
 #: keep trying, not so many that the decision needs a lookup table.
-FAILURE_CLASSES = ("auth", "network", "rate_limited", "other")
-
-#: The only class that stops unattended runs. Everything else is
-#: temporary by nature and worth retrying on the next cycle.
-CIRCUIT_CLASSES = frozenset({"auth"})
-
-#: What to tell a user whose circuit is open.
-CIRCUIT_REMEDY = (
-    "circuit open: fix credentials then run 'worsaga sync' manually"
+FAILURE_CLASSES = (
+    "auth", "network", "rate_limited", "service_disabled", "other",
 )
+
+#: The classes that stop unattended runs. Everything else is temporary by
+#: nature and worth retrying on the next cycle. ``service_disabled`` is
+#: here for the opposite reason to ``auth``: not because it needs
+#: attention, but because it will not change on its own, and a scheduled
+#: job that keeps asking a site that has switched web services off is
+#: load nobody asked for.
+CIRCUIT_CLASSES = frozenset({"auth", "service_disabled"})
+
+#: What to tell a user whose circuit is open, per class. A single
+#: "fix credentials" line was fine while auth was the only way to get
+#: here; it is actively misleading for a site that never offered web
+#: services in the first place.
+CIRCUIT_REMEDIES = {
+    "auth": "circuit open: fix credentials then run 'worsaga sync' manually",
+    "service_disabled": (
+        "circuit open: this site has not enabled web-service access, so "
+        "unattended syncing has stopped"
+    ),
+}
+
+#: The historical single-string remedy, kept as the default for a class
+#: that has no wording of its own.
+CIRCUIT_REMEDY = CIRCUIT_REMEDIES["auth"]
+
+#: How an open circuit describes one failure that opened it (singular;
+#: :func:`circuit_message` pluralises). Singular matters because the
+#: circuit opens on the first failure, so a streak of one is the common
+#: case, not the edge case.
+_CIRCUIT_FAILURE_NOUN = {
+    "auth": "authentication failure",
+    "service_disabled": "failure",
+}
 
 
 def classify_failure(exc: BaseException | None) -> str:
@@ -110,6 +158,8 @@ def classify_failure(exc: BaseException | None) -> str:
             return "rate_limited"
         return "network"
     if isinstance(exc, MoodleRequestError):
+        if is_service_disabled_error(exc):
+            return "service_disabled"
         return "auth" if is_auth_error(exc) else "other"
     if isinstance(exc, urllib.error.URLError):
         return "network"
@@ -125,10 +175,12 @@ def classify_failure(exc: BaseException | None) -> str:
 def worst_failure_class(classes: list[str]) -> str:
     """Return the class that should represent a run that failed several ways.
 
-    Ordered by how much a user can do about it: a rejected token is worth
-    surfacing over a flaky network, and both over an unclassified error.
+    Ordered by how much a user can do about it: a site that offers no
+    web services at all is the end of the story and outranks everything,
+    a rejected token is worth surfacing over a flaky network, and both
+    over an unclassified error.
     """
-    for candidate in ("auth", "rate_limited", "network"):
+    for candidate in ("service_disabled", "auth", "rate_limited", "network"):
         if candidate in classes:
             return candidate
     return "other"
@@ -235,12 +287,20 @@ def circuit_state(site: str, *, path: Path | None = None) -> dict[str, Any] | No
 
 
 def circuit_message(entry: dict[str, Any]) -> str:
-    """Return the one-line explanation for an open circuit."""
+    """Return the one-line explanation for an open circuit.
+
+    Worded from the class that opened it, so a site with web services
+    switched off is not described as an authentication problem the user
+    could fix by re-issuing a token.
+    """
     failures = _as_int(entry.get("consecutive_failures")) or 0
-    return (
-        f"{CIRCUIT_REMEDY} ({failures} consecutive authentication failures; "
-        "no request was made)"
-    )
+    klass = str(entry.get("failure_class") or "auth")
+    remedy = CIRCUIT_REMEDIES.get(klass, CIRCUIT_REMEDY)
+    noun = _CIRCUIT_FAILURE_NOUN.get(klass, "failure")
+    # The circuit opens on the first failure, so a streak of one is the
+    # normal message; "1 consecutive failures" would be wrong twice over.
+    streak = f"1 {noun}" if failures == 1 else f"{failures} consecutive {noun}s"
+    return f"{remedy} ({streak}; no request was made)"
 
 
 def record_outcome(

@@ -17,3 +17,10 @@ without written permission.
 
 Modified versions should use a different name and must not imply that they are
 official, endorsed, or maintained by Worsaga.
+
+## Other people's trademarks
+
+Moodle(TM) is a trademark of Moodle Pty Ltd. Worsaga is an independent
+open-source project and is not affiliated with or endorsed by Moodle HQ or
+Moodle Pty Ltd. The name is used here only to describe what Worsaga works
+with.

@@ -47,6 +47,7 @@ import platformdirs
 
 from worsaga.cache import sanitize_payload
 from worsaga.client import DownloadError, MoodleWriteAttemptError
+from worsaga.config import _absolute_override
 from worsaga.extraction import (
     MAX_TEXT_PER_FILE,
     SUPPORTED_EXTENSIONS,
@@ -120,11 +121,22 @@ class TextIndexError(RuntimeError):
 
 
 def default_index_path() -> Path:
-    """Return the index database path (``WORSAGA_INDEX_PATH`` overrides)."""
-    env_path = os.environ.get("WORSAGA_INDEX_PATH", "").strip()
-    if env_path:
-        return Path(env_path)
-    return Path(platformdirs.user_data_dir(_APP_NAME)) / "search.db"
+    """Return the index database path (``WORSAGA_INDEX_PATH`` overrides).
+
+    The override must be an absolute path: the CLI and the MCP server read
+    this variable from unrelated working directories, so a relative value
+    would have ``worsaga index`` build one database and ``search_text``
+    query another. A relative one is refused and reported; see
+    :func:`worsaga.config._absolute_override`.
+    """
+    override = _absolute_override(
+        "WORSAGA_INDEX_PATH", os.environ.get("WORSAGA_INDEX_PATH", ""),
+    )
+    if override is not None:
+        return override
+    # resolve() so every process derives the same absolute path, exactly
+    # as the cache, downloads, and state defaults do.
+    return (Path(platformdirs.user_data_dir(_APP_NAME)) / "search.db").resolve()
 
 
 def fts_match_expression(query: str) -> str:

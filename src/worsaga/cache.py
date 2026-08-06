@@ -42,6 +42,7 @@ from typing import Any
 
 import platformdirs
 
+from worsaga.config import _absolute_override
 from worsaga.principal import (
     bind_principal as _bind_principal,
 )
@@ -109,11 +110,23 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 
 
 def default_cache_path() -> Path:
-    """Return the cache database path (``WORSAGA_CACHE_PATH`` overrides)."""
-    env_path = os.environ.get("WORSAGA_CACHE_PATH", "").strip()
-    if env_path:
-        return Path(env_path)
-    return Path(platformdirs.user_data_dir(_APP_NAME)) / "cache.db"
+    """Return the cache database path (``WORSAGA_CACHE_PATH`` overrides).
+
+    The override must be an absolute path. The cache is guarded by
+    interprocess sync locks named after this file, and a relative value
+    would give a ``watch`` loop and a scheduled sync different files to
+    lock — so a relative one is refused and reported; see
+    :func:`worsaga.config._absolute_override`.
+    """
+    override = _absolute_override(
+        "WORSAGA_CACHE_PATH", os.environ.get("WORSAGA_CACHE_PATH", ""),
+    )
+    if override is not None:
+        return override
+    # resolve() for the same reason the downloads and state defaults do
+    # it: the sync locks are named after this path, and every process on
+    # the machine must derive the same name.
+    return (Path(platformdirs.user_data_dir(_APP_NAME)) / "cache.db").resolve()
 
 
 def _is_banned_key(key: Any) -> bool:

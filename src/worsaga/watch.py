@@ -35,8 +35,27 @@ collection default in :mod:`worsaga.sync`: deadlines, files, and grades,
 but not forums. Pass ``categories`` (``worsaga watch --categories ...``,
 or ``WORSAGA_SYNC_CATEGORIES``) to change that.
 
-Notification content is course metadata only (change kinds and titles)
-— never tokens, URLs, or file contents.
+Notifications are deliberately uninformative by default. A desktop
+notification is drawn by the operating system on top of whatever is
+currently on screen — a shared display, a projector, a screen recording,
+a lock screen — so the default body carries counts and course
+short-codes only ("2 in ECON101, 1 in CS210") and never an item title.
+``--notify-details`` / ``notify_details=True`` restores titles for
+someone who has decided their screen is private.
+
+What that does and does not promise, precisely:
+
+- The Moodle token is stripped at the notification boundary itself
+  (:func:`worsaga.notify.send_notification` runs both strings through
+  :func:`worsaga.redact.redact_text`), so it cannot reach a toast however
+  it got into the text.
+- Grade values, instructor feedback, and file contents are never part of
+  what Worsaga *composes* into a notification, in either mode. There is
+  no flag that turns them on.
+- Detailed mode carries item titles as their authors wrote them. A
+  discussion title is free text typed by a person, so it can contain a
+  URL, a mark, or anything else — which is exactly why counts-only is the
+  default and titles are an explicit opt-in, not an oversight.
 """
 
 from __future__ import annotations
@@ -60,8 +79,14 @@ DEFAULT_WATCH_INTERVAL = 900  # 15 minutes
 #: Moodle instance without surfacing changes meaningfully sooner.
 MIN_WATCH_INTERVAL = 300  # 5 minutes
 
-#: Change titles listed in a notification body before "and N more".
+#: Lines listed in a notification body before "and N more" — change
+#: titles with ``details``, per-course counts without.
 _NOTIFY_MAX_LINES = 3
+
+#: Bucket for changes that arrived without a course short-code. Named the
+#: same way an untitled change is, so the body never implies a course
+#: that is not there.
+_NOTIFY_NO_COURSE = "(no course)"
 
 #: Backoff after consecutive failed cycles: the interval is multiplied by
 #: ``2 ** failures`` and then capped. Whichever cap binds first wins, so a
@@ -74,10 +99,35 @@ MAX_BACKOFF_SECONDS = 3600
 BACKOFF_JITTER = 0.10
 
 
-def notification_text(changes: list[dict[str, Any]]) -> tuple[str, str]:
-    """Return ``(title, body)`` describing *changes* for a notification."""
+def notification_text(
+    changes: list[dict[str, Any]], *, details: bool = False,
+) -> tuple[str, str]:
+    """Return ``(title, body)`` describing *changes* for a notification.
+
+    The title is always a bare count. The body depends on *details*:
+
+    - ``False`` (the default) — per-course counts and nothing else, e.g.
+      ``"2 in ECON101, 1 in CS210"``. Enough to know whether the loop is
+      worth switching to, and not enough for a passer-by to learn what
+      assignment is due or what an instructor wrote.
+    - ``True`` — the previous behaviour: up to
+      :data:`_NOTIFY_MAX_LINES` change titles with their kind and course,
+      then ``...and N more``.
+    """
     count = len(changes)
     title = f"Worsaga: {count} change{'s' if count != 1 else ''}"
+    if details:
+        return title, _detailed_body(changes)
+    return title, _counts_body(changes)
+
+
+def _detailed_body(changes: list[dict[str, Any]]) -> str:
+    """Return a notification body listing change titles (opt-in).
+
+    Titles are Moodle-authored text reproduced as written — nobody here
+    decides what is in a discussion title — which is what makes this an
+    opt-in rather than the default.
+    """
     lines = []
     for change in changes[:_NOTIFY_MAX_LINES]:
         kind = str(change.get("kind", "change")).replace("_", " ")
@@ -85,9 +135,53 @@ def notification_text(changes: list[dict[str, Any]]) -> tuple[str, str]:
         course = str(change.get("course_shortname", "")).strip()
         prefix = f"{course}: " if course else ""
         lines.append(f"{prefix}{kind} - {label}")
-    if count > _NOTIFY_MAX_LINES:
-        lines.append(f"...and {count - _NOTIFY_MAX_LINES} more")
-    return title, "\n".join(lines)
+    if len(changes) > _NOTIFY_MAX_LINES:
+        lines.append(f"...and {len(changes) - _NOTIFY_MAX_LINES} more")
+    return "\n".join(lines)
+
+
+def _counts_body(changes: list[dict[str, Any]]) -> str:
+    """Return a notification body of per-course counts (the default).
+
+    Courses are ordered by how much changed, then by name, so the same
+    set of changes always produces the same line. The
+    :data:`_NOTIFY_NO_COURSE` bucket always sorts last whatever its count:
+    it is a leftover rather than a course, and sorting it by name would
+    let a parenthesis push it ahead of real course codes. Only the first
+    :data:`_NOTIFY_MAX_LINES` entries are named; the rest are summed into
+    a trailing count rather than growing a notification without limit.
+
+    That trailing count says "in other courses" only when every bucket it
+    covers really is a course. When the hidden tail includes the
+    :data:`_NOTIFY_NO_COURSE` bucket — which it usually does, since that
+    bucket sorts last — the label would be attributing changes to courses
+    they were never associated with, so it degrades to a bare "N more".
+    """
+    counts: dict[str, int] = {}
+    for change in changes:
+        course = (
+            str(change.get("course_shortname", "")).strip()
+            or _NOTIFY_NO_COURSE
+        )
+        counts[course] = counts.get(course, 0) + 1
+
+    ordered = sorted(
+        counts.items(),
+        key=lambda item: (item[0] == _NOTIFY_NO_COURSE, -item[1], item[0]),
+    )
+    shown = ordered[:_NOTIFY_MAX_LINES]
+    hidden = ordered[_NOTIFY_MAX_LINES:]
+    parts = [f"{total} in {course}" for course, total in shown]
+    remaining = sum(total for _course, total in hidden)
+    if remaining:
+        hides_no_course = any(
+            course == _NOTIFY_NO_COURSE for course, _total in hidden
+        )
+        parts.append(
+            f"{remaining} more" if hides_no_course
+            else f"{remaining} in other courses"
+        )
+    return ", ".join(parts)
 
 
 def backoff_seconds(
@@ -125,6 +219,7 @@ def run_watch(
     interval_seconds: int = DEFAULT_WATCH_INTERVAL,
     max_cycles: int | None = None,
     notify: bool = True,
+    notify_details: bool = False,
     lookahead_days: int = SYNC_LOOKAHEAD_DAYS,
     cache_path: str | Path | None = None,
     categories: str | Sequence[str] | None = None,
@@ -149,6 +244,14 @@ def run_watch(
         Stop after this many cycles (None = run until interrupted).
     notify : bool
         Raise a desktop notification when a cycle detects changes.
+    notify_details : bool
+        Include change titles in the notification body. Off by default:
+        a notification is drawn wherever the screen happens to be
+        pointing, so it carries per-course counts unless asked
+        otherwise. The token is stripped either way, and grade values,
+        feedback, and file contents are never composed into a
+        notification either way; a title, when it is included, is
+        whatever its author wrote.
     categories : str | sequence of str, optional
         Which sync categories each cycle collects. ``None`` (default)
         takes the unattended default — no forums. Forwarded verbatim to
@@ -242,7 +345,7 @@ def run_watch(
         changes = result.get("changes", [])
         changes_total += len(changes)
         if notify and changes:
-            title, body = notification_text(changes)
+            title, body = notification_text(changes, details=notify_details)
             result["notification"] = notify_fn(title, body)
 
         last_cycle = max_cycles is not None and cycles >= max_cycles

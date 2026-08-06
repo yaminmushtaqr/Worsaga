@@ -3,6 +3,7 @@
 import pytest
 
 from worsaga.materials import (
+    _sanitize_filename,
     extract_materials,
     extract_week_number,
     get_section_materials,
@@ -428,3 +429,100 @@ class TestSearchCourseContent:
 
     def test_empty_sections(self):
         assert search_course_content([], "anything") == []
+
+
+class TestSanitizeFilename:
+    """Names are made safe for Windows on every platform.
+
+    A study pack built on Linux is routinely copied to a Windows machine
+    afterwards, so a name that is only dangerous on arrival is worse than
+    one that was never generated.
+    """
+
+    @pytest.mark.parametrize("name", [
+        "lecture-1.pdf", "Week_3_Slides.pptx", "notes.tar.gz", "a.b.c",
+        "_leading_underscore.txt", "trailing_underscore_.txt",
+    ])
+    def test_ordinary_names_are_unchanged(self, name):
+        assert _sanitize_filename(name) == name
+
+    @pytest.mark.parametrize("name,expected", [
+        ("CON", "_CON"),
+        ("con", "_con"),
+        ("con.pdf", "_con.pdf"),
+        ("CON.PDF", "_CON.PDF"),
+        ("COM7.txt", "_COM7.txt"),
+        ("lpt9", "_lpt9"),
+        ("NUL.tar.gz", "_NUL.tar.gz"),
+        ("aux", "_aux"),
+        ("prn", "_prn"),
+    ])
+    def test_reserved_device_stems_are_neutralised(self, name, expected):
+        # Reserved with any extension, and case-insensitively: opening
+        # "con.pdf" on Windows talks to the console, not to a file.
+        assert _sanitize_filename(name) == expected
+
+    # Written as escapes rather than literals so this file stays ASCII
+    # and reads identically whatever a reviewer's editor guesses.
+    @pytest.mark.parametrize("name,expected", [
+        ("COM\u00b9", "_COM\u00b9"),
+        ("com\u00b2.pdf", "_com\u00b2.pdf"),
+        ("LPT\u00b3.txt", "_LPT\u00b3.txt"),
+        ("lpt\u00b9.tar.gz", "_lpt\u00b9.tar.gz"),
+        ("Com\u00b3", "_Com\u00b3"),
+    ])
+    def test_superscript_device_stems_are_neutralised(self, name, expected):
+        """Win32 folds superscript one/two/three to the ASCII digits.
+
+        "COM<superscript one>" is COM1, and opening it talks to a serial
+        port instead of creating a file. Those characters count as word
+        characters to Python's regex, so they survive the substitution
+        above and would otherwise walk past the reserved-name check.
+        The prefix is what neutralises the name; the character itself is
+        kept, because the name is still the name.
+        """
+        assert _sanitize_filename(name) == expected
+
+    @pytest.mark.parametrize("name", [
+        "connect.pdf", "console.txt", "com.txt", "com10.txt", "lpt0.txt",
+        "nulls.csv",
+        # A superscript anywhere but a device position is just a
+        # character in a filename.
+        "notes\u00b2.pdf", "x\u00b2-regression.pdf", "com1\u00b2.txt",
+    ])
+    def test_names_that_merely_start_like_a_device_are_left_alone(self, name):
+        assert _sanitize_filename(name) == name
+
+    @pytest.mark.parametrize("name,expected", [
+        ("report.", "report"),
+        ("report..", "report"),
+        ("report .", "report_"),
+        ("report. ", "report._"),
+    ])
+    def test_trailing_dots_are_stripped(self, name, expected):
+        # Win32 discards trailing dots silently, so "report." and
+        # "report" would be the same file there — a collision the
+        # download reservation could not see coming.
+        assert _sanitize_filename(name) == expected
+
+    @pytest.mark.parametrize("name", ["", "...", ".", None])
+    def test_never_returns_an_empty_string(self, name):
+        # An empty name would make "directory / name" resolve to the
+        # directory itself.
+        assert _sanitize_filename(name) == "download"
+
+    def test_fallback_is_per_call_site(self):
+        assert _sanitize_filename("", fallback="week") == "week"
+        assert _sanitize_filename("...", fallback="material") == "material"
+
+    @pytest.mark.parametrize("name,expected", [
+        ("../../etc/passwd", ".._.._etc_passwd"),
+        ("a/b\\c", "a_b_c"),
+        ("file:name?.txt", "file_name_.txt"),
+        ("with spaces.pdf", "with_spaces.pdf"),
+        ("   ", "___"),
+    ])
+    def test_separators_and_wildcards_still_become_underscores(
+        self, name, expected,
+    ):
+        assert _sanitize_filename(name) == expected

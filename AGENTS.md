@@ -2,8 +2,10 @@
 
 This repo is designed for agent use.
 
-Worsaga is an open-source, local-first, read-only study toolkit for Moodle,
-licensed under AGPL-3.0-only. Moodle is the only supported LMS provider today.
+Worsaga is an open-source, local-first study toolkit for Moodle, licensed
+under AGPL-3.0-only. Moodle is the only supported LMS provider today. It is
+read-only against Moodle and writes local state on the user's own machine —
+see the Safety section below, which spells out both halves.
 
 ## Scope of this repository
 
@@ -16,7 +18,8 @@ When working in here:
   hosted-service logic.
 - Moodle is the only supported provider today. Do not add claims of support
   for other LMS providers.
-- Keep all Moodle actions read-only (see the Safety section below).
+- Keep all Moodle actions read-only (see the Safety section below), and keep
+  local writes confined to the stores documented in `README.md`.
 - Keep credentials, tokens, private course data, downloaded materials, and
   local config out of git.
 - Never commit planning, idea, feature-draft, or private-strategy documents,
@@ -203,7 +206,31 @@ For future indexing / search pipelines:
 
 ## Safety
 
-This package is read-only by design.
+Read-only on two axes, and they are not the same claim:
+
+- **Against Moodle, nothing is written.** Every call goes through the
+  hardcoded allowlist, with a fixed parameter set per function. Do not
+  weaken that, and do not describe Worsaga as "changing nothing" — it does
+  change things locally.
+- **Locally, Worsaga writes plenty**: the config file (with the token), the
+  sync cache, the search index, downloads, study packs, operational-state
+  records, and a scheduler registration when asked. Every path is listed in
+  "What Worsaga stores" in `README.md`.
+
+Rules:
+
 - Never bypass the package with direct write-capable Moodle calls.
 - Never treat `file_url` as the public contract for downloads.
 - Never commit credentials or tokens.
+- Worsaga uses Moodle's External Services framework — the same framework
+  Moodle uses for its official mobile app. Never write "the same API as the
+  official app": it is the same *framework*, and the stronger phrasing
+  implies an equivalence, and an endorsement, that does not exist.
+- Downloads and study packs default to Worsaga's own downloads directory
+  (`worsaga.config.default_downloads_dir`), never the working directory.
+  Both CLI commands warn when the resolved destination is inside a git
+  working tree. Keep both properties.
+- A site that has web services switched off gets
+  `worsaga.client.SERVICE_DISABLED_MESSAGE` and nothing else. Never add,
+  suggest, or document a workaround for an institution's decision to
+  disable web-service access.

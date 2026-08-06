@@ -17,6 +17,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -32,13 +33,102 @@ _PLATFORM_CONFIG_PATH = _PLATFORM_CONFIG_DIR / "config.json"
 DEFAULT_CONFIG_PATH = _PLATFORM_CONFIG_PATH
 
 
+#: ``(variable, value)`` pairs whose refusal has already been reported.
+#: These helpers are called several times per command — ``worsaga config``
+#: alone resolves four stores, and a sync resolves two of them per run — so
+#: without this one mistyped variable reads like four separate problems.
+#: Process-local and keyed by value, so correcting the variable and calling
+#: again reports the new mistake.
+_reported_overrides: set[tuple[str, str]] = set()
+
+
+def _forget_override_warnings() -> None:
+    """Clear the once-per-process record of reported refusals (tests)."""
+    _reported_overrides.clear()
+
+
+def _absolute_override(env_name: str, value: str) -> Path | None:
+    """Return the absolute path *value* names, or None to use the default.
+
+    The shared rule for every ``WORSAGA_*`` variable that relocates a
+    store. ``~`` is expanded, because a literal ``~`` directory is nobody's
+    intent, and the answer is resolved, so callers never have to decide
+    what a path means.
+
+    A *relative* value is **refused**. Each of these is read by processes
+    with unrelated working directories — the CLI's is the shell's, the MCP
+    server's is whatever its host launched it from, a scheduled sync's is
+    the scheduler's — so ``worsaga-state`` names as many different places
+    as there are callers. That is not a cosmetic problem: the cooldown a
+    site asked for, the credential circuit state, and the sync locks are
+    all claimed to hold *machine-wide*, and they only do so while every
+    process agrees on one file. Resolving a relative value against the
+    current directory would make the wrong answer absolute rather than
+    correct, so it is reported on stderr and the default location is used
+    instead — wrong in an obvious way rather than a silent one.
+
+    The warning is printed once per process for each ``(variable, value)``
+    pair, so a command that resolves several stores does not repeat one
+    mistake back several times.
+    """
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        candidate = Path(raw).expanduser()
+    except RuntimeError:
+        # expanduser() raises when there is no home directory to expand
+        # against, which makes a "~/..." value unusable rather than wrong.
+        candidate = Path(raw)
+    if not candidate.is_absolute():
+        key = (env_name, raw)
+        if key not in _reported_overrides:
+            _reported_overrides.add(key)
+            print(
+                f"Warning: {env_name} must be an absolute path "
+                f"(got '{raw}'); using the default location instead. "
+                "Run 'worsaga config' to see where that is.",
+                file=sys.stderr,
+            )
+        return None
+    return _resolved(candidate)
+
+
 def default_downloads_dir() -> Path:
     """Platform-native directory where Worsaga saves downloaded materials.
 
-    Used as the MCP download destination so files never land in the
-    server process working directory. Not created until first use.
+    The single destination both surfaces use when no output directory was
+    chosen: the MCP tools, so files never land in the server process's
+    working directory, and ``worsaga download`` / ``worsaga study-pack``,
+    so course material never lands in whatever directory the shell
+    happened to be sitting in — frequently a git checkout, where the next
+    ``git add -A`` publishes it.
+
+    ``WORSAGA_DOWNLOADS_DIR`` relocates it, for anyone who wants course
+    files somewhere they already back up (or deliberately do not). It must
+    be absolute; see :func:`_absolute_override`. Not created until first
+    use.
     """
-    return Path(platformdirs.user_data_dir(_APP_NAME)) / "downloads"
+    override = _absolute_override(
+        "WORSAGA_DOWNLOADS_DIR",
+        os.environ.get("WORSAGA_DOWNLOADS_DIR", ""),
+    )
+    if override is not None:
+        return override
+    return _resolved(Path(platformdirs.user_data_dir(_APP_NAME)) / "downloads")
+
+
+def _resolved(directory: Path) -> Path:
+    """Return *directory* resolved, falling back to it unchanged.
+
+    ``resolve()`` reaches the filesystem and can fail on a path the OS
+    declines to inspect. An unresolved absolute path is still a usable
+    answer, and this is a directory name, not a security boundary.
+    """
+    try:
+        return directory.resolve()
+    except OSError:
+        return directory
 
 
 def default_state_dir() -> Path:
@@ -51,12 +141,17 @@ def default_state_dir() -> Path:
     costs at most one over-eager request or one forgotten failure count.
 
     ``WORSAGA_STATE_DIR`` relocates it (used by tests, and by anyone
-    keeping several accounts apart). Not created until first use.
+    keeping several accounts apart). It must be absolute — these are
+    exactly the files one Worsaga process leaves for another to find, and
+    a relative value would give each of them its own copy. Not created
+    until first use.
     """
-    env_dir = os.environ.get("WORSAGA_STATE_DIR", "").strip()
-    if env_dir:
-        return Path(env_dir)
-    return Path(platformdirs.user_data_dir(_APP_NAME))
+    override = _absolute_override(
+        "WORSAGA_STATE_DIR", os.environ.get("WORSAGA_STATE_DIR", ""),
+    )
+    if override is not None:
+        return override
+    return _resolved(Path(platformdirs.user_data_dir(_APP_NAME)))
 
 
 def _find_config_file(explicit: str | Path | None = None) -> Path | None:

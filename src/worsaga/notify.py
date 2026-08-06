@@ -14,10 +14,25 @@ gracefully everywhere else:
 Every send returns a structured result (``{"sent", "backend", ...}``)
 instead of raising: a missing or broken notification stack must never
 take down a sync loop. Callers are expected to print their own console
-fallback when ``sent`` is false. Notification content is course
-metadata only — callers must not put tokens or URLs in it, and all
-subprocess calls run without a shell, with a timeout, and with the API
-token stripped from the child's environment.
+fallback when ``sent`` is false.
+
+:func:`send_notification` is a **redaction boundary**: the title and body
+go through :func:`worsaga.redact.redact_text` before any backend sees
+them. That has to happen here rather than at the call sites, because this
+text does not leave the process through ``stdout`` — it leaves as
+subprocess argv or inside a PowerShell payload, where the CLI's redacting
+stream wrappers cannot reach it. All subprocess calls also run without a
+shell, with a timeout, and with the API token stripped from the child's
+environment.
+
+What Worsaga's own watch loop puts here is decided in
+:func:`worsaga.watch.notification_text`, which defaults to per-course
+counts precisely because this text is drawn over whatever happens to be
+on screen. Worsaga never composes a grade value, instructor feedback, or
+file contents into a notification in either mode; the opt-in detailed
+body does carry item titles as their authors wrote them, which is a
+reason to leave the default alone rather than a guarantee about what a
+title contains.
 
 All operations are local. Nothing is sent over the network.
 """
@@ -30,6 +45,7 @@ import subprocess
 import sys
 from xml.sax.saxutils import escape
 
+from worsaga.redact import redact_text
 from worsaga.secureio import child_env
 
 #: Seconds a notification subprocess may run before being abandoned.
@@ -120,7 +136,16 @@ def send_notification(title: str, body: str) -> dict:
 
     Returns ``{"sent": bool, "backend": str | None, "error": str}``
     (``error`` only when something failed). Never raises.
+
+    The title and body are redacted first. This is the one boundary every
+    notification crosses, whoever composed it, and the text goes out as
+    subprocess argv rather than through the redacting stdout wrapper — so
+    a Moodle-authored item title carrying a ``token=`` link (a discussion
+    title is whatever its author typed) would otherwise be drawn on screen
+    with the credential intact.
     """
+    title = redact_text(str(title))
+    body = redact_text(str(body))
     backend = notification_backend()
     if backend is None:
         return {
@@ -129,7 +154,7 @@ def send_notification(title: str, body: str) -> dict:
             "error": "no notification backend available on this platform",
         }
     try:
-        proc = _SENDERS[backend](str(title), str(body))
+        proc = _SENDERS[backend](title, body)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"sent": False, "backend": backend, "error": str(exc)}
     if proc.returncode != 0:

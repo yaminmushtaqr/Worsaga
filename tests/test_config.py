@@ -2,10 +2,12 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
 from worsaga import secureio
+from worsaga.cache import default_cache_path
 from worsaga.config import (
     DEFAULT_CONFIG_PATH,
     MoodleConfig,
@@ -13,8 +15,24 @@ from worsaga.config import (
     _PLATFORM_CONFIG_PATH,
     _find_config_file,
     canonical_moodle_url,
+    default_downloads_dir,
+    default_state_dir,
 )
 from worsaga.secureio import SecureWriteError
+from worsaga.textindex import default_index_path
+
+#: Every ``WORSAGA_*`` variable that relocates a store, the function that
+#: resolves it, and the last path component of the platform default it
+#: falls back to. One policy, applied to all of them, so a new store
+#: cannot quietly acquire a different one.
+_STORE_OVERRIDES = [
+    ("WORSAGA_DOWNLOADS_DIR", default_downloads_dir, "downloads"),
+    ("WORSAGA_STATE_DIR", default_state_dir, "worsaga"),
+    ("WORSAGA_CACHE_PATH", default_cache_path, "cache.db"),
+    ("WORSAGA_INDEX_PATH", default_index_path, "search.db"),
+]
+
+_STORE_IDS = [name for name, _resolve, _default in _STORE_OVERRIDES]
 
 
 class TestConfigLoad:
@@ -504,3 +522,261 @@ class TestCanonicalMoodleUrl:
         assert json.loads(dest.read_text())["url"] == (
             "https://moodle.example.edu/moodle"
         )
+
+
+class TestDefaultDownloadsDir:
+    """The one destination both the CLI and the MCP server resolve.
+
+    It has to be absolute. A relative override would mean two different
+    directories — the CLI resolves against the shell's working directory,
+    the MCP server against whatever directory its host launched it from —
+    which is precisely the drift this shared helper exists to prevent.
+    """
+
+    def test_platform_default_is_absolute(self, monkeypatch):
+        monkeypatch.delenv("WORSAGA_DOWNLOADS_DIR", raising=False)
+        assert default_downloads_dir().is_absolute()
+
+    def test_relative_override_is_refused_and_reported(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", "course-files")
+        result = default_downloads_dir()
+        # Not resolved against the working directory: that would only
+        # make the wrong answer absolute.
+        assert result != (tmp_path / "course-files").resolve()
+        assert result.is_absolute()
+        assert result.name == "downloads"
+        err = capsys.readouterr().err
+        assert "WORSAGA_DOWNLOADS_DIR must be an absolute path" in err
+        assert "course-files" in err
+
+    @pytest.mark.parametrize("value", ["course-files", "./dl", "../dl"])
+    def test_relative_override_is_the_same_dir_from_any_cwd(
+        self, tmp_path, monkeypatch, value,
+    ):
+        """The bug this guards.
+
+        The CLI and the MCP server run with unrelated working
+        directories, so a relative override named two different places
+        and dropped course files wherever an agent host was launched
+        from.
+        """
+        one = tmp_path / "one"
+        one.mkdir()
+        two = tmp_path / "two"
+        two.mkdir()
+        monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", value)
+
+        monkeypatch.chdir(one)
+        from_one = default_downloads_dir()
+        monkeypatch.chdir(two)
+        from_two = default_downloads_dir()
+
+        assert from_one == from_two
+        assert from_one.is_absolute()
+
+    def test_absolute_override_is_honoured_from_any_cwd(
+        self, tmp_path, monkeypatch,
+    ):
+        target = tmp_path / "dl"
+        monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", str(target))
+        one = tmp_path / "one"
+        one.mkdir()
+        monkeypatch.chdir(one)
+        assert default_downloads_dir() == target.resolve()
+        monkeypatch.chdir(tmp_path)
+        assert default_downloads_dir() == target.resolve()
+
+    def test_tilde_is_expanded(self, monkeypatch):
+        monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", "~/worsaga-course-files")
+        result = default_downloads_dir()
+        assert "~" not in str(result)
+        assert result == (
+            Path.home() / "worsaga-course-files"
+        ).resolve()
+
+    def test_whitespace_only_override_falls_back_to_the_default(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", "   ")
+        assert default_downloads_dir().name == "downloads"
+
+
+class TestStoreOverridesMustBeAbsolute:
+    """One policy for every variable that moves a store.
+
+    A relative value is not merely untidy. These paths are read by
+    processes with unrelated working directories -- the CLI's is the
+    shell's, the MCP server's is whatever its host launched it from, a
+    scheduled sync's is the scheduler's -- and the persisted cooldown, the
+    credential circuit state, and the sync locks are only machine-wide
+    while all of them agree on one file.
+    """
+
+    @pytest.mark.parametrize(
+        "env_name,resolve,default_name", _STORE_OVERRIDES, ids=_STORE_IDS,
+    )
+    def test_relative_is_refused_reported_once_and_cwd_independent(
+        self, env_name, resolve, default_name, tmp_path, monkeypatch, capsys,
+    ):
+        one = tmp_path / "one"
+        one.mkdir()
+        two = tmp_path / "two"
+        two.mkdir()
+        monkeypatch.setenv(env_name, "worsaga-relative")
+
+        monkeypatch.chdir(one)
+        first = resolve()
+        monkeypatch.chdir(two)
+        second = resolve()
+
+        # The whole point: two callers in two directories, one answer.
+        assert first == second
+        assert first.is_absolute()
+        assert first.name == default_name
+        # Not resolved against the working directory -- that would only
+        # make the wrong answer absolute.
+        assert first != (one / "worsaga-relative")
+        assert first != (two / "worsaga-relative")
+
+        err = capsys.readouterr().err
+        assert f"{env_name} must be an absolute path" in err
+        assert "worsaga-relative" in err
+        # Reported once per process per value: a command that resolves
+        # four stores must not repeat one mistake four times.
+        assert err.count("must be an absolute path") == 1
+
+    @pytest.mark.parametrize(
+        "env_name,resolve,default_name", _STORE_OVERRIDES, ids=_STORE_IDS,
+    )
+    def test_tilde_is_expanded(
+        self, env_name, resolve, default_name, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv(env_name, "~/worsaga-store-under-test")
+        result = resolve()
+        assert "~" not in str(result)
+        assert result == (Path.home() / "worsaga-store-under-test").resolve()
+        assert "must be an absolute path" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "env_name,resolve,default_name", _STORE_OVERRIDES, ids=_STORE_IDS,
+    )
+    def test_absolute_is_honoured_from_any_cwd(
+        self, env_name, resolve, default_name, tmp_path, monkeypatch, capsys,
+    ):
+        target = tmp_path / "chosen"
+        monkeypatch.setenv(env_name, str(target))
+        one = tmp_path / "one"
+        one.mkdir()
+        monkeypatch.chdir(one)
+        assert resolve() == target.resolve()
+        monkeypatch.chdir(tmp_path)
+        assert resolve() == target.resolve()
+        assert "must be an absolute path" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "env_name,resolve,default_name", _STORE_OVERRIDES, ids=_STORE_IDS,
+    )
+    def test_whitespace_only_override_falls_back_silently(
+        self, env_name, resolve, default_name, monkeypatch, capsys,
+    ):
+        # An empty value is "unset", not "wrong": nothing to report.
+        monkeypatch.setenv(env_name, "   ")
+        assert resolve().name == default_name
+        assert capsys.readouterr().err == ""
+
+    def test_one_bad_variable_does_not_silence_another(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("WORSAGA_CACHE_PATH", "shared-name")
+        monkeypatch.setenv("WORSAGA_INDEX_PATH", "shared-name")
+        default_cache_path()
+        default_index_path()
+        err = capsys.readouterr().err
+        assert "WORSAGA_CACHE_PATH must be an absolute path" in err
+        assert "WORSAGA_INDEX_PATH must be an absolute path" in err
+
+
+class TestConfigCommandReportsEveryStore:
+    """'worsaga config' is the documented way to find what to delete."""
+
+    def _payload(self, capsys):
+        from worsaga.cli import main
+
+        main(["--json", "config"])
+        return json.loads(capsys.readouterr().out)
+
+    def test_json_reports_every_resolved_store(self, capsys):
+        payload = self._payload(capsys)
+        for key in (
+            "config_path", "config_dir", "downloads_dir",
+            "cache_path", "index_path", "state_dir",
+        ):
+            assert key in payload, key
+            assert Path(payload[key]).is_absolute(), key
+
+    def test_json_reflects_the_active_overrides(self, tmp_path, capsys):
+        # conftest points cache/index/state at tmp_path already; the
+        # command must report those, not the platform defaults.
+        payload = self._payload(capsys)
+        assert Path(payload["cache_path"]) == (tmp_path / "cache.db")
+        assert Path(payload["index_path"]) == (tmp_path / "search.db")
+        assert Path(payload["state_dir"]) == (tmp_path / "state")
+
+    def test_human_output_names_every_store(self, capsys):
+        from worsaga.cli import main
+
+        main(["config"])
+        out = capsys.readouterr().out
+        for label in ("Config dir:", "Downloads:", "Cache:", "Index:",
+                      "State dir:"):
+            assert label in out, label
+
+    def test_a_refused_relative_override_reports_the_default(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """The command that tells you where things are cannot say 'here'.
+
+        A relative override is refused, so what this prints is the
+        default location -- and it prints it absolute, because a path
+        relative to the shell that happened to run the command is not an
+        answer anybody can act on.
+        """
+        from worsaga.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("WORSAGA_INDEX_PATH", "search.db")
+        main(["--json", "config"])
+        captured = capsys.readouterr()
+        index_path = Path(json.loads(captured.out)["index_path"])
+        assert index_path.is_absolute()
+        assert index_path != (tmp_path / "search.db")
+        assert index_path.name == "search.db"
+        assert "WORSAGA_INDEX_PATH must be an absolute path" in captured.err
+
+    def test_a_relative_creds_path_is_displayed_resolved(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """--creds-path still works relative; it is *shown* absolute.
+
+        One process reads that file, so a relative value is usable in a
+        way a shared store's is not. Printing it back unresolved would
+        still name a different file to anyone reading the output from
+        anywhere else.
+        """
+        from worsaga.cli import main
+
+        creds = tmp_path / "elsewhere.json"
+        creds.write_text(json.dumps({
+            "url": "https://moodle.example.edu", "token": "t" * 20,
+            "userid": 7,
+        }))
+        monkeypatch.chdir(tmp_path)
+        main(["--json", "--creds-path", "elsewhere.json", "config"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["found"] is True
+        assert Path(payload["config_path"]).is_absolute()
+        assert Path(payload["config_path"]) == creds.resolve()

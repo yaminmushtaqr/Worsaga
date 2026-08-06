@@ -1,7 +1,14 @@
 """MCP server for worsaga.
 
-Worsaga is an open-source, local-first, read-only study toolkit for Moodle.
-Moodle is the only supported LMS provider today.
+Worsaga is an open-source, local-first study toolkit for Moodle. Moodle is
+the only supported LMS provider today.
+
+Read-only on two axes, which are not the same claim: against Moodle no tool
+can write anything (the client's allowlist has no write function in it),
+while locally several tools do write — ``download_material`` and
+``export_study_pack`` save files into Worsaga's own downloads directory,
+``sync_now`` writes the cache, ``build_search_index`` writes the index.
+Those four are behind capabilities and absent from the default profile.
 
 Tools in the default profile:
     - list_courses
@@ -229,6 +236,10 @@ ERROR_CODES = (
     # retries allowed for one request ran out. Not a bad token and not an
     # unreachable site: wait and try again.
     "rate_limited",
+    # the site does not offer web-service access at all. Its operators
+    # decided that; no token, account, or retry changes it, and there is
+    # nothing for an agent to try next.
+    "service_disabled",
 )
 
 # Deterministic upper bound on the serialized ``extract_material`` response.
@@ -1412,7 +1423,8 @@ def sync_now(
     ``"failed"`` (none did, so an empty ``changes`` list means "nothing
     was fetched", not "nothing changed"). A failed run also carries
     ``failure_class`` (``auth``, ``network``, ``rate_limited``,
-    ``other``). ``selected_categories`` says what this run collected;
+    ``service_disabled``, ``other``). ``selected_categories`` says what
+    this run collected;
     a category with ``"selected": false`` in ``categories`` was not
     collected and did not fail — its cached rows are untouched.
 
@@ -1800,11 +1812,14 @@ def get_connection_info() -> dict[str, Any]:
       (never its contents); ``None`` otherwise.
 
     Use this before other tools to confirm the server is pointed at the
-    right Moodle and account. On an authentication or network failure it
-    returns a structured ``{"error", "error_code"}`` dict with
-    ``error_code`` ``"auth"`` (credentials missing or rejected) or
-    ``"network"`` (the site was unreachable). The token never appears in
-    any field.
+    right Moodle and account. On failure it returns a structured
+    ``{"error", "error_code"}`` dict with ``error_code`` ``"auth"``
+    (credentials missing or rejected), ``"network"`` (the site was
+    unreachable), ``"rate_limited"`` (the site asked for fewer requests),
+    or ``"service_disabled"`` (the site does not offer web-service access
+    at all — an institutional decision, so no other tool will work
+    either and there is nothing to retry). The token never appears in any
+    field.
     """
     demo = demo_mode_enabled()
     try:

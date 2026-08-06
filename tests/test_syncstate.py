@@ -262,9 +262,17 @@ class TestClassifyFailure:
         exc = MoodleRequestError("nope", errorcode="invalidtoken")
         assert classify_failure(exc) == "auth"
 
-    def test_service_disabled_is_auth(self):
+    def test_service_disabled_is_its_own_class(self):
+        """A site with web services off is not a credentials problem.
+
+        It used to be classified as ``auth``, which told the user to fix a
+        token that was never rejected.
+        """
         exc = MoodleRequestError("off", errorcode="servicenotavailable")
-        assert classify_failure(exc) == "auth"
+        assert classify_failure(exc) == "service_disabled"
+        assert classify_failure(
+            MoodleRequestError("off", errorcode="enablewsdescription")
+        ) == "service_disabled"
 
     def test_http_401_is_auth(self):
         exc = urllib.error.HTTPError("u", 401, "no", None, None)
@@ -403,6 +411,28 @@ class TestRecordOutcome:
         # Fail open: the worst case is one attempted sync, whereas a
         # wrongly-open circuit silently stops syncing forever.
         assert circuit_state(SITE) is None
+
+    @pytest.mark.parametrize("failures, klass, streak", [
+        # A streak of one is the normal case, not the edge case: the
+        # circuit opens on the first failure, so this exact wording is
+        # what most users with an open circuit actually see.
+        (1, "auth", "(1 authentication failure; no request was made)"),
+        (2, "auth",
+         "(2 consecutive authentication failures; no request was made)"),
+        (1, "service_disabled", "(1 failure; no request was made)"),
+        (2, "service_disabled",
+         "(2 consecutive failures; no request was made)"),
+    ])
+    def test_the_circuit_message_pluralises_the_streak(
+        self, failures, klass, streak,
+    ):
+        message = syncstate.circuit_message(
+            {"consecutive_failures": failures, "failure_class": klass}
+        )
+        assert streak in message
+        if failures == 1:
+            assert "1 consecutive" not in message
+            assert "failures" not in message
 
     def test_a_corrupt_counter_recovers_on_the_next_write(self):
         self._write_raw({"consecutive_failures": "corrupt"})

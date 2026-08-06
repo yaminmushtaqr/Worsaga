@@ -129,7 +129,7 @@ def sync_command() -> list[str]:
 
     ``--unattended`` marks the run as one nobody is watching, so it
     honours the credential circuit breaker instead of authenticating with
-    a token the last several runs already proved is rejected. A job
+    a token a previous run already proved is rejected. A job
     registered by an older Worsaga simply keeps running without the flag
     until it is reinstalled; it syncs exactly as it always did.
     """
@@ -766,8 +766,8 @@ def _attach_last_sync(result: dict[str, Any]) -> None:
     that has been failing all day.
 
     ``sync_state`` adds what the timestamp alone cannot show: the last
-    outcome, how many runs have failed in a row, and whether repeated
-    authentication failures have paused unattended syncing altogether.
+    outcome, how many runs have failed in a row, and whether a sync whose
+    credentials were rejected has paused unattended syncing altogether.
     Both readers are non-creating (status must never bring state into
     existence as a side effect) and both are skipped silently when no
     site is configured.

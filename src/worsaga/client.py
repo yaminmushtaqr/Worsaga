@@ -507,8 +507,72 @@ _NOT_FOUND_ERRORCODES = frozenset({
 # stable, so classify on the code and fall back to the message.
 AUTH_ERRORCODES = frozenset({
     "invalidtoken", "accessexception", "invalidlogin", "tokenexpired",
-    "enrolmentrequired", "servicenotavailable", "webservicesnotenabled",
+    "enrolmentrequired",
 })
+
+
+# Moodle ``errorcode`` values that mean the site does not offer
+# web-service access at all — a configuration decision by whoever runs
+# it, not a fault, not a rejected token, and not something a different
+# request would get past. ``enablewsdescription`` is what Moodle raises
+# when web services are switched off site-wide; ``servicenotavailable``
+# when the external service a token belongs to (the mobile service, in
+# practice) is disabled or not published to this user.
+#
+# These used to be classified as authentication failures, which told a
+# student to check a token that was never the problem.
+SERVICE_DISABLED_ERRORCODES = frozenset({
+    "enablewsdescription", "servicenotavailable", "webservicesnotenabled",
+})
+
+
+#: What Worsaga says when a site does not offer web services. It states
+#: the situation, attributes it to the institution — which is entitled to
+#: make that call — and stops. No alternative route is suggested here or
+#: anywhere else, because there is no version of "work around your
+#: university's decision" that this project is willing to document.
+SERVICE_DISABLED_MESSAGE = (
+    "This Moodle site has not enabled web-service access. That is the "
+    "institution's decision, and Worsaga cannot be used with it. If you "
+    "believe the service should be available to you, ask your Moodle "
+    "administrator."
+)
+
+
+class MoodleServiceDisabledError(MoodleRequestError):
+    """The site answered, and its answer was "web services are off here".
+
+    A distinct type rather than another auth failure, because every
+    surface should say something different about it: nothing the user
+    does with their token or their account will change the answer, and
+    retrying is pointless rather than merely slow. The message is fixed
+    (:data:`SERVICE_DISABLED_MESSAGE`) so no surface has to compose its
+    own wording for a situation that calls for a careful one.
+    """
+
+    def __init__(self, *, errorcode: str = ""):
+        super().__init__(SERVICE_DISABLED_MESSAGE, errorcode=errorcode)
+
+
+def is_service_disabled_error(exc: BaseException) -> bool:
+    """Return True when *exc* means the site offers no web-service access.
+
+    Checked before :func:`is_auth_error` everywhere the two could both
+    match, since this is the more specific answer.
+    """
+    if isinstance(exc, MoodleServiceDisabledError):
+        return True
+    code = str(getattr(exc, "errorcode", "") or "").lower()
+    if code in SERVICE_DISABLED_ERRORCODES:
+        return True
+    # Moodle localises the human text, so this only catches an English
+    # site whose errorcode did not survive a proxy. It is a fallback, not
+    # the classification.
+    message = str(exc).lower()
+    return (
+        "web services are not enabled" in message
+        or "web service is not available" in message
+    )
 
 
 def is_auth_error(exc: BaseException) -> bool:
@@ -516,9 +580,14 @@ def is_auth_error(exc: BaseException) -> bool:
 
     Shared by the connection check (:mod:`worsaga.doctor`) and the sync
     failure classifier (:mod:`worsaga.syncstate`), which have to agree:
-    one reports "your token is not accepted", the other decides whether
-    repeated unattended failures are worth stopping to fix.
+    one reports "your token is not accepted", the other stops unattended
+    syncing until somebody fixes it.
+
+    A site with web services switched off is deliberately *not* an auth
+    error — see :func:`is_service_disabled_error`.
     """
+    if is_service_disabled_error(exc):
+        return False
     code = str(getattr(exc, "errorcode", "") or "").lower()
     if code in AUTH_ERRORCODES:
         return True
@@ -1056,12 +1125,16 @@ class MoodleClient:
         )
 
         if isinstance(result, dict) and "exception" in result:
+            errorcode = self._redact_token(str(result.get("errorcode") or ""))
+            message = self._redact_token(str(result.get("message", result)))
+            if errorcode.lower() in SERVICE_DISABLED_ERRORCODES:
+                # Raised as its own type here, at the one place Moodle's
+                # errorcode is still in hand, so every surface downstream
+                # gets the considered wording without re-deriving it from
+                # a message the site may have localised.
+                raise MoodleServiceDisabledError(errorcode=errorcode)
             raise MoodleRequestError(
-                "Moodle API error: "
-                + self._redact_token(str(result.get("message", result))),
-                errorcode=self._redact_token(
-                    str(result.get("errorcode") or "")
-                ),
+                "Moodle API error: " + message, errorcode=errorcode,
             )
 
         return result
@@ -1324,7 +1397,7 @@ class MoodleClient:
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
             raise DownloadError(
-                "network", f"network request failed for '{name}' — {reason}",
+                "network", f"network request failed for '{name}': {reason}",
             ) from None
         except (TimeoutError, OSError):
             raise DownloadError(

@@ -1,4 +1,8 @@
-"""worsaga — Open-source, local-first, read-only study toolkit for Moodle."""
+"""worsaga — Open-source, local-first study toolkit for Moodle.
+
+Read-only against Moodle; writes only local files on the user's own
+machine. See "Responsible use" in README.md.
+"""
 
 __version__ = "0.8.1"
 
@@ -17,6 +21,7 @@ from worsaga.client import (
     MoodleRateLimitedError,
     MoodleResponseError,
     MoodleScopeError,
+    MoodleServiceDisabledError,
     MoodleWriteAttemptError,
 )
 from worsaga.config import (
@@ -127,6 +132,7 @@ __all__ = [
     "MoodleRateLimitedError",
     "MoodleResponseError",
     "MoodleScopeError",
+    "MoodleServiceDisabledError",
     "MoodleWriteAttemptError",
     "OUTCOMES",
     "PrincipalMismatchError",

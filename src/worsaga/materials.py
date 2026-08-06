@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from worsaga.client import DownloadError
+from worsaga.config import default_downloads_dir
 from worsaga.extraction import MAX_TEXT_PER_FILE, extract_file_structured
 from worsaga.models import (
     course_module_file_record,
@@ -401,10 +402,73 @@ def search_course_content(
 # ── Selection & download ────────────────────────────────────────
 
 
-def _sanitize_filename(name: str) -> str:
-    """Remove or replace characters unsafe for filenames."""
+#: Names Win32 resolves to a device rather than a file, whatever the
+#: directory. The reservation applies to the part before the first dot, so
+#: ``con.pdf`` and ``COM7.txt`` are as reserved as ``CON`` — opening one
+#: talks to a console or a serial port instead of creating a file.
+_WINDOWS_RESERVED_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{digit}" for digit in range(1, 10)}
+    | {f"lpt{digit}" for digit in range(1, 10)}
+)
+
+#: Win32 also resolves the *superscript* spellings of the digits one, two,
+#: and three in a device name: ``COM<superscript one>`` is ``COM1``, and it
+#: is as reserved as it. Those characters survive the substitution above,
+#: because Python's ``\w`` is Unicode-aware and treats them as word
+#: characters, so a stem had to be folded to ASCII digits before being
+#: tested rather than after.
+#:
+#: A translation table keyed by code point: the keys are integers and the
+#: values ASCII, so this module holds no non-ASCII literal (see the runtime
+#: string guard in the test suite). Only the *test* is folded — the name
+#: keeps the character it came with and is neutralised by the prefix.
+_SUPERSCRIPT_DIGITS = {0xB9: "1", 0xB2: "2", 0xB3: "3"}
+
+
+def _sanitize_filename(name: str, *, fallback: str = "download") -> str:
+    """Return *name* reduced to a filename that is safe on every platform.
+
+    Everything outside word characters, dots, and hyphens becomes an
+    underscore — which already disposes of separators, wildcards, colons,
+    and spaces. Three further rules exist because Windows quietly
+    disagrees with POSIX about what a filename is, and they are applied
+    on **all** platforms: a study pack or a downloaded slide deck built
+    on Linux is routinely copied to a Windows machine afterwards, and a
+    name that only becomes dangerous on arrival is worse than one that
+    was never generated.
+
+    - **Trailing dots are stripped.** Win32 silently discards them, so
+      ``report.`` and ``report`` are the same file there — enough for two
+      distinct downloads to collide and for one to overwrite the other,
+      which the collision-safe reservation in :func:`_reserve_path` could
+      not see coming. (Trailing spaces are stripped for the same reason,
+      by the substitution above, which has already turned them into
+      underscores.)
+    - **Reserved device stems are prefixed with an underscore.** ``CON``,
+      ``PRN``, ``AUX``, ``NUL``, ``COM1``-``COM9``, and ``LPT1``-``LPT9``
+      name devices, case-insensitively and with any extension attached —
+      as do the superscript spellings of ``COM1``/``COM2``/``COM3`` and
+      ``LPT1``/``LPT2``/``LPT3`` (see :data:`_SUPERSCRIPT_DIGITS`), which
+      Win32 folds to the same devices and which survive the substitution
+      above as ordinary word characters.
+    - **The result is never empty.** ``""``, ``"..."``, and anything else
+      that sanitises away to nothing returns *fallback*; an empty string
+      would make ``directory / name`` resolve to the directory itself.
+
+    Underscores are deliberately left alone, leading and trailing: they
+    are legitimate filename characters and most of the ones here were put
+    there by the substitution above.
+    """
     # Keep alphanumerics, dots, hyphens, underscores
-    return re.sub(r"[^\w.\-]", "_", name)
+    cleaned = re.sub(r"[^\w.\-]", "_", str(name or ""))
+    cleaned = cleaned.rstrip(".")
+    if not cleaned:
+        return fallback
+    stem = cleaned.split(".", 1)[0].lower().translate(_SUPERSCRIPT_DIGITS)
+    if stem in _WINDOWS_RESERVED_STEMS:
+        cleaned = f"_{cleaned}"
+    return cleaned
 
 
 def _available_path(path: Path) -> Path:
@@ -500,7 +564,7 @@ def select_material(
     if index is not None:
         if index < 0 or index >= len(candidates):
             raise MaterialSelectionError(
-                f"Index {index} out of range (0–{len(candidates) - 1}).",
+                f"Index {index} out of range (0-{len(candidates) - 1}).",
                 candidates,
             )
         return candidates[index]
@@ -566,8 +630,11 @@ def download_material(
     material : dict
         A material record (from :func:`extract_materials` etc.).
     output_dir : str or Path, optional
-        Directory to save the file.  Defaults to the current working
-        directory.
+        Directory to save the file. Defaults to
+        :func:`worsaga.config.default_downloads_dir` — Worsaga's own
+        downloads directory, not the process's working directory, so a
+        library caller cannot scatter course files across whichever
+        directory it happened to be started from.
 
     Returns
     -------
@@ -588,20 +655,20 @@ def download_material(
     file_url = material.get("file_url", "")
     if not file_url:
         raise DownloadError(
-            "invalid_url", "Material has no file_url — cannot download.",
+            "invalid_url", "Material has no file_url - cannot download.",
         )
 
     file_name = material.get("file_name", "")
     if not file_name:
         # URL-type modules may lack a filename
-        file_name = _sanitize_filename(material.get("module_name", "download"))
+        file_name = _sanitize_filename(material.get("module_name", ""))
 
     data = client.download_file(file_url)
     if data is None:
         # Defensive: the real client raises, but stand-ins may return None.
         raise DownloadError("empty", f"Download failed for '{file_name}'.")
 
-    dest_dir = Path(output_dir) if output_dir else Path.cwd()
+    dest_dir = Path(output_dir) if output_dir else default_downloads_dir()
     # Only directories this call has to create are made owner-only; an
     # existing destination the user chose is left exactly as it is.
     ensure_private_dir(dest_dir)
@@ -685,12 +752,14 @@ def extract_material_content(
     file_url = material.get("file_url", "")
     if not file_url:
         raise DownloadError(
-            "invalid_url", "Material has no file_url — cannot extract.",
+            "invalid_url", "Material has no file_url - cannot extract.",
         )
 
     file_name = material.get("file_name", "")
     if not file_name:
-        file_name = _sanitize_filename(material.get("module_name", "material"))
+        file_name = _sanitize_filename(
+            material.get("module_name", ""), fallback="material",
+        )
 
     data = client.download_file(file_url)
     if data is None:

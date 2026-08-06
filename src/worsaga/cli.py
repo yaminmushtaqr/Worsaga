@@ -43,6 +43,7 @@ import json
 import os
 import sys
 import urllib.error
+from pathlib import Path
 
 from worsaga.banner import print_banner, should_show_banner
 from worsaga.assignments import get_assignments as get_assignments_data
@@ -63,8 +64,11 @@ from worsaga.config import (
     MoodleConfig,
     _PLATFORM_CONFIG_DIR,
     _find_config_file,
+    default_downloads_dir,
+    default_state_dir,
     test_connection,
 )
+from worsaga.cache import default_cache_path
 
 from worsaga.deadlines import get_upcoming_deadlines
 from worsaga.demo import DemoMoodleClient, demo_mode_enabled
@@ -118,6 +122,7 @@ from worsaga.summaries import build_weekly_summary, format_bullets
 from worsaga.textindex import (
     INDEX_MAX_FILES_PER_RUN,
     build_text_index,
+    default_index_path,
     search_text_index,
 )
 from worsaga.sync import (
@@ -168,7 +173,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="worsaga",
         description=(
-            "Open-source, local-first, read-only study toolkit for Moodle. "
+            "Open-source, local-first study toolkit for Moodle. Read-only "
+            "against Moodle; writes only local files on this machine "
+            "(config, cache, search index, downloads, study packs). "
             "Moodle is the only supported LMS today."
         ),
     )
@@ -279,7 +286,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Raw Moodle file_url values are omitted from JSON output by\n"
             "default because they require token authentication; pass\n"
             "--include-file-urls if you explicitly need them for\n"
-            "provenance. Never fetch a file_url directly — use\n"
+            "provenance. Never fetch a file_url directly - use\n"
             "'worsaga download' for authenticated retrieval."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -332,7 +339,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dn.add_argument(
         "--output", default=None, metavar="DIR",
-        help="Directory to save the file (default: current directory)",
+        help=(
+            "Directory to save the file. Default: Worsaga's own downloads "
+            "directory (printed with 'worsaga config'). Pass '--output .' "
+            "for the current directory"
+        ),
     )
 
     ex = sub.add_parser(
@@ -340,7 +351,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Extract per-page text from a material (nothing saved to disk)",
         description=(
             "Fetch a material into memory and extract structured per-page "
-            "text — no file is written to disk (use 'worsaga download' to "
+            "text; no file is written to disk (use 'worsaga download' to "
             "save the file itself). Light cleaning preserves educational "
             "content such as captions, learning objectives, and references "
             "by default."
@@ -610,7 +621,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sk.add_argument(
         "--output", default=None, metavar="DIR",
-        help="Directory to write the pack into (default: current directory)",
+        help=(
+            "Directory to write the pack into. Default: Worsaga's own "
+            "downloads directory (printed with 'worsaga config'). Pass "
+            "'--output .' for the current directory"
+        ),
     )
     sk.add_argument(
         "--stdout", action="store_true",
@@ -622,7 +637,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Sync metadata to the local cache and report changes",
         description=(
             "Fetch metadata-only snapshots (deadlines, file metadata, "
-            "grades, forum discussions — never file contents) into the "
+            "grades, forum discussions; never file contents) into the "
             "local SQLite cache and report what changed since the last "
             "sync. The first sync establishes a baseline and reports no "
             "changes. Tokens and authenticated URLs are never stored, and "
@@ -716,6 +731,16 @@ def _build_parser() -> argparse.ArgumentParser:
     wt.add_argument(
         "--no-notify", action="store_true",
         help="Do not send desktop notifications",
+    )
+    wt.add_argument(
+        "--notify-details", action="store_true",
+        help=(
+            "Include change titles in desktop notifications. Off by "
+            "default: a notification appears over whatever is on screen, "
+            "so it carries per-course counts only ('2 in ECON101, 1 in "
+            "CS210'). Tokens, URLs, grades, and feedback are never "
+            "included either way"
+        ),
     )
     wt.add_argument(
         "--days", type=int, default=SYNC_LOOKAHEAD_DAYS,
@@ -1561,10 +1586,84 @@ def _select_week_material(
         sys.exit(1)
 
 
+def _git_worktree_root(path: Path) -> Path | None:
+    """Return the working tree *path* sits in, or None.
+
+    Walks *path* and its parents looking for a ``.git`` entry. The entry
+    is accepted whether it is a directory (an ordinary clone) or a *file*
+    (a linked worktree or a submodule, where ``.git`` holds a
+    ``gitdir:`` pointer) — checking only for a directory would miss both
+    and report a repository as safe.
+
+    Purely advisory, and deliberately cheap: no ``git`` process is run,
+    and any filesystem error along the way is treated as "not a
+    repository" rather than propagated, because this answer only ever
+    decides whether to print one warning line.
+    """
+    try:
+        current = path.resolve()
+    except OSError:
+        return None
+    for candidate in (current, *current.parents):
+        try:
+            if (candidate / ".git").exists():
+                return candidate
+        except OSError:
+            return None
+    return None
+
+
+def _resolve_output_dir(args: argparse.Namespace) -> Path:
+    """Return the directory a download or study pack should be written to.
+
+    ``--output`` when given, and otherwise Worsaga's own downloads
+    directory — the same one the MCP tools write into, so the two
+    surfaces cannot drift apart. Always absolute, so what the command
+    prints afterwards is a path the user can act on rather than something
+    relative to a working directory they may already have left.
+    """
+    chosen = getattr(args, "output", None)
+    directory = Path(chosen) if chosen else default_downloads_dir()
+    try:
+        return directory.resolve()
+    except OSError:
+        return directory
+
+
+def _warn_if_inside_repository(args: argparse.Namespace, dest: Path) -> None:
+    """Warn once on stderr when *dest* is inside a git working tree.
+
+    Course materials are usually somebody else's copyrighted work, and a
+    repository is a place whose whole purpose is to publish what is in
+    it: one ``git add -A`` away from a lecture recording or a set of
+    slides being pushed to a public remote. Worsaga cannot know whether
+    that was intended, so it says so and continues — a refusal would be
+    wrong for the many legitimate reasons to keep notes under version
+    control.
+    """
+    if args.quiet:
+        return
+    root = _git_worktree_root(dest)
+    if root is None:
+        return
+    where = (
+        f"{dest} is a git repository"
+        if root == dest
+        else f"{dest} is inside the git repository at {root}"
+    )
+    print(
+        f"Warning: {where}. Course materials are usually copyrighted; keep "
+        "them out of commits.",
+        file=sys.stderr,
+    )
+
+
 def cmd_download(args: argparse.Namespace) -> None:
     client = _client(args)
     course_id = _resolve_course_id(client, args.course)
     chosen = _select_week_material(args, client, course_id)
+    dest_dir = _resolve_output_dir(args)
+    _warn_if_inside_repository(args, dest_dir)
 
     if not args.quiet:
         print(
@@ -1573,7 +1672,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         )
 
     try:
-        result = download_material(client, chosen, output_dir=args.output)
+        result = download_material(client, chosen, output_dir=dest_dir)
     except DownloadError as exc:
         if wants_structured(args):
             _emit_data(args, {"error": str(exc), "error_code": exc.code})
@@ -1654,7 +1753,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
         )
 
     if not wants_structured(args):
-        print(f"Week {week_query} — {section_name or '(no section found)'}")
+        print(f"Week {week_query} - {section_name or '(no section found)'}")
         if section and section.get("modules"):
             overview = summarize_modules(section["modules"])
             if overview:
@@ -1801,6 +1900,16 @@ def cmd_search_text(args: argparse.Namespace) -> None:
 def cmd_study_pack(args: argparse.Namespace) -> None:
     client = _client(args)
     course_id = _resolve_course_id(client, args.course)
+    # --stdout writes nothing to disk, so it resolves no destination at
+    # all: resolving one is what reports a refused WORSAGA_DOWNLOADS_DIR,
+    # and a run that creates no file has nothing to warn anybody about.
+    # Every other run resolves and warns *before* the fetches start, so a
+    # pack heading somewhere unwanted can be interrupted before it costs a
+    # week's worth of downloads.
+    dest_dir: Path | None = None
+    if not args.stdout:
+        dest_dir = _resolve_output_dir(args)
+        _warn_if_inside_repository(args, dest_dir)
 
     def _on_file(filename: str) -> None:
         if not wants_structured(args) and not args.quiet:
@@ -1823,7 +1932,7 @@ def cmd_study_pack(args: argparse.Namespace) -> None:
 
     path = write_study_pack(
         result["markdown"],
-        args.output or os.getcwd(),
+        dest_dir,
         result["suggested_filename"],
     )
     # The markdown itself lives in the written file; keep the emitted
@@ -1875,12 +1984,25 @@ def _fail_sync(result: dict) -> None:
     for warning in reason:
         print(f"  {warning}", file=sys.stderr)
     if result.get("circuit_open"):
-        print(
-            "  Repeated authentication failures stopped this unattended run "
-            "before it made any request. Fix the credentials, then run "
-            "'worsaga sync' yourself to clear it.",
-            file=sys.stderr,
-        )
+        if result.get("failure_class") == "service_disabled":
+            # Deliberately does not offer a manual sync as the way out:
+            # a manual run against a site with web services switched off
+            # cannot succeed either, so telling the user to try one would
+            # send them round the same loop.
+            print(
+                "  This Moodle site has not enabled web-service access, so "
+                "unattended syncing has stopped. That is the institution's "
+                "decision; syncing stays paused unless the site enables the "
+                "service.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "  Moodle rejected the credentials, so unattended syncs are "
+                "paused and this run made no request. Fix the credentials, "
+                "then run 'worsaga sync' yourself to clear it.",
+                file=sys.stderr,
+            )
     sys.exit(1)
 
 
@@ -2092,6 +2214,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             interval_seconds=interval,
             max_cycles=args.cycles,
             notify=not args.no_notify,
+            notify_details=getattr(args, "notify_details", False),
             lookahead_days=args.days,
             categories=selected,
             store_feedback=(
@@ -2148,12 +2271,20 @@ def cmd_autosync(args: argparse.Namespace) -> None:
             klass = sync_state.get("failure_class") or "other"
             print(f"  consecutive failures: {streak} ({klass})")
         if sync_state.get("circuit_open"):
-            print(
-                "  Scheduled syncs are paused after repeated authentication "
-                "failures. Fix the credentials, then run 'worsaga sync' "
-                "yourself to resume them.",
-                file=sys.stderr,
-            )
+            if sync_state.get("failure_class") == "service_disabled":
+                print(
+                    "  Scheduled syncs are paused: this Moodle site has not "
+                    "enabled web-service access. That is the institution's "
+                    "decision, and Worsaga cannot be used with it.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "  Scheduled syncs are paused because Moodle rejected "
+                    "the credentials. Fix the credentials, then run "
+                    "'worsaga sync' yourself to resume them.",
+                    file=sys.stderr,
+                )
         if result.get("error"):
             print(f"Warning: {result['error']}", file=sys.stderr)
         if result.get("record_error"):
@@ -2243,7 +2374,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                 "sitename": info["sitename"],
             }):
             return
-        print("OK (demo mode — fake data, no network)")
+        print("OK (demo mode - fake data, no network)")
         print(f"  User:   {info['username']} (id: {info['userid']})")
         print(f"  Site:   {info['sitename']}")
         return
@@ -2298,11 +2429,35 @@ def cmd_config(args: argparse.Namespace) -> None:
 
     creds_path = getattr(args, "creds_path", None)
     found = _find_config_file(creds_path)
+    if found is not None:
+        # Display only - the file was located exactly as it always is.
+        # A relative --creds-path or WORSAGA_CREDS_PATH still works,
+        # because one process reads it, but printing it back unresolved
+        # would name a different file to anyone reading the output from
+        # somewhere else. This command exists to say where things are.
+        try:
+            found = found.resolve()
+        except OSError:
+            pass
     os_name = _platform.system().lower()  # "linux", "windows", "darwin"
+
+    # Every store Worsaga writes, resolved as this machine and this
+    # environment actually resolve it. A default location nobody can find
+    # is a location nobody can clear out, and each of these can be moved
+    # by an environment variable, so printing the *resolved* path is the
+    # only answer that is true for the person asking.
+    downloads_dir = default_downloads_dir()
+    cache_path = default_cache_path()
+    index_path = default_index_path()
+    state_dir = default_state_dir()
 
     if _emit_data(args, {
             "config_path": str(found) if found else str(DEFAULT_CONFIG_PATH),
             "config_dir": str(_PLATFORM_CONFIG_DIR),
+            "downloads_dir": str(downloads_dir),
+            "cache_path": str(cache_path),
+            "index_path": str(index_path),
+            "state_dir": str(state_dir),
             "found": found is not None,
             "os": os_name,
         }):
@@ -2314,6 +2469,10 @@ def cmd_config(args: argparse.Namespace) -> None:
         print("No config file found.")
         print(f"Default path: {DEFAULT_CONFIG_PATH}")
     print(f"Config dir:  {_PLATFORM_CONFIG_DIR}")
+    print(f"Downloads:   {downloads_dir}")
+    print(f"Cache:       {cache_path}")
+    print(f"Index:       {index_path}")
+    print(f"State dir:   {state_dir}")
     print(f"OS:          {os_name}")
 
 
@@ -2402,7 +2561,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
             print(f"OK (detected user ID: {userid})")
         else:
             userid = 0
-            print("OK (user ID not detected — set manually if needed)")
+            print("OK (user ID not detected - set manually if needed)")
 
         dest = MoodleConfig.write_config(url=setup_url, token=setup_token, userid=userid)
         _print_setup_success(dest)
@@ -2502,7 +2661,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
         print(f"OK (detected user ID: {userid})")
     else:
         userid = 0
-        print("OK (user ID not detected — set manually if needed)")
+        print("OK (user ID not detected - set manually if needed)")
 
     dest = MoodleConfig.write_config(url=url, token=token, userid=userid)
     _print_setup_success(dest)
@@ -2651,11 +2810,11 @@ def _main(argv: list[str] | None = None) -> None:
         )
         sys.exit(1)
     except urllib.error.HTTPError as e:
-        print(f"Error: HTTP {e.code} — {e.reason}", file=sys.stderr)
+        print(f"Error: HTTP {e.code}: {e.reason}", file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", e)
-        print(f"Error: network request failed — {reason}", file=sys.stderr)
+        print(f"Error: network request failed: {reason}", file=sys.stderr)
         sys.exit(1)
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)

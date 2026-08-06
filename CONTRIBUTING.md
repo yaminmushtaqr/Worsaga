@@ -18,7 +18,9 @@ while Worsaga is early-stage.
 
 ## Safety rules for any change
 
-Worsaga is read-only by design.
+Worsaga is read-only against Moodle. It does write locally — config, cache,
+search index, downloads, study packs, scheduler registration — so "read-only"
+is a claim about the LMS, never about the machine.
 
 - Do not add LMS write actions.
 - Do not submit assignments, post replies, upload files, create events, delete

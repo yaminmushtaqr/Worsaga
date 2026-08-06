@@ -1391,13 +1391,17 @@ class TestBuildWeeklySummary:
 
 
 class TestFormatBullets:
-    def test_default_marker(self):
+    def test_default_marker_is_ascii(self):
+        # A typographic bullet cannot be encoded by a cp437 console at
+        # all, and renders as a replacement character when a cp1252 one
+        # feeds a UTF-8 terminal emulator.
         result = format_bullets(["First", "Second"])
-        assert result == "  \u2022 First\n  \u2022 Second"
+        assert result == "  - First\n  - Second"
+        result.encode("ascii")
 
     def test_custom_marker(self):
-        result = format_bullets(["A", "B"], marker="-")
-        assert result == "  - A\n  - B"
+        result = format_bullets(["A", "B"], marker="*")
+        assert result == "  * A\n  * B"
 
     def test_empty_list(self):
         assert format_bullets([]) == ""

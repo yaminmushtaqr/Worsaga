@@ -40,8 +40,8 @@ Correctness rules:
   :mod:`worsaga.synclock`, so a ``watch`` loop and a scheduled run cannot
   fetch every course twice at once.
 - Unattended runs consult the circuit breaker in :mod:`worsaga.syncstate`
-  first: after repeated authentication failures they stop before touching
-  the network until a foreground sync succeeds.
+  first: once a sync has had its credentials rejected they stop before
+  touching the network until a foreground sync succeeds.
 
 What a run collects
 -------------------

@@ -6,6 +6,89 @@ All notable changes to Worsaga are documented in this file.
 
 ### Changed
 
+- **BREAKING: `worsaga download` and `worsaga study-pack` no longer write
+  to the current directory.** Without `--output` they used to save into
+  whatever directory the shell happened to be sitting in. On a student's
+  machine that is frequently a git checkout, and course materials are
+  usually somebody else's copyrighted work: one `git add -A` away from
+  being published. Both commands now default to Worsaga's own downloads
+  directory — the same one the MCP `download_material` and
+  `export_study_pack` tools have always used, so the two surfaces cannot
+  drift apart:
+
+  | OS | Default location |
+  |---|---|
+  | Linux | `~/.local/share/worsaga/downloads/` |
+  | macOS | `~/Library/Application Support/worsaga/downloads/` |
+  | Windows | `%LOCALAPPDATA%\worsaga\worsaga\downloads\` |
+
+  `worsaga config` now prints the resolved path, and both commands state
+  the full destination of what they wrote. **To get the old behaviour
+  back, pass `--output .`** — explicitly, per command. `--output DIR`
+  is otherwise unchanged, and the new `WORSAGA_DOWNLOADS_DIR` moves the
+  default somewhere else permanently. It must be an absolute path (`~` is
+  expanded): the CLI and the MCP server run with unrelated working
+  directories, so a relative value would name two different places, and
+  one of them would be wherever an agent host happened to be launched
+  from. A relative value is reported on stderr and ignored.
+
+  Whenever the resolved destination — default or explicit — turns out to
+  be inside a git working tree, both commands print one warning line to
+  stderr (suppressed by `-q`). It is a warning, never a refusal: there
+  are good reasons to keep coursework under version control, and Worsaga
+  is not in a position to know whether yours is one of them.
+- **Study packs now open with a provenance header.** Every generated pack
+  — written to a file, printed with `--stdout`, or returned by the MCP
+  `export_study_pack` — begins with the Worsaga version that produced it,
+  the source site, course, and week, the UTC generation time in ISO 8601,
+  and the line *"Personal study material. Source materials retain their
+  original rights; do not redistribute without permission."* A pack is a
+  verbatim reproduction of a week's teaching material and it is a file
+  that gets kept, copied between machines, and forwarded, so what it is
+  travels with it rather than living only in this documentation. Packs
+  were already created owner-only; that is unchanged.
+- **Desktop notifications no longer carry change titles by default.**
+  `worsaga watch` used to put up to three change titles in the
+  notification body — an assignment name, a graded item — and a desktop
+  notification is drawn by the operating system over whatever is on
+  screen at the time: a shared display, a projector, a screen recording,
+  a lock screen. The default body is now counts and course short-codes
+  only ("Worsaga: 3 changes" / "2 in ECON101, 1 in CS210"). The new
+  `worsaga watch --notify-details` (`notify_details=True` on `run_watch`)
+  restores titles for someone who has decided their screen is private.
+  What each mode promises, exactly: the Moodle token is stripped at the
+  notification boundary itself (`send_notification` now redacts the title
+  and the body, which the CLI's stdout wrapper could never do — this text
+  leaves as subprocess argv); grade values, instructor feedback, and file
+  contents are never composed into a notification in either mode, and no
+  flag turns them on; and detailed mode reproduces item titles as their
+  authors wrote them, which can include a URL or anything else somebody
+  typed. That last point is why counts-only is the default.
+- **A site with web services switched off is no longer reported as an
+  authentication failure.** Moodle's `enablewsdescription` and
+  `servicenotavailable` error codes were classified as rejected
+  credentials, so a student whose institution simply does not offer
+  web-service access was told to check a token that had never been
+  rejected. They are now their own class: the CLI, the MCP
+  `get_connection_info` (`error_code: "service_disabled"`), and a sync's
+  `failure_class` all report *"This Moodle site has not enabled
+  web-service access. That is the institution's decision, and Worsaga
+  cannot be used with it."* Unattended syncing stops rather than
+  retrying an answer that will not change. Worsaga documents no way
+  around such a decision, and will not.
+- **Downloaded filenames are now safe on Windows wherever they were
+  made.** `_sanitize_filename` already replaced separators and wildcards,
+  but left two Windows-specific hazards intact: names whose stem is a
+  reserved device (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+  `LPT1`-`LPT9` — case-insensitive, and reserved with any extension, so
+  `con.pdf` counts), and trailing dots, which Win32 strips silently so
+  that `report.` and `report` become the same file and one download can
+  overwrite another. Reserved stems are now prefixed with an underscore
+  and trailing dots removed, on **every** platform: a pack built on Linux
+  is routinely copied to a Windows machine afterwards. A name that
+  sanitises away to nothing returns the caller's fallback rather than an
+  empty string, which would have resolved to the destination directory
+  itself.
 - **Unattended syncs no longer collect forum discussions.** A forum
   discussion is other people's writing, and a scheduled job accumulating it
   in the background is a different proposition from a student opening
@@ -150,9 +233,9 @@ All notable changes to Worsaga are documented in this file.
   `user_display_name`, the `worsaga_version`, and a `config_source` hint
   (`env` / `file` / `demo` / `unset`, with the file *path* only, never its
   contents). It makes at most one `core_webservice_get_site_info` call and
-  returns a structured `{"error", "error_code": "auth" | "network"}` dict on
-  failure. The token never appears in any field. This brings the MCP tool
-  count to 26.
+  returns a structured `{"error", "error_code": "auth" | "network" |
+  "rate_limited" | "service_disabled"}` dict on failure. The token never
+  appears in any field. This brings the MCP tool count to 26.
 - Forum-discussion, notification, message, and grade records now carry
   derived timestamp fields alongside their raw Unix epochs, matching the
   `due_iso` / `due_str` and `start_iso` / `start_str` fields already on
@@ -226,7 +309,7 @@ All notable changes to Worsaga are documented in this file.
   Moodle and could not fetch a single category returned normally with an
   empty change list — indistinguishable from a healthy sync that found
   nothing new. A failed run also carries a coarse `failure_class` (`auth`,
-  `network`, `rate_limited`, `other`).
+  `network`, `rate_limited`, `service_disabled`, `other`).
 
 - **One sync per site at a time.** A sync takes an interprocess lock beside
   the cache before it fetches anything, so a `watch` loop, the scheduled
@@ -252,10 +335,13 @@ All notable changes to Worsaga are documented in this file.
   broken site at full rate.
 
 - **A circuit breaker for rejected credentials.** After a sync fails
-  because Moodle rejected the token (or web services are disabled),
-  unattended runs — `watch` cycles and the scheduled auto-sync — stop
-  before making any request and say `circuit open: fix credentials then run
-  'worsaga sync' manually`. Running `worsaga sync` yourself always tries,
+  because Moodle rejected the token, unattended runs — `watch` cycles and
+  the scheduled auto-sync — stop before making any request and say
+  `circuit open: fix credentials then run 'worsaga sync' manually`. A site
+  that has switched web services off opens the breaker too, with its own
+  wording: nothing the user does will change that answer, and a scheduled
+  job that keeps asking is load nobody asked for. Running `worsaga sync`
+  yourself always tries,
   and any successful sync closes the breaker. `worsaga auto-sync status`
   now shows the last outcome, the consecutive-failure count and its class,
   and whether scheduled syncs are paused. Network failures and rate limits
@@ -282,6 +368,29 @@ All notable changes to Worsaga are documented in this file.
 
 ### Fixed
 
+- **Messages Worsaga prints are now ASCII, so they read correctly on a
+  Windows console.** Em dashes, en dashes, and the typographic bullet in
+  summary output cannot be encoded by a cp437 console at all, and a
+  cp1252 one emits bytes that a UTF-8 terminal emulator draws as
+  replacement characters — so `worsaga doctor`, `worsaga setup`, several
+  `--help` texts, the download and network error messages, and the
+  bullets in `worsaga summary` all showed mojibake in the middle of a
+  sentence meant to explain something. The default bullet marker in
+  `format_bullets` is now `-` (pass `marker=` for anything else). A test
+  walks every module's AST and fails on a non-ASCII string constant
+  outside a docstring, so the rule is enforced rather than remembered;
+  the banner's deliberate block art and the text-cleaning regexes that
+  must match curly quotes are exempt by name.
+- `worsaga sync --unattended` no longer tells a user whose institution has
+  disabled web services to fix their credentials. That branch printed the
+  authentication wording whatever opened the circuit; it now reads from
+  `failure_class`, and the service-disabled case says the site has not
+  enabled web-service access and that syncing stays paused until it does —
+  without suggesting a manual sync, which would fail identically.
+- `worsaga config` now also reports the resolved cache path, search-index
+  path, and state directory, so the deletion instructions in the README
+  can point at one command that tells you where everything actually is,
+  including anything a `WORSAGA_*` override has relocated.
 - `worsaga watch` no longer reports a cycle that fetched nothing as a
   successful one. A sync that reached Moodle and failed every category, and
   a sync refused because the local cache belongs to a different Moodle

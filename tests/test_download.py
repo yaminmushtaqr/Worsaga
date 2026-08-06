@@ -289,14 +289,25 @@ class TestDownloadMaterial:
         assert Path(result["local_path"]).name == "week3_slides_1.pdf"
         assert Path(result["local_path"]).read_bytes() == b"second download"
 
-    def test_default_output_dir_is_cwd(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
+    def test_default_output_dir_is_worsaga_downloads(self, tmp_path, monkeypatch):
+        """No output_dir means Worsaga's downloads directory, not the CWD.
+
+        The working directory is deliberately somewhere else here: a
+        download that lands where the shell happened to be sitting is the
+        behaviour this default replaced.
+        """
+        elsewhere = tmp_path / "somewhere-else"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        downloads = tmp_path / "worsaga-downloads"
+        monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", str(downloads))
         material = _materials()[0]
         mock_client = MagicMock()
         mock_client.download_file.return_value = b"data"
 
         result = download_material(mock_client, material)
-        assert str(tmp_path) in result["local_path"]
+        assert Path(result["local_path"]).parent == downloads
+        assert str(elsewhere) not in result["local_path"]
 
     def test_failed_write_leaves_no_partial_file(self, tmp_path):
         material = _materials()[0]
@@ -611,3 +622,183 @@ class TestCmdDownloadExecution:
         captured = capsys.readouterr()
         assert "Saved:" in captured.out
         assert "week3_slides.pdf" in captured.out
+
+
+class TestDefaultDestinationAndRepositoryWarning:
+    """Where a CLI download lands, and when Worsaga says so.
+
+    Downloads used to land in the working directory, which on a developer
+    machine is frequently a git checkout — one ``git add -A`` away from
+    publishing somebody else's copyrighted teaching material.
+    """
+
+    def _mock_client(self):
+        client = MagicMock()
+        client.base_url = "https://moodle.example.com"
+        client.get_courses.return_value = [
+            {"id": 42, "shortname": "ECON101", "fullname": "Economics 100"}
+        ]
+        client.get_course_contents.return_value = SAMPLE_SECTIONS
+        client.download_file.return_value = b"%PDF-fake"
+        return client
+
+    @patch("worsaga.cli._client")
+    def test_default_lands_in_the_downloads_dir_not_the_cwd(
+        self, mock_client_fn, tmp_path, monkeypatch, capsys,
+    ):
+        from worsaga.cli import main
+
+        mock_client_fn.return_value = self._mock_client()
+        elsewhere = tmp_path / "cwd"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        downloads = tmp_path / "worsaga-downloads"
+        monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", str(downloads))
+
+        main(["--json", "download", "42", "--week", "3", "--match", "slides"])
+
+        result = json.loads(capsys.readouterr().out)
+        assert Path(result["local_path"]).parent == downloads
+        assert list(elsewhere.iterdir()) == []
+
+    @patch("worsaga.cli._client")
+    def test_output_dot_still_writes_to_the_working_directory(
+        self, mock_client_fn, tmp_path, monkeypatch, capsys,
+    ):
+        from worsaga.cli import main
+
+        mock_client_fn.return_value = self._mock_client()
+        monkeypatch.chdir(tmp_path)
+
+        main([
+            "--json", "download", "42", "--week", "3",
+            "--match", "slides", "--output", ".",
+        ])
+
+        result = json.loads(capsys.readouterr().out)
+        # Resolved to an absolute path, so what is printed is actionable.
+        assert Path(result["local_path"]).parent == tmp_path.resolve()
+
+    @patch("worsaga.cli._client")
+    def test_human_output_states_the_full_resolved_destination(
+        self, mock_client_fn, tmp_path, monkeypatch, capsys,
+    ):
+        from worsaga.cli import main
+
+        mock_client_fn.return_value = self._mock_client()
+        downloads = tmp_path / "worsaga-downloads"
+        monkeypatch.setenv("WORSAGA_DOWNLOADS_DIR", str(downloads))
+
+        main(["download", "42", "--week", "3", "--match", "slides"])
+
+        out = capsys.readouterr().out
+        assert "Saved:" in out
+        # The whole point of moving the default: the user has to be able
+        # to find the file afterwards.
+        assert str(downloads) in out
+
+
+class TestGitWorktreeDetection:
+    def test_plain_directory_is_not_a_worktree(self, tmp_path):
+        from worsaga.cli import _git_worktree_root
+
+        assert _git_worktree_root(tmp_path) is None
+
+    def test_directory_with_a_git_directory(self, tmp_path):
+        from worsaga.cli import _git_worktree_root
+
+        (tmp_path / ".git").mkdir()
+        nested = tmp_path / "downloads" / "econ"
+        nested.mkdir(parents=True)
+        assert _git_worktree_root(nested) == tmp_path.resolve()
+
+    def test_git_file_counts_too(self, tmp_path):
+        """A linked worktree or submodule has .git as a *file*."""
+        from worsaga.cli import _git_worktree_root
+
+        (tmp_path / ".git").write_text("gitdir: ../.git/worktrees/x\n")
+        assert _git_worktree_root(tmp_path) == tmp_path.resolve()
+
+
+class TestRepositoryWarningSurface:
+    def _mock_client(self):
+        client = MagicMock()
+        client.base_url = "https://moodle.example.com"
+        client.get_courses.return_value = [
+            {"id": 42, "shortname": "ECON101", "fullname": "Economics 100"}
+        ]
+        client.get_course_contents.return_value = SAMPLE_SECTIONS
+        client.download_file.return_value = b"%PDF-fake"
+        return client
+
+    @patch("worsaga.cli._client")
+    def test_warns_when_the_destination_is_the_repository_root(
+        self, mock_client_fn, tmp_path, capsys,
+    ):
+        from worsaga.cli import main
+
+        mock_client_fn.return_value = self._mock_client()
+        (tmp_path / ".git").mkdir()
+
+        main([
+            "download", "42", "--week", "3", "--match", "slides",
+            "--output", str(tmp_path),
+        ])
+
+        err = capsys.readouterr().err
+        assert "is a git repository" in err
+        assert "copyrighted" in err
+        # A warning, never a refusal.
+        assert (tmp_path / "week3_slides.pdf").exists()
+
+    @patch("worsaga.cli._client")
+    def test_warns_when_the_destination_is_nested_in_a_repository(
+        self, mock_client_fn, tmp_path, capsys,
+    ):
+        from worsaga.cli import main
+
+        mock_client_fn.return_value = self._mock_client()
+        (tmp_path / ".git").mkdir()
+        nested = tmp_path / "downloads" / "econ"
+
+        main([
+            "download", "42", "--week", "3", "--match", "slides",
+            "--output", str(nested),
+        ])
+
+        err = capsys.readouterr().err
+        # Names the repository root, not just the destination, so the user
+        # can see which checkout they are about to add the file to.
+        assert f"inside the git repository at {tmp_path.resolve()}" in err
+        assert (nested / "week3_slides.pdf").exists()
+
+    @patch("worsaga.cli._client")
+    def test_no_warning_outside_a_repository(
+        self, mock_client_fn, tmp_path, capsys,
+    ):
+        from worsaga.cli import main
+
+        mock_client_fn.return_value = self._mock_client()
+
+        main([
+            "download", "42", "--week", "3", "--match", "slides",
+            "--output", str(tmp_path),
+        ])
+
+        assert "git repository" not in capsys.readouterr().err
+
+    @patch("worsaga.cli._client")
+    def test_quiet_suppresses_the_warning(
+        self, mock_client_fn, tmp_path, capsys,
+    ):
+        from worsaga.cli import main
+
+        mock_client_fn.return_value = self._mock_client()
+        (tmp_path / ".git").mkdir()
+
+        main([
+            "download", "42", "--week", "3", "--match", "slides",
+            "--output", str(tmp_path), "-q",
+        ])
+
+        assert "git repository" not in capsys.readouterr().err

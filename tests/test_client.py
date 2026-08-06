@@ -17,6 +17,7 @@ from worsaga.client import (
     BLOCKED_PATTERNS,
     IDENTITY_PARAMS,
     SELF_SCOPED_PARAMS,
+    SERVICE_DISABLED_MESSAGE,
     AssignmentNotFoundError,
     CourseNotFoundError,
     DownloadError,
@@ -24,8 +25,11 @@ from worsaga.client import (
     MoodleParameterError,
     MoodleRequestError,
     MoodleScopeError,
+    MoodleServiceDisabledError,
     MoodleWriteAttemptError,
     _param_base_name,
+    is_auth_error,
+    is_service_disabled_error,
 )
 from worsaga.config import MoodleConfig
 
@@ -1122,3 +1126,107 @@ class TestDomainNotFoundErrors:
         assert not isinstance(exc_info.value, CourseNotFoundError)
         assert "Moodle API error" in str(exc_info.value)
         assert exc_info.value.errorcode == "accessexception"
+
+
+class TestServiceDisabled:
+    """A site that has switched web services off is its own answer.
+
+    Not a rejected token — nothing the user does with their credentials
+    changes it — and not an unreachable site. The message says so,
+    attributes the decision to the institution, and stops there: Worsaga
+    documents no way around it.
+    """
+
+    #: The two errorcodes Moodle raises: web services off site-wide, and
+    #: the external service a token belongs to being disabled.
+    PAYLOADS = ("enablewsdescription", "servicenotavailable")
+
+    def _transport(self, errorcode: str):
+        """Every call answers with the disabled-service exception payload."""
+        payload = json.dumps({
+            "exception": "moodle_exception",
+            "errorcode": errorcode,
+            "message": "Web services are not enabled on this site.",
+        }).encode()
+
+        def transport(req, timeout=30):
+            return _FakeResponse(payload)
+
+        return transport
+
+    @pytest.mark.parametrize("errorcode", PAYLOADS)
+    def test_client_raises_the_dedicated_error(self, client, errorcode):
+        with patch("urllib.request.urlopen", side_effect=self._transport(errorcode)):
+            with pytest.raises(MoodleServiceDisabledError) as exc_info:
+                client.site_info()
+        assert str(exc_info.value) == SERVICE_DISABLED_MESSAGE
+        assert exc_info.value.errorcode == errorcode
+
+    def test_message_is_respectful_and_offers_no_workaround(self):
+        text = SERVICE_DISABLED_MESSAGE.lower()
+        assert "institution's decision" in text
+        assert "cannot be used" in text
+        # ASCII only: this reaches Windows consoles.
+        SERVICE_DISABLED_MESSAGE.encode("ascii")
+        # Nothing in it may read as a route around the decision.
+        for forbidden in (
+            "instead", "workaround", "work around", "bypass", "scrap",
+            "another way", "alternative", "try ", "however",
+        ):
+            assert forbidden not in text, forbidden
+
+    def test_not_classified_as_an_auth_failure(self):
+        from worsaga.syncstate import classify_failure
+
+        for errorcode in self.PAYLOADS:
+            exc = MoodleRequestError("off", errorcode=errorcode)
+            assert is_service_disabled_error(exc)
+            assert not is_auth_error(exc)
+            assert classify_failure(exc) == "service_disabled"
+
+    def test_a_real_auth_failure_is_still_auth(self):
+        from worsaga.syncstate import classify_failure
+
+        exc = MoodleRequestError("nope", errorcode="invalidtoken")
+        assert not is_service_disabled_error(exc)
+        assert is_auth_error(exc)
+        assert classify_failure(exc) == "auth"
+
+    def test_message_fallback_when_the_errorcode_is_missing(self):
+        # A proxy that drops the errorcode still leaves English text.
+        exc = MoodleRequestError("Web services are not enabled on this site.")
+        assert is_service_disabled_error(exc)
+        assert not is_auth_error(exc)
+
+    def test_connection_check_reports_service_disabled(self, client):
+        from worsaga.doctor import ConnectionCheckError, fetch_site_info
+
+        with patch("urllib.request.urlopen",
+                   side_effect=self._transport("enablewsdescription")):
+            with pytest.raises(ConnectionCheckError) as exc_info:
+                fetch_site_info(client)
+        assert exc_info.value.code == "service_disabled"
+        assert str(exc_info.value) == SERVICE_DISABLED_MESSAGE
+
+    def test_mcp_get_connection_info_returns_the_structured_code(self, client):
+        from worsaga import mcp_server
+
+        with patch.object(mcp_server, "_get_client", return_value=client), \
+             patch("urllib.request.urlopen",
+                   side_effect=self._transport("servicenotavailable")):
+            result = mcp_server.get_connection_info()
+        assert result["error_code"] == "service_disabled"
+        assert result["error"] == SERVICE_DISABLED_MESSAGE
+        assert result["error_code"] in mcp_server.ERROR_CODES
+
+    def test_cli_doctor_prints_the_message(self, capsys):
+        from worsaga.cli import main
+
+        with patch("urllib.request.urlopen",
+                   side_effect=self._transport("enablewsdescription")):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["doctor"])
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert SERVICE_DISABLED_MESSAGE in out
+        assert "token" not in out.lower().replace("web-service", "")

@@ -46,7 +46,7 @@ class CourseAmbiguousError(CourseResolutionError):
             shortnames = ", ".join(
                 sorted(str(c.get("shortname", "?")) for c in candidates)
             )
-            message = f"'{query}' is ambiguous — matches: {shortnames}"
+            message = f"'{query}' is ambiguous - matches: {shortnames}"
         super().__init__(message)
 
 

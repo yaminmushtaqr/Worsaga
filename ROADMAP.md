@@ -66,3 +66,6 @@ explored; no other provider is supported or promised yet.
 - Marking resources as viewed.
 - Fetching raw Moodle `file_url` values directly.
 - Storing tokens in cache or logs.
+- Any route around an institution's decision not to enable web services.
+- Shared, multi-user, remote, or hosted deployment. Worsaga is one person
+  on their own machine, reading their own account.

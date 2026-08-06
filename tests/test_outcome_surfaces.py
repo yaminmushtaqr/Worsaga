@@ -101,6 +101,35 @@ class TestCliSyncExitCode:
         assert "circuit open" in err
         assert "Fix the credentials" in err
 
+    def test_service_disabled_circuit_does_not_blame_the_credentials(
+        self, capsys,
+    ):
+        """A site with web services off is not a credentials problem.
+
+        Telling the user to fix a token that was never rejected sends
+        them to reset something that will not help, and a manual sync is
+        not the way out of this one either: it would fail identically.
+        """
+        blocked = _result(
+            "failed",
+            warnings=["circuit open: this site has not enabled web-service "
+                      "access, so unattended syncing has stopped (3 "
+                      "consecutive failures; no request was made)"],
+            circuit_open=True,
+            failure_class="service_disabled",
+        )
+        with patch.object(cli_module, "run_sync", return_value=blocked):
+            with pytest.raises(SystemExit) as exc:
+                main(["--demo", "sync", "--unattended"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "has not enabled web-service access" in err
+        assert "institution's decision" in err
+        # The word never appears: not as advice, not as a diagnosis.
+        assert "credential" not in err.lower()
+        # And no suggestion that running it by hand would clear it.
+        assert "yourself" not in err.lower()
+
     def test_unattended_flag_is_forwarded(self):
         seen = {}
 
